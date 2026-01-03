@@ -219,25 +219,21 @@ impl InputFileBuilder {
         }
 
         // if output_rst is present, the period must be greater than zero
-        if let Some(output) = &output_rst {
-            if output.period == 0 {
-                return Err(InputFileBuilderError::invalid_field_value(
-                    "output_rst",
-                    0,
-                    "period must be greater than zero",
-                ));
-            }
+        if let Some(Output { period: 0, .. }) = output_rst {
+            return Err(InputFileBuilderError::invalid_field_value(
+                "output_rst",
+                0,
+                "period must be greater than zero",
+            ));
         }
 
         // if output_dcd is present, the period must be greater than zero
-        if let Some(output) = &output_dcd {
-            if output.period == 0 {
-                return Err(InputFileBuilderError::invalid_field_value(
-                    "output_dcd",
-                    0,
-                    "period must be greater than zero",
-                ));
-            }
+        if let Some(Output { period: 0, .. }) = output_dcd {
+            return Err(InputFileBuilderError::invalid_field_value(
+                "output_dcd",
+                0,
+                "period must be greater than zero",
+            ));
         }
 
         // periods should be divisors of the total number of steps
@@ -249,24 +245,24 @@ impl InputFileBuilder {
             ));
         }
 
-        if let Some(output) = &output_rst {
-            if num_steps % output.period != 0 {
-                return Err(InputFileBuilderError::invalid_field_value(
-                    "output_rst",
-                    output.period,
-                    "period must be a divisor of the total number of steps",
-                ));
-            }
+        if let Some(output) = &output_rst
+            && num_steps % output.period != 0
+        {
+            return Err(InputFileBuilderError::invalid_field_value(
+                "output_rst",
+                output.period,
+                "period must be a divisor of the total number of steps",
+            ));
         }
 
-        if let Some(output) = &output_dcd {
-            if num_steps % output.period != 0 {
-                return Err(InputFileBuilderError::invalid_field_value(
-                    "output_dcd",
-                    output.period,
-                    "period must be a divisor of the total number of steps",
-                ));
-            }
+        if let Some(output) = &output_dcd
+            && num_steps % output.period != 0
+        {
+            return Err(InputFileBuilderError::invalid_field_value(
+                "output_dcd",
+                output.period,
+                "period must be a divisor of the total number of steps",
+            ));
         }
 
         if num_steps % update_nb_period != 0 {
@@ -313,14 +309,15 @@ impl InputFileBuilder {
 
         // when using a PBC boundary, the box size should be present if
         // running a new simulation
-        if input_rst.is_none() && matches!(boundary, Boundary::Pbc { box_size: None }) {
-            if let Boundary::Pbc { box_size: None } = &boundary {
-                return Err(InputFileBuilderError::invalid_field_value(
-                    "boundary",
-                    "box_size",
-                    "box_size is required when not using a restart file",
-                ));
-            }
+        if input_rst.is_none()
+            && matches!(boundary, Boundary::Pbc { box_size: None })
+            && let Boundary::Pbc { box_size: None } = &boundary
+        {
+            return Err(InputFileBuilderError::invalid_field_value(
+                "boundary",
+                "box_size",
+                "box_size is required when not using a restart file",
+            ));
         }
 
         Ok(InputFile {
@@ -439,74 +436,70 @@ pub struct InputFile {
 impl fmt::Display for InputFile {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // Input
-        write!(f, "[INPUT]\n",)?;
-        write!(f, "grotopfile            = {}\n", self.input_grotop)?;
-        write!(f, "grocrdfile            = {}\n", self.input_grocrd)?;
+        writeln!(f, "[INPUT]")?;
+        writeln!(f, "grotopfile            = {}", self.input_grotop)?;
+        writeln!(f, "grocrdfile            = {}", self.input_grocrd)?;
         if let Some(input_rst) = &self.input_rst {
-            write!(f, "rstfile               = {}\n", input_rst)?;
+            writeln!(f, "rstfile               = {}", input_rst)?;
         }
-        write!(f, "\n",)?;
+        writeln!(f)?;
 
         // Output
-        write!(f, "[OUTPUT]\n",)?;
+        writeln!(f, "[OUTPUT]")?;
         if let Some(output_rst) = &self.output_rst {
-            write!(f, "rstfile               = {}\n", output_rst.path)?;
+            writeln!(f, "rstfile               = {}", output_rst.path)?;
         }
         if let Some(output_dcd) = &self.output_dcd {
-            write!(f, "dcdfile               = {}\n", output_dcd.path)?;
+            writeln!(f, "dcdfile               = {}", output_dcd.path)?;
         }
-        write!(f, "\n",)?;
+        writeln!(f)?;
 
         // Energy
-        write!(f, "[ENERGY]\n",)?;
-        write!(f, "forcefield            = RESIDCG\n",)?;
-        write!(f, "electrostatic         = CUTOFF\n",)?;
-        write!(f, "nonb_limiter          = YES\n",)?;
-        write!(f, "cg_sol_temperature    = {}\n", self.solvent_temperature)?;
-        write!(
-            f,
-            "cg_sol_ionic_strength = {}\n",
-            self.solvent_ionic_strength
-        )?;
-        write!(f, "\n",)?;
+        writeln!(f, "[ENERGY]")?;
+        writeln!(f, "forcefield            = RESIDCG",)?;
+        writeln!(f, "electrostatic         = CUTOFF",)?;
+        writeln!(f, "nonb_limiter          = YES",)?;
+        writeln!(f, "cg_sol_temperature    = {}", self.solvent_temperature)?;
+        writeln!(f, "cg_sol_ionic_strength = {}", self.solvent_ionic_strength)?;
+        writeln!(f)?;
 
         // Dynamics
-        write!(f, "[DYNAMICS]\n",)?;
-        write!(f, "integrator            = VVER_CG\n",)?;
-        write!(f, "timestep              = {}\n", self.time_step)?;
-        write!(f, "nsteps                = {}\n", self.num_steps)?;
-        write!(f, "eneout_period         = {}\n", self.output_ene_period)?;
+        writeln!(f, "[DYNAMICS]")?;
+        writeln!(f, "integrator            = VVER_CG",)?;
+        writeln!(f, "timestep              = {}", self.time_step)?;
+        writeln!(f, "nsteps                = {}", self.num_steps)?;
+        writeln!(f, "eneout_period         = {}", self.output_ene_period)?;
         if let Some(output_crd) = &self.output_dcd {
-            write!(f, "crdout_period         = {}\n", output_crd.period)?;
+            writeln!(f, "crdout_period         = {}", output_crd.period)?;
         }
         if let Some(output_rst) = &self.output_rst {
-            write!(f, "rstout_period         = {}\n", output_rst.period)?;
+            writeln!(f, "rstout_period         = {}", output_rst.period)?;
         }
-        write!(f, "nbupdate_period       = {}\n", self.update_nb_period)?;
-        write!(f, "stoptr_period         = {}\n", self.remove_tr_period)?;
-        write!(f, "iseed                 = {}\n", self.seed)?;
-        write!(f, "\n",)?;
+        writeln!(f, "nbupdate_period       = {}", self.update_nb_period)?;
+        writeln!(f, "stoptr_period         = {}", self.remove_tr_period)?;
+        writeln!(f, "iseed                 = {}", self.seed)?;
+        writeln!(f)?;
 
         // Constraints
-        write!(f, "[CONSTRAINTS]\n",)?;
-        write!(f, "rigid_bond            = NO\n",)?;
-        write!(f, "\n",)?;
+        writeln!(f, "[CONSTRAINTS]")?;
+        writeln!(f, "rigid_bond            = NO",)?;
+        writeln!(f)?;
 
         // Ensemble
-        write!(f, "[ENSEMBLE]\n",)?;
+        writeln!(f, "[ENSEMBLE]")?;
         match self.ensemble {
             Ensemble::Nve => {
-                write!(f, "ensemble              = NVE\n")?;
-                write!(f, "tpcontrol             = NO\n")?;
+                writeln!(f, "ensemble              = NVE")?;
+                writeln!(f, "tpcontrol             = NO")?;
             }
             Ensemble::Nvt {
                 temperature,
                 gamma_t,
             } => {
-                write!(f, "ensemble              = NVT\n")?;
-                write!(f, "tpcontrol             = LANGEVIN\n")?;
-                write!(f, "temperature           = {}\n", temperature)?;
-                write!(f, "gamma_t               = {}\n", gamma_t)?;
+                writeln!(f, "ensemble              = NVT")?;
+                writeln!(f, "tpcontrol             = LANGEVIN")?;
+                writeln!(f, "temperature           = {}", temperature)?;
+                writeln!(f, "gamma_t               = {}", gamma_t)?;
             }
             Ensemble::Npt {
                 temperature,
@@ -514,27 +507,27 @@ impl fmt::Display for InputFile {
                 gamma_t,
                 gamma_p,
             } => {
-                write!(f, "ensemble              = NPT\n")?;
-                write!(f, "tpcontrol             = LANGEVIN\n")?;
-                write!(f, "temperature           = {}\n", temperature)?;
-                write!(f, "pressure              = {}\n", pressure)?;
-                write!(f, "gamma_t               = {}\n", gamma_t)?;
-                write!(f, "gamma_p               = {}\n", gamma_p)?;
-                write!(f, "isotropy              = Z-FIXED-SEMI-ISO\n")?;
+                writeln!(f, "ensemble              = NPT")?;
+                writeln!(f, "tpcontrol             = LANGEVIN")?;
+                writeln!(f, "temperature           = {}", temperature)?;
+                writeln!(f, "pressure              = {}", pressure)?;
+                writeln!(f, "gamma_t               = {}", gamma_t)?;
+                writeln!(f, "gamma_p               = {}", gamma_p)?;
+                writeln!(f, "isotropy              = Z-FIXED-SEMI-ISO")?;
             }
         }
-        write!(f, "\n",)?;
+        writeln!(f)?;
 
         // Boundary
-        write!(f, "[Boundary]\n",)?;
+        writeln!(f, "[Boundary]",)?;
         match &self.boundary {
-            Boundary::NoBc => write!(f, "type                  = NOBC\n")?,
+            Boundary::NoBc => writeln!(f, "type                  = NOBC")?,
             Boundary::Pbc { box_size } => {
-                write!(f, "type                  = PBC\n")?;
+                writeln!(f, "type                  = PBC")?;
                 if let Some(box_size) = box_size {
-                    write!(f, "box_size_x            = {}\n", box_size.x)?;
-                    write!(f, "box_size_y            = {}\n", box_size.y)?;
-                    write!(f, "box_size_z            = {}\n", box_size.z)?;
+                    writeln!(f, "box_size_x            = {}", box_size.x)?;
+                    writeln!(f, "box_size_y            = {}", box_size.y)?;
+                    writeln!(f, "box_size_z            = {}", box_size.z)?;
                 }
             }
         }
