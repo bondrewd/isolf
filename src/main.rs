@@ -14,6 +14,84 @@ struct Args {
     #[arg(value_name = "PATH")]
     #[arg(default_value_t = String::from("sim"))]
     output: String,
+
+    /// Simulation temperature
+    #[arg(long)]
+    #[arg(value_name = "TEMPERATURE")]
+    #[arg(default_value_t = 303.15)]
+    temperature: f64,
+
+    /// Equilibration run steps
+    #[arg(long)]
+    #[arg(value_name = "STEPS")]
+    #[arg(default_value_t = 10_000)]
+    equilibration_steps: u64,
+
+    /// Equilibration rst output period
+    #[arg(long)]
+    #[arg(value_name = "PERIOD")]
+    #[arg(default_value_t = 1000)]
+    equilibration_rst_period: u64,
+
+    /// Equilibration dcd output period
+    #[arg(long)]
+    #[arg(value_name = "PERIOD")]
+    #[arg(default_value_t = 1000)]
+    equilibration_dcd_period: u64,
+
+    /// Equilibration ene output period
+    #[arg(long)]
+    #[arg(value_name = "PERIOD")]
+    #[arg(default_value_t = 100)]
+    equilibration_ene_period: u64,
+
+    /// Equilibration neighbor list update period
+    #[arg(long)]
+    #[arg(value_name = "PERIOD")]
+    #[arg(default_value_t = 10)]
+    equilibration_nb_period: u64,
+
+    /// Equilibration translation and rotation removal period
+    #[arg(long)]
+    #[arg(value_name = "PERIOD")]
+    #[arg(default_value_t = 10)]
+    equilibration_tr_period: u64,
+
+    /// Production run steps
+    #[arg(long)]
+    #[arg(value_name = "STEPS")]
+    #[arg(default_value_t = 100_000)]
+    production_steps: u64,
+
+    /// Production rst output period
+    #[arg(long)]
+    #[arg(value_name = "PERIOD")]
+    #[arg(default_value_t = 1000)]
+    production_rst_period: u64,
+
+    /// Production dcd output period
+    #[arg(long)]
+    #[arg(value_name = "PERIOD")]
+    #[arg(default_value_t = 1000)]
+    production_dcd_period: u64,
+
+    /// Production ene output period
+    #[arg(long)]
+    #[arg(value_name = "PERIOD")]
+    #[arg(default_value_t = 100)]
+    production_ene_period: u64,
+
+    /// Production neighbor list update period
+    #[arg(long)]
+    #[arg(value_name = "PERIOD")]
+    #[arg(default_value_t = 10)]
+    production_nb_period: u64,
+
+    /// Production translation and rotation removal period
+    #[arg(long)]
+    #[arg(value_name = "PERIOD")]
+    #[arg(default_value_t = 10)]
+    production_tr_period: u64,
 }
 
 fn main() {
@@ -37,13 +115,20 @@ fn main() {
     let equ_input_file = isolf::InputFileBuilder::default()
         .input_grotop("./membrane.top")
         .input_grocrd("./membrane.gro")
-        .output_dcd(isolf::Output::new("./equilibration.dcd", 100))
-        .output_rst(isolf::Output::new("./equilibration.rst", 10000))
-        .num_steps(10000)
-        .output_ene_period(100)
-        .update_nb_period(10)
-        .remove_tr_period(10)
-        .ensemble(isolf::Ensemble::npt(303.15, 0.0, 0.01, 0.01))
+        .output_dcd(isolf::Output::new(
+            "./equilibration.dcd",
+            args.equilibration_dcd_period,
+        ))
+        .output_rst(isolf::Output::new(
+            "./equilibration.rst",
+            args.equilibration_rst_period,
+        ))
+        .solvent_temperature(args.temperature)
+        .num_steps(args.equilibration_steps)
+        .output_ene_period(args.equilibration_ene_period)
+        .update_nb_period(args.equilibration_nb_period)
+        .remove_tr_period(args.equilibration_tr_period)
+        .ensemble(isolf::Ensemble::npt(args.temperature, 0.0, 0.01, 0.01))
         .boundary(isolf::Boundary::pbc_with_box_size(255.821, 255.821, 200.0))
         .build()
         .unwrap_or_else(|e| {
@@ -60,13 +145,20 @@ fn main() {
         .input_grotop("./membrane.top")
         .input_grocrd("./membrane.gro")
         .input_rst("./equilibration.rst")
-        .output_dcd(isolf::Output::new("./production.dcd", 100))
-        .output_rst(isolf::Output::new("./production.rst", 10000))
-        .num_steps(10000)
-        .output_ene_period(100)
-        .update_nb_period(10)
-        .remove_tr_period(10)
-        .ensemble(isolf::Ensemble::npt(303.15, 0.0, 0.01, 0.01))
+        .output_dcd(isolf::Output::new(
+            "./production.dcd",
+            args.production_dcd_period,
+        ))
+        .output_rst(isolf::Output::new(
+            "./production.rst",
+            args.equilibration_rst_period,
+        ))
+        .solvent_temperature(args.temperature)
+        .num_steps(args.production_steps)
+        .output_ene_period(args.production_ene_period)
+        .update_nb_period(args.production_nb_period)
+        .remove_tr_period(args.production_tr_period)
+        .ensemble(isolf::Ensemble::npt(args.temperature, 0.0, 0.01, 0.01))
         .boundary(isolf::Boundary::pbc())
         .build()
         .unwrap_or_else(|e| {
