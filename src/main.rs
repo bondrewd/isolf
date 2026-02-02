@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use clap::Parser;
 use colored::Colorize;
 use isolf::csv::parse_isolf_csv;
+use isolf::itp::IsolfItp;
 use std::fs;
 use std::path::PathBuf;
 
@@ -157,7 +158,8 @@ fn run() -> Result<()> {
     fs::write(&pro_input_path, pro_input_file.to_string())?;
 
     let isolf_csv = parse_isolf_csv()?;
-    println!("{:?}", isolf_csv);
+    let isolf_itp = IsolfItp::try_from(isolf_csv)?;
+    println!("{}", isolf_itp);
 
     Ok(())
 }

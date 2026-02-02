@@ -1,9 +1,10 @@
+use crate::error::IsolfError;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::path::Path;
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Angle {
     pub lipid: String,
     pub bead1: String,
@@ -12,7 +13,7 @@ pub struct Angle {
     pub t0: f64,
     pub k: f64,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Bond {
     pub lipid: String,
     pub bead1: String,
@@ -21,13 +22,13 @@ pub struct Bond {
     pub k: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Charge {
     pub bead: String,
     pub q: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Hp {
     pub bead: String,
     pub e: f64,
@@ -35,27 +36,27 @@ pub struct Hp {
     pub w: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Lj {
     pub bead: String,
     pub e: f64,
     pub s: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Mass {
     pub bead: String,
     pub m: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Wca {
     pub bead: String,
     pub e: f64,
     pub s: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Apl {
     pub lipid: String,
     pub mean30: f64,
@@ -66,19 +67,7 @@ pub struct Apl {
     pub std50: f64,
 }
 
-#[derive(thiserror::Error, Debug)]
-pub enum IsolfError {
-    #[error("CSV error at {path}: {source}")]
-    Csv { path: PathBuf, source: csv::Error },
-}
-
-impl IsolfError {
-    pub fn csv(path: PathBuf, source: csv::Error) -> Self {
-        IsolfError::Csv { path, source }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IsolfFf {
     pub angle: Vec<Angle>,
     pub bond: Vec<Bond>,
@@ -89,7 +78,7 @@ pub struct IsolfFf {
     pub wca: Vec<Wca>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IsolfCsv {
     pub ff: IsolfFf,
     pub apl: Vec<Apl>,

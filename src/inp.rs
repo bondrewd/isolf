@@ -1,40 +1,7 @@
+use crate::error::IsolfError;
 use colored::Colorize;
 use rand::Rng;
 use std::fmt;
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum InputFileBuilderError {
-    #[error("Missing required field '{field}'")]
-    MissingRequiredField { field: String },
-
-    #[error("Invalid value '{value}' for field '{field}': {reason}")]
-    InvalidFieldValue {
-        field: String,
-        value: String,
-        reason: String,
-    },
-}
-
-impl InputFileBuilderError {
-    pub fn missing_required_field<F: ToString>(field: F) -> Self {
-        InputFileBuilderError::MissingRequiredField {
-            field: field.to_string(),
-        }
-    }
-
-    pub fn invalid_field_value<F: ToString, V: ToString, R: ToString>(
-        field: F,
-        value: V,
-        reason: R,
-    ) -> Self {
-        InputFileBuilderError::InvalidFieldValue {
-            field: field.to_string(),
-            value: value.to_string(),
-            reason: reason.to_string(),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct Output {
@@ -143,39 +110,39 @@ pub struct InputFileBuilder {
 }
 
 impl InputFileBuilder {
-    pub fn build(self) -> Result<InputFile, InputFileBuilderError> {
+    pub fn build(self) -> Result<InputFile, IsolfError> {
         // assert the presence of required fields
         let input_grotop = self
             .input_grotop
-            .ok_or_else(|| InputFileBuilderError::missing_required_field("input_grotop"))?;
+            .ok_or_else(|| IsolfError::missing_required_field("input_grotop"))?;
 
         let input_grocrd = self
             .input_grocrd
-            .ok_or_else(|| InputFileBuilderError::missing_required_field("input_grocrd"))?;
+            .ok_or_else(|| IsolfError::missing_required_field("input_grocrd"))?;
 
         let num_steps = self
             .num_steps
-            .ok_or_else(|| InputFileBuilderError::missing_required_field("num_steps"))?;
+            .ok_or_else(|| IsolfError::missing_required_field("num_steps"))?;
 
         let output_ene_period = self
             .output_ene_period
-            .ok_or_else(|| InputFileBuilderError::missing_required_field("output_ene_period"))?;
+            .ok_or_else(|| IsolfError::missing_required_field("output_ene_period"))?;
 
         let update_nb_period = self
             .update_nb_period
-            .ok_or_else(|| InputFileBuilderError::missing_required_field("update_nb_period"))?;
+            .ok_or_else(|| IsolfError::missing_required_field("update_nb_period"))?;
 
         let remove_tr_period = self
             .remove_tr_period
-            .ok_or_else(|| InputFileBuilderError::missing_required_field("remove_tr_period"))?;
+            .ok_or_else(|| IsolfError::missing_required_field("remove_tr_period"))?;
 
         let ensemble = self
             .ensemble
-            .ok_or_else(|| InputFileBuilderError::missing_required_field("ensemble"))?;
+            .ok_or_else(|| IsolfError::missing_required_field("ensemble"))?;
 
         let boundary = self
             .boundary
-            .ok_or_else(|| InputFileBuilderError::missing_required_field("boundary"))?;
+            .ok_or_else(|| IsolfError::missing_required_field("boundary"))?;
 
         // set default values for optional fields
         let time_step = self.time_step.unwrap_or(0.01);
@@ -190,7 +157,7 @@ impl InputFileBuilder {
 
         // output_ene_period needs to be greater than zero
         if output_ene_period == 0 {
-            return Err(InputFileBuilderError::invalid_field_value(
+            return Err(IsolfError::invalid_field_value(
                 "output_ene_period",
                 0,
                 "period must be greater than zero",
@@ -199,7 +166,7 @@ impl InputFileBuilder {
 
         // if output_rst is present, the period must be greater than zero
         if let Some(Output { period: 0, .. }) = output_rst {
-            return Err(InputFileBuilderError::invalid_field_value(
+            return Err(IsolfError::invalid_field_value(
                 "output_rst",
                 0,
                 "period must be greater than zero",
@@ -208,7 +175,7 @@ impl InputFileBuilder {
 
         // if output_dcd is present, the period must be greater than zero
         if let Some(Output { period: 0, .. }) = output_dcd {
-            return Err(InputFileBuilderError::invalid_field_value(
+            return Err(IsolfError::invalid_field_value(
                 "output_dcd",
                 0,
                 "period must be greater than zero",
@@ -217,7 +184,7 @@ impl InputFileBuilder {
 
         // periods should be divisors of the total number of steps
         if num_steps % output_ene_period != 0 {
-            return Err(InputFileBuilderError::invalid_field_value(
+            return Err(IsolfError::invalid_field_value(
                 "output_ene",
                 output_ene_period,
                 "period must be a divisor of the total number of steps",
@@ -227,7 +194,7 @@ impl InputFileBuilder {
         if let Some(output) = &output_rst
             && num_steps % output.period != 0
         {
-            return Err(InputFileBuilderError::invalid_field_value(
+            return Err(IsolfError::invalid_field_value(
                 "output_rst",
                 output.period,
                 "period must be a divisor of the total number of steps",
@@ -237,7 +204,7 @@ impl InputFileBuilder {
         if let Some(output) = &output_dcd
             && num_steps % output.period != 0
         {
-            return Err(InputFileBuilderError::invalid_field_value(
+            return Err(IsolfError::invalid_field_value(
                 "output_dcd",
                 output.period,
                 "period must be a divisor of the total number of steps",
@@ -245,7 +212,7 @@ impl InputFileBuilder {
         }
 
         if num_steps % update_nb_period != 0 {
-            return Err(InputFileBuilderError::invalid_field_value(
+            return Err(IsolfError::invalid_field_value(
                 "update_nb_period",
                 update_nb_period,
                 "period must be a divisor of the total number of steps",
@@ -253,7 +220,7 @@ impl InputFileBuilder {
         }
 
         if num_steps % remove_tr_period != 0 {
-            return Err(InputFileBuilderError::invalid_field_value(
+            return Err(IsolfError::invalid_field_value(
                 "remove_tr_period",
                 remove_tr_period,
                 "period must be a divisor of the total number of steps",
@@ -279,7 +246,7 @@ impl InputFileBuilder {
         // when using a PBC boundary, the box size should not be present
         // if continuing a simulation from a restart file
         if input_rst.is_some() && matches!(boundary, Boundary::Pbc { box_size: Some(_) }) {
-            return Err(InputFileBuilderError::invalid_field_value(
+            return Err(IsolfError::invalid_field_value(
                 "boundary",
                 "box_size",
                 "box_size is not needed when using a restart file",
@@ -292,7 +259,7 @@ impl InputFileBuilder {
             && matches!(boundary, Boundary::Pbc { box_size: None })
             && let Boundary::Pbc { box_size: None } = &boundary
         {
-            return Err(InputFileBuilderError::invalid_field_value(
+            return Err(IsolfError::invalid_field_value(
                 "boundary",
                 "box_size",
                 "box_size is required when not using a restart file",
