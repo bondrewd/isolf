@@ -2,7 +2,7 @@ use crate::error::IsolfError;
 use colored::Colorize;
 use rand::Rng;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct InputFileBuilder {
     input_grotop: Option<String>,
     input_grocrd: Option<String>,
