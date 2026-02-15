@@ -32,6 +32,7 @@ impl fmt::Display for Molecule {
         for bond in &self.bonds {
             writeln!(f, "{}", bond)?;
         }
+        writeln!(f)?;
 
         // Angle
         writeln!(f, "[ angles ]")?;

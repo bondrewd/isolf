@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Debug, Default)]
@@ -39,7 +40,6 @@ impl fmt::Display for ItpFile {
         // Molecules
         for molecule in &self.molecules {
             writeln!(f, "{}", molecule)?;
-            writeln!(f)?;
         }
 
         Ok(())
@@ -143,10 +143,65 @@ impl TryFrom<crate::itp::force_field::ForceField> for ItpFile {
             .chain(cg_wca_parameters_no_tail_tail.into_iter())
             .collect();
 
+        // Molecules
+        let atoms_map: HashMap<String, (f64, f64)> = ff
+            .atoms
+            .into_iter()
+            .map(|atom| (atom.name, (atom.m, atom.q)))
+            .collect();
+        let molecules = ff
+            .lipids
+            .iter()
+            .map(|lipid| {
+                let mut molecule = crate::itp::molecule::Molecule::default();
+                // Molecule type
+                molecule.molecule_type.name = lipid.name.to_uppercase();
+                // Molecule atoms
+                molecule.atoms = lipid
+                    .atoms
+                    .iter()
+                    .enumerate()
+                    .map(|(id, atom)| {
+                        let (mass, charge) = atoms_map.get(&atom.name).unwrap();
+                        crate::itp::atom::Atom {
+                            atom_name: atom.name.to_uppercase(),
+                            molecule_name: lipid.name.to_uppercase(),
+                            q: *charge,
+                            m: *mass,
+                            id: 1 + id as u64,
+                        }
+                    })
+                    .collect();
+                // Molecule bonds
+                molecule.bonds = lipid
+                    .bonds
+                    .iter()
+                    .map(|bond| crate::itp::bond::Bond {
+                        ids: [bond.ids[0] + 1, bond.ids[1] + 1],
+                        k: bond.k,
+                        r0: bond.r0,
+                    })
+                    .collect();
+                // Molecule angles
+                molecule.angles = lipid
+                    .angles
+                    .iter()
+                    .map(|angle| crate::itp::angle::Angle {
+                        ids: [angle.ids[0] + 1, angle.ids[1] + 1, angle.ids[2] + 1],
+                        k: angle.k,
+                        t0: angle.t0,
+                    })
+                    .collect();
+
+                molecule
+            })
+            .collect();
+
         let mut itp_file = crate::itp::itp_file::ItpFile::default();
         itp_file.atom_types = atom_types;
         itp_file.cg_lj_parameters = cg_lj_parameters;
         itp_file.cg_wca_parameters = cg_wca_parameters;
+        itp_file.molecules = molecules;
 
         Ok(itp_file)
     }

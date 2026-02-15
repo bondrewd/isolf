@@ -143,8 +143,9 @@ fn run() -> Result<()> {
     fs::write(&pro_input_path, pro_input_file.to_string())?;
 
     let isolf_ff: ForceField = serde_json::from_str(include_str!("../data/ff.json"))?;
-    let isolf_itp = ItpFile::try_from(isolf_ff)?;
-    println!("{}", isolf_itp);
+    let itp_file = ItpFile::try_from(isolf_ff)?;
+    let itp_path = output_path.join("isolf.itp");
+    fs::write(&itp_path, itp_file.to_string())?;
 
     Ok(())
 }
