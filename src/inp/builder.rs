@@ -22,7 +22,7 @@ pub struct InputFileBuilder {
 }
 
 impl InputFileBuilder {
-    pub fn build(self) -> Result<crate::inp::input::InputFile, IsolfError> {
+    pub fn build(self) -> Result<crate::inp::itp_file::InputFile, IsolfError> {
         // assert the presence of required fields
         let input_grotop = self
             .input_grotop
@@ -182,7 +182,7 @@ impl InputFileBuilder {
             ));
         }
 
-        Ok(crate::inp::input::InputFile {
+        Ok(crate::inp::itp_file::InputFile {
             input_grotop,
             input_grocrd,
             input_rst,

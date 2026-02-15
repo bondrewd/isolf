@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use colored::Colorize;
-use isolf::itp::{IsolfForceField, IsolfItp};
+use isolf::itp::{force_field::ForceField, itp_file::ItpFile};
 use std::fs;
 use std::path::PathBuf;
 
@@ -142,9 +142,9 @@ fn run() -> Result<()> {
     let pro_input_path = output_path.join("production.inp");
     fs::write(&pro_input_path, pro_input_file.to_string())?;
 
-    let isolf_ff: IsolfForceField = serde_json::from_str(include_str!("../data/ff.json"))?;
+    let isolf_ff: ForceField = serde_json::from_str(include_str!("../data/ff.json"))?;
     println!("{:?}", isolf_ff);
-    let isolf_itp = IsolfItp::default();
+    let isolf_itp = ItpFile::default();
     println!("{}", isolf_itp);
 
     Ok(())
