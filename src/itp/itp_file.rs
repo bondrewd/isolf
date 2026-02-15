@@ -5,6 +5,7 @@ pub struct ItpFile {
     pub atom_types: Vec<crate::itp::atom_type::AtomType>,
     pub cg_lj_parameters: Vec<crate::itp::cg_lj_parameter::CgLjParameter>,
     pub cg_wca_parameters: Vec<crate::itp::cg_wca_parameter::CgWcaParameter>,
+    pub molecules: Vec<crate::itp::molecule::Molecule>,
 }
 
 impl fmt::Display for ItpFile {
@@ -33,6 +34,12 @@ impl fmt::Display for ItpFile {
         writeln!(f, ";    -     -   kJ/mol       nm")?;
         for cg_wca_parameter in &self.cg_wca_parameters {
             writeln!(f, "{}", cg_wca_parameter)?;
+        }
+
+        // Molecules
+        for molecule in &self.molecules {
+            writeln!(f, "{}", molecule)?;
+            writeln!(f)?;
         }
 
         Ok(())
