@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Atom {
     pub name: String,
     pub e: f64,
@@ -11,27 +11,27 @@ pub struct Atom {
     pub p: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct LipidAtom {
     pub name: String,
     pub id: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct LipidBond {
     pub ids: [u64; 2],
     pub k: f64,
     pub r0: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct LipidAngle {
     pub ids: [u64; 3],
     pub k: f64,
     pub t0: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Lipid {
     pub name: String,
     pub atoms: Vec<LipidAtom>,
@@ -39,7 +39,7 @@ pub struct Lipid {
     pub angles: Vec<LipidAngle>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ForceField {
     pub atoms: Vec<Atom>,
     pub lipids: Vec<Lipid>,
