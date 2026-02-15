@@ -17,6 +17,20 @@ struct Args {
     #[arg(default_value_t = String::from("sim"))]
     output: String,
 
+    /// Upper layer composition
+    #[arg(short)]
+    #[arg(long)]
+    #[arg(value_name = "COMPOSITION")]
+    #[arg(default_value_t = String::from("DOPC:128,DOPS:128"))]
+    upper: String,
+
+    /// Lower layer composition
+    #[arg(short)]
+    #[arg(long)]
+    #[arg(value_name = "COMPOSITION")]
+    #[arg(default_value_t = String::from("DOPC:128,DOPS:128"))]
+    lower: String,
+
     /// Simulation temperature
     #[arg(long)]
     #[arg(value_name = "TEMPERATURE")]
