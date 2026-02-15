@@ -110,8 +110,8 @@ fn run() -> Result<()> {
     fs::create_dir_all(&output_path)?;
 
     let equ_input_file = isolf::inp::builder::InputFileBuilder::default()
-        .input_grotop("./membrane.top")
-        .input_grocrd("./membrane.gro")
+        .input_grotop("./system.top")
+        .input_grocrd("./system.gro")
         .output_dcd("./equilibration.dcd", args.equilibration_dcd_period)
         .output_rst("./equilibration.rst", args.equilibration_rst_period)
         .solvent_temperature(args.temperature)
@@ -126,8 +126,8 @@ fn run() -> Result<()> {
     fs::write(&equ_input_path, equ_input_file.to_string())?;
 
     let pro_input_file = isolf::inp::builder::InputFileBuilder::default()
-        .input_grotop("./membrane.top")
-        .input_grocrd("./membrane.gro")
+        .input_grotop("./system.top")
+        .input_grocrd("./system.gro")
         .input_rst("./equilibration.rst")
         .output_dcd("./production.dcd", args.production_dcd_period)
         .output_rst("./production.rst", args.equilibration_rst_period)
