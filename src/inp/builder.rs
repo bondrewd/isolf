@@ -1,102 +1,14 @@
 use crate::error::IsolfError;
 use colored::Colorize;
 use rand::Rng;
-use std::fmt;
-
-#[derive(Debug)]
-pub struct Output {
-    path: String,
-    period: u64,
-}
-
-impl Output {
-    pub fn new(path: &str, period: u64) -> Self {
-        Output {
-            path: path.to_string(),
-            period,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum Ensemble {
-    Nve,
-    Nvt {
-        temperature: f64,
-        gamma_t: f64,
-    },
-    Npt {
-        temperature: f64,
-        pressure: f64,
-        gamma_t: f64,
-        gamma_p: f64,
-    },
-}
-
-impl Ensemble {
-    pub fn nve() -> Self {
-        Ensemble::Nve
-    }
-
-    pub fn nvt(temperature: f64, gamma_t: f64) -> Self {
-        Ensemble::Nvt {
-            temperature,
-            gamma_t,
-        }
-    }
-
-    pub fn npt(temperature: f64, pressure: f64, gamma_t: f64, gamma_p: f64) -> Self {
-        Ensemble::Npt {
-            temperature,
-            pressure,
-            gamma_t,
-            gamma_p,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct BoxSize {
-    pub x: f64,
-    pub y: f64,
-    pub z: f64,
-}
-
-impl BoxSize {
-    pub fn new(x: f64, y: f64, z: f64) -> Self {
-        BoxSize { x, y, z }
-    }
-}
-
-#[derive(Debug)]
-pub enum Boundary {
-    NoBc,
-    Pbc { box_size: Option<BoxSize> },
-}
-
-impl Boundary {
-    pub fn nobc() -> Self {
-        Boundary::NoBc
-    }
-
-    pub fn pbc() -> Self {
-        Boundary::Pbc { box_size: None }
-    }
-
-    pub fn pbc_with_box_size(x: f64, y: f64, z: f64) -> Self {
-        Boundary::Pbc {
-            box_size: Some(BoxSize::new(x, y, z)),
-        }
-    }
-}
 
 #[derive(Debug, Default)]
 pub struct InputFileBuilder {
     input_grotop: Option<String>,
     input_grocrd: Option<String>,
     input_rst: Option<String>,
-    output_rst: Option<Output>,
-    output_dcd: Option<Output>,
+    output_rst: Option<crate::inp::output::Output>,
+    output_dcd: Option<crate::inp::output::Output>,
     solvent_temperature: Option<f64>,
     solvent_ionic_strength: Option<f64>,
     time_step: Option<f64>,
@@ -105,12 +17,12 @@ pub struct InputFileBuilder {
     update_nb_period: Option<u64>,
     remove_tr_period: Option<u64>,
     seed: Option<u16>,
-    ensemble: Option<Ensemble>,
-    boundary: Option<Boundary>,
+    ensemble: crate::inp::ensemble::Ensemble,
+    boundary: crate::inp::boundary::Boundary,
 }
 
 impl InputFileBuilder {
-    pub fn build(self) -> Result<InputFile, IsolfError> {
+    pub fn build(self) -> Result<crate::inp::input::InputFile, IsolfError> {
         // assert the presence of required fields
         let input_grotop = self
             .input_grotop
@@ -136,13 +48,8 @@ impl InputFileBuilder {
             .remove_tr_period
             .ok_or_else(|| IsolfError::missing_required_field("remove_tr_period"))?;
 
-        let ensemble = self
-            .ensemble
-            .ok_or_else(|| IsolfError::missing_required_field("ensemble"))?;
-
-        let boundary = self
-            .boundary
-            .ok_or_else(|| IsolfError::missing_required_field("boundary"))?;
+        let ensemble = self.ensemble;
+        let boundary = self.boundary;
 
         // set default values for optional fields
         let time_step = self.time_step.unwrap_or(0.01);
@@ -165,7 +72,7 @@ impl InputFileBuilder {
         }
 
         // if output_rst is present, the period must be greater than zero
-        if let Some(Output { period: 0, .. }) = output_rst {
+        if let Some(crate::inp::output::Output { period: 0, .. }) = output_rst {
             return Err(IsolfError::invalid_field_value(
                 "output_rst",
                 0,
@@ -174,7 +81,7 @@ impl InputFileBuilder {
         }
 
         // if output_dcd is present, the period must be greater than zero
-        if let Some(Output { period: 0, .. }) = output_dcd {
+        if let Some(crate::inp::output::Output { period: 0, .. }) = output_dcd {
             return Err(IsolfError::invalid_field_value(
                 "output_dcd",
                 0,
@@ -230,7 +137,8 @@ impl InputFileBuilder {
         // emit a warning if the solvent temperature is different from
         // the ensemble temperature
         match &ensemble {
-            Ensemble::Nvt { temperature, .. } | Ensemble::Npt { temperature, .. } => {
+            crate::inp::ensemble::Ensemble::Nvt { temperature, .. }
+            | crate::inp::ensemble::Ensemble::Npt { temperature, .. } => {
                 if *temperature != solvent_temperature {
                     eprintln!(
                         "{} solvent temperature ({}) is different from ensemble temperature ({})",
@@ -245,7 +153,12 @@ impl InputFileBuilder {
 
         // when using a PBC boundary, the box size should not be present
         // if continuing a simulation from a restart file
-        if input_rst.is_some() && matches!(boundary, Boundary::Pbc { box_size: Some(_) }) {
+        if input_rst.is_some()
+            && matches!(
+                boundary,
+                crate::inp::boundary::Boundary::Pbc { box_size: Some(_) }
+            )
+        {
             return Err(IsolfError::invalid_field_value(
                 "boundary",
                 "box_size",
@@ -256,8 +169,11 @@ impl InputFileBuilder {
         // when using a PBC boundary, the box size should be present if
         // running a new simulation
         if input_rst.is_none()
-            && matches!(boundary, Boundary::Pbc { box_size: None })
-            && let Boundary::Pbc { box_size: None } = &boundary
+            && matches!(
+                boundary,
+                crate::inp::boundary::Boundary::Pbc { box_size: None }
+            )
+            && let crate::inp::boundary::Boundary::Pbc { box_size: None } = &boundary
         {
             return Err(IsolfError::invalid_field_value(
                 "boundary",
@@ -266,7 +182,7 @@ impl InputFileBuilder {
             ));
         }
 
-        Ok(InputFile {
+        Ok(crate::inp::input::InputFile {
             input_grotop,
             input_grocrd,
             input_rst,
@@ -300,13 +216,13 @@ impl InputFileBuilder {
         self
     }
 
-    pub fn output_rst(mut self, output_rst: Output) -> Self {
-        self.output_rst = Some(output_rst);
+    pub fn output_rst(mut self, path: &str, period: u64) -> Self {
+        self.output_rst = Some(crate::inp::output::Output::new(path, period));
         self
     }
 
-    pub fn output_dcd(mut self, output_dcd: Output) -> Self {
-        self.output_dcd = Some(output_dcd);
+    pub fn output_dcd(mut self, path: &str, period: u64) -> Self {
+        self.output_dcd = Some(crate::inp::output::Output::new(path, period));
         self
     }
 
@@ -350,134 +266,24 @@ impl InputFileBuilder {
         self
     }
 
-    pub fn ensemble(mut self, ensemble: Ensemble) -> Self {
-        self.ensemble = Some(ensemble);
+    pub fn nvt(mut self, temperature: f64, gamma_t: f64) -> Self {
+        self.ensemble = crate::inp::ensemble::Ensemble::nvt(temperature, gamma_t);
         self
     }
 
-    pub fn boundary(mut self, boundary: Boundary) -> Self {
-        self.boundary = Some(boundary);
+    pub fn npt(mut self, temperature: f64, pressure: f64, gamma_t: f64, gamma_p: f64) -> Self {
+        self.ensemble =
+            crate::inp::ensemble::Ensemble::npt(temperature, pressure, gamma_t, gamma_p);
         self
     }
-}
 
-pub struct InputFile {
-    input_grotop: String,
-    input_grocrd: String,
-    input_rst: Option<String>,
-    output_rst: Option<Output>,
-    output_dcd: Option<Output>,
-    solvent_temperature: f64,
-    solvent_ionic_strength: f64,
-    time_step: f64,
-    num_steps: u64,
-    output_ene_period: u64,
-    update_nb_period: u64,
-    remove_tr_period: u64,
-    seed: u16,
-    ensemble: Ensemble,
-    boundary: Boundary,
-}
+    pub fn pbc(mut self) -> Self {
+        self.boundary = crate::inp::boundary::Boundary::pbc();
+        self
+    }
 
-impl fmt::Display for InputFile {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // Input
-        writeln!(f, "[INPUT]")?;
-        writeln!(f, "grotopfile            = {}", self.input_grotop)?;
-        writeln!(f, "grocrdfile            = {}", self.input_grocrd)?;
-        if let Some(input_rst) = &self.input_rst {
-            writeln!(f, "rstfile               = {}", input_rst)?;
-        }
-        writeln!(f)?;
-
-        // Output
-        writeln!(f, "[OUTPUT]")?;
-        if let Some(output_rst) = &self.output_rst {
-            writeln!(f, "rstfile               = {}", output_rst.path)?;
-        }
-        if let Some(output_dcd) = &self.output_dcd {
-            writeln!(f, "dcdfile               = {}", output_dcd.path)?;
-        }
-        writeln!(f)?;
-
-        // Energy
-        writeln!(f, "[ENERGY]")?;
-        writeln!(f, "forcefield            = RESIDCG",)?;
-        writeln!(f, "electrostatic         = CUTOFF",)?;
-        writeln!(f, "nonb_limiter          = YES",)?;
-        writeln!(f, "cg_sol_temperature    = {}", self.solvent_temperature)?;
-        writeln!(f, "cg_sol_ionic_strength = {}", self.solvent_ionic_strength)?;
-        writeln!(f)?;
-
-        // Dynamics
-        writeln!(f, "[DYNAMICS]")?;
-        writeln!(f, "integrator            = VVER_CG",)?;
-        writeln!(f, "timestep              = {}", self.time_step)?;
-        writeln!(f, "nsteps                = {}", self.num_steps)?;
-        writeln!(f, "eneout_period         = {}", self.output_ene_period)?;
-        if let Some(output_crd) = &self.output_dcd {
-            writeln!(f, "crdout_period         = {}", output_crd.period)?;
-        }
-        if let Some(output_rst) = &self.output_rst {
-            writeln!(f, "rstout_period         = {}", output_rst.period)?;
-        }
-        writeln!(f, "nbupdate_period       = {}", self.update_nb_period)?;
-        writeln!(f, "stoptr_period         = {}", self.remove_tr_period)?;
-        writeln!(f, "iseed                 = {}", self.seed)?;
-        writeln!(f)?;
-
-        // Constraints
-        writeln!(f, "[CONSTRAINTS]")?;
-        writeln!(f, "rigid_bond            = NO",)?;
-        writeln!(f)?;
-
-        // Ensemble
-        writeln!(f, "[ENSEMBLE]")?;
-        match self.ensemble {
-            Ensemble::Nve => {
-                writeln!(f, "ensemble              = NVE")?;
-                writeln!(f, "tpcontrol             = NO")?;
-            }
-            Ensemble::Nvt {
-                temperature,
-                gamma_t,
-            } => {
-                writeln!(f, "ensemble              = NVT")?;
-                writeln!(f, "tpcontrol             = LANGEVIN")?;
-                writeln!(f, "temperature           = {}", temperature)?;
-                writeln!(f, "gamma_t               = {}", gamma_t)?;
-            }
-            Ensemble::Npt {
-                temperature,
-                pressure,
-                gamma_t,
-                gamma_p,
-            } => {
-                writeln!(f, "ensemble              = NPT")?;
-                writeln!(f, "tpcontrol             = LANGEVIN")?;
-                writeln!(f, "temperature           = {}", temperature)?;
-                writeln!(f, "pressure              = {}", pressure)?;
-                writeln!(f, "gamma_t               = {}", gamma_t)?;
-                writeln!(f, "gamma_p               = {}", gamma_p)?;
-                writeln!(f, "isotropy              = Z-FIXED-SEMI-ISO")?;
-            }
-        }
-        writeln!(f)?;
-
-        // Boundary
-        writeln!(f, "[Boundary]",)?;
-        match &self.boundary {
-            Boundary::NoBc => writeln!(f, "type                  = NOBC")?,
-            Boundary::Pbc { box_size } => {
-                writeln!(f, "type                  = PBC")?;
-                if let Some(box_size) = box_size {
-                    writeln!(f, "box_size_x            = {}", box_size.x)?;
-                    writeln!(f, "box_size_y            = {}", box_size.y)?;
-                    writeln!(f, "box_size_z            = {}", box_size.z)?;
-                }
-            }
-        }
-
-        Ok(())
+    pub fn pbc_with_box_size(mut self, x: f64, y: f64, z: f64) -> Self {
+        self.boundary = crate::inp::boundary::Boundary::pbc_with_box_size(x, y, z);
+        self
     }
 }

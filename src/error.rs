@@ -1,10 +1,5 @@
-use std::path::PathBuf;
-
 #[derive(thiserror::Error, Debug)]
 pub enum IsolfError {
-    #[error("CSV error at {path}: {source}")]
-    Csv { path: PathBuf, source: csv::Error },
-
     #[error("Invalid input '{input}': {reason}")]
     InvalidInput { input: String, reason: String },
 
@@ -20,10 +15,6 @@ pub enum IsolfError {
 }
 
 impl IsolfError {
-    pub fn csv(path: PathBuf, source: csv::Error) -> Self {
-        IsolfError::Csv { path, source }
-    }
-
     pub fn invalid_input(input: String, reason: String) -> Self {
         IsolfError::InvalidInput { input, reason }
     }

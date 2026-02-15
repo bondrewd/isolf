@@ -1,8 +1,7 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use colored::Colorize;
-use isolf::csv::parse_isolf_csv;
-use isolf::itp::IsolfItp;
+use isolf::itp::{IsolfForceField, IsolfItp};
 use std::fs;
 use std::path::PathBuf;
 
@@ -110,55 +109,42 @@ fn run() -> Result<()> {
 
     fs::create_dir_all(&output_path)?;
 
-    let equ_input_file = isolf::inp::InputFileBuilder::default()
+    let equ_input_file = isolf::inp::builder::InputFileBuilder::default()
         .input_grotop("./membrane.top")
         .input_grocrd("./membrane.gro")
-        .output_dcd(isolf::inp::Output::new(
-            "./equilibration.dcd",
-            args.equilibration_dcd_period,
-        ))
-        .output_rst(isolf::inp::Output::new(
-            "./equilibration.rst",
-            args.equilibration_rst_period,
-        ))
+        .output_dcd("./equilibration.dcd", args.equilibration_dcd_period)
+        .output_rst("./equilibration.rst", args.equilibration_rst_period)
         .solvent_temperature(args.temperature)
         .num_steps(args.equilibration_steps)
         .output_ene_period(args.equilibration_ene_period)
         .update_nb_period(args.equilibration_nb_period)
         .remove_tr_period(args.equilibration_tr_period)
-        .ensemble(isolf::inp::Ensemble::npt(args.temperature, 0.0, 0.01, 0.01))
-        .boundary(isolf::inp::Boundary::pbc_with_box_size(
-            255.821, 255.821, 200.0,
-        ))
+        .npt(args.temperature, 0.0, 0.01, 0.01)
+        .pbc_with_box_size(255.821, 255.821, 200.0)
         .build()?;
     let equ_input_path = output_path.join("equilibration.inp");
     fs::write(&equ_input_path, equ_input_file.to_string())?;
 
-    let pro_input_file = isolf::inp::InputFileBuilder::default()
+    let pro_input_file = isolf::inp::builder::InputFileBuilder::default()
         .input_grotop("./membrane.top")
         .input_grocrd("./membrane.gro")
         .input_rst("./equilibration.rst")
-        .output_dcd(isolf::inp::Output::new(
-            "./production.dcd",
-            args.production_dcd_period,
-        ))
-        .output_rst(isolf::inp::Output::new(
-            "./production.rst",
-            args.equilibration_rst_period,
-        ))
+        .output_dcd("./production.dcd", args.production_dcd_period)
+        .output_rst("./production.rst", args.equilibration_rst_period)
         .solvent_temperature(args.temperature)
         .num_steps(args.production_steps)
         .output_ene_period(args.production_ene_period)
         .update_nb_period(args.production_nb_period)
         .remove_tr_period(args.production_tr_period)
-        .ensemble(isolf::inp::Ensemble::npt(args.temperature, 0.0, 0.01, 0.01))
-        .boundary(isolf::inp::Boundary::pbc())
+        .npt(args.temperature, 0.0, 0.01, 0.01)
+        .pbc()
         .build()?;
     let pro_input_path = output_path.join("production.inp");
     fs::write(&pro_input_path, pro_input_file.to_string())?;
 
-    let isolf_csv = parse_isolf_csv()?;
-    let isolf_itp = IsolfItp::try_from(isolf_csv)?;
+    let isolf_ff: IsolfForceField = serde_json::from_str(include_str!("../data/ff.json"))?;
+    println!("{:?}", isolf_ff);
+    let isolf_itp = IsolfItp::default();
     println!("{}", isolf_itp);
 
     Ok(())
