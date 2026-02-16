@@ -21,7 +21,7 @@ impl fmt::Display for Molecule {
         writeln!(f, "; nr   type  resnr    res   atom   cg   charge     mass")?;
         writeln!(f, ";  -      -      -      -      -    -        e      amu")?;
         for atom in &self.atoms {
-            writeln!(f, "{}", atom)?;
+            writeln!(f, "{atom}")?;
         }
         writeln!(f)?;
 
@@ -30,7 +30,7 @@ impl fmt::Display for Molecule {
         writeln!(f, ";  i   j   f       eq           coef")?;
         writeln!(f, ";  -   -   -       nm  kJ*nm-2*mol-1")?;
         for bond in &self.bonds {
-            writeln!(f, "{}", bond)?;
+            writeln!(f, "{bond}")?;
         }
         writeln!(f)?;
 
@@ -39,7 +39,7 @@ impl fmt::Display for Molecule {
         writeln!(f, ";  i   j   k   f       eq           coef")?;
         writeln!(f, ";  -   -   -   -      deg kJ*rad-2*mol-1")?;
         for angle in &self.angles {
-            writeln!(f, "{}", angle)?;
+            writeln!(f, "{angle}")?;
         }
 
         Ok(())

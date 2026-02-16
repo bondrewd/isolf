@@ -26,7 +26,7 @@ impl fmt::Display for ItpFile {
         writeln!(f, "; name   n     mass   charge ptype     rmin      eps")?;
         writeln!(f, ";    -   -    g/mol        e     -       nm   kJ/mol")?;
         for atom_type in &self.atom_types {
-            writeln!(f, "{}", atom_type)?;
+            writeln!(f, "{atom_type}")?;
         }
         writeln!(f)?;
 
@@ -35,7 +35,7 @@ impl fmt::Display for ItpFile {
         writeln!(f, "; name  name  epsilon    sigma  cut-off")?;
         writeln!(f, ";    -     -   kJ/mol       nm       nm")?;
         for cg_lj_parameter in &self.cg_lj_parameters {
-            writeln!(f, "{}", cg_lj_parameter)?;
+            writeln!(f, "{cg_lj_parameter}")?;
         }
         writeln!(f)?;
 
@@ -44,12 +44,12 @@ impl fmt::Display for ItpFile {
         writeln!(f, "; name  name  epsilon    sigma")?;
         writeln!(f, ";    -     -   kJ/mol       nm")?;
         for cg_wca_parameter in &self.cg_wca_parameters {
-            writeln!(f, "{}", cg_wca_parameter)?;
+            writeln!(f, "{cg_wca_parameter}")?;
         }
 
         // Molecules
         for molecule in &self.molecules {
-            writeln!(f, "{}", molecule)?;
+            writeln!(f, "{molecule}")?;
         }
 
         Ok(())
@@ -85,7 +85,7 @@ impl TryFrom<ForceField> for ItpFile {
                     bead1: atom1.name.to_uppercase(),
                     bead2: atom2.name.to_uppercase(),
                     epsilon: (atom1.e * atom2.e).sqrt(),
-                    sigma: (atom1.s + atom2.s) / 2.0,
+                    sigma: f64::midpoint(atom1.s, atom2.s),
                     cutoff: 2.5 * (atom1.s + atom2.s) / 2.0,
                 })
             })
@@ -97,7 +97,7 @@ impl TryFrom<ForceField> for ItpFile {
                     bead1: atom1.name.to_uppercase(),
                     bead2: atom2.name.to_uppercase(),
                     epsilon: (atom1.e * atom2.e).sqrt(),
-                    sigma: (atom1.s + atom2.s) / 2.0,
+                    sigma: f64::midpoint(atom1.s, atom2.s),
                     cutoff: 2.5 * (atom1.s + atom2.s) / 2.0,
                 })
             })
@@ -117,7 +117,7 @@ impl TryFrom<ForceField> for ItpFile {
                     bead1: atom1.name.to_uppercase(),
                     bead2: atom2.name.to_uppercase(),
                     epsilon: (atom1.e * atom2.e).sqrt(),
-                    sigma: (atom1.s + atom2.s) / 2.0,
+                    sigma: f64::midpoint(atom1.s, atom2.s),
                 })
             })
             .collect();
@@ -128,7 +128,7 @@ impl TryFrom<ForceField> for ItpFile {
                     bead1: atom1.name.to_uppercase(),
                     bead2: atom2.name.to_uppercase(),
                     epsilon: (atom1.e * atom2.e).sqrt(),
-                    sigma: (atom1.s + atom2.s) / 2.0,
+                    sigma: f64::midpoint(atom1.s, atom2.s),
                 })
             })
             .collect();

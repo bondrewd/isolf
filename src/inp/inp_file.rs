@@ -30,7 +30,7 @@ impl fmt::Display for InputFile {
         writeln!(f, "grotopfile            = {}", self.input_grotop)?;
         writeln!(f, "grocrdfile            = {}", self.input_grocrd)?;
         if let Some(input_rst) = &self.input_rst {
-            writeln!(f, "rstfile               = {}", input_rst)?;
+            writeln!(f, "rstfile               = {input_rst}")?;
         }
         writeln!(f)?;
 
@@ -88,8 +88,8 @@ impl fmt::Display for InputFile {
             } => {
                 writeln!(f, "ensemble              = NVT")?;
                 writeln!(f, "tpcontrol             = LANGEVIN")?;
-                writeln!(f, "temperature           = {}", temperature)?;
-                writeln!(f, "gamma_t               = {}", gamma_t)?;
+                writeln!(f, "temperature           = {temperature}")?;
+                writeln!(f, "gamma_t               = {gamma_t}")?;
             }
             Ensemble::Npt {
                 temperature,
@@ -99,10 +99,10 @@ impl fmt::Display for InputFile {
             } => {
                 writeln!(f, "ensemble              = NPT")?;
                 writeln!(f, "tpcontrol             = LANGEVIN")?;
-                writeln!(f, "temperature           = {}", temperature)?;
-                writeln!(f, "pressure              = {}", pressure)?;
-                writeln!(f, "gamma_t               = {}", gamma_t)?;
-                writeln!(f, "gamma_p               = {}", gamma_p)?;
+                writeln!(f, "temperature           = {temperature}")?;
+                writeln!(f, "pressure              = {pressure}")?;
+                writeln!(f, "gamma_t               = {gamma_t}")?;
+                writeln!(f, "gamma_p               = {gamma_p}")?;
                 writeln!(f, "isotropy              = Z-FIXED-SEMI-ISO")?;
             }
         }
@@ -115,9 +115,9 @@ impl fmt::Display for InputFile {
             Boundary::Pbc { box_size } => {
                 writeln!(f, "type                  = PBC")?;
                 if let Some(BoxSize { x, y, z }) = box_size {
-                    writeln!(f, "box_size_x            = {}", x)?;
-                    writeln!(f, "box_size_y            = {}", y)?;
-                    writeln!(f, "box_size_z            = {}", z)?;
+                    writeln!(f, "box_size_x            = {x}")?;
+                    writeln!(f, "box_size_y            = {y}")?;
+                    writeln!(f, "box_size_z            = {z}")?;
                 }
             }
         }
