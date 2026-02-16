@@ -104,7 +104,7 @@ impl TryFrom<ForceField> for ItpFile {
             .collect();
         let cg_lj_parameters = cg_lj_parameters_polar_polar
             .into_iter()
-            .chain(cg_lj_parameters_polar_charged.into_iter())
+            .chain(cg_lj_parameters_polar_charged)
             .collect();
 
         // CG WCA Parameters
@@ -134,7 +134,7 @@ impl TryFrom<ForceField> for ItpFile {
             .collect();
         let cg_wca_parameters = cg_wca_parameters_no_tail_no_tail
             .into_iter()
-            .chain(cg_wca_parameters_no_tail_tail.into_iter())
+            .chain(cg_wca_parameters_no_tail_tail)
             .collect();
 
         // Molecules
@@ -191,11 +191,12 @@ impl TryFrom<ForceField> for ItpFile {
             })
             .collect();
 
-        let mut itp_file = ItpFile::default();
-        itp_file.atom_types = atom_types;
-        itp_file.cg_lj_parameters = cg_lj_parameters;
-        itp_file.cg_wca_parameters = cg_wca_parameters;
-        itp_file.molecules = molecules;
+        let itp_file = ItpFile {
+            atom_types,
+            cg_lj_parameters,
+            cg_wca_parameters,
+            molecules,
+        };
 
         Ok(itp_file)
     }
