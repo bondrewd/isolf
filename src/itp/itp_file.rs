@@ -1,12 +1,22 @@
+use crate::error::IsolfError;
+use crate::itp::angle::Angle;
+use crate::itp::atom::Atom;
+use crate::itp::atom_type::AtomType;
+use crate::itp::bond::Bond;
+use crate::itp::cg_lj_parameter::CgLjParameter;
+use crate::itp::cg_wca_parameter::CgWcaParameter;
+use crate::itp::force_field::Bead;
+use crate::itp::force_field::ForceField;
+use crate::itp::molecule::Molecule;
 use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Debug, Default)]
 pub struct ItpFile {
-    pub atom_types: Vec<crate::itp::atom_type::AtomType>,
-    pub cg_lj_parameters: Vec<crate::itp::cg_lj_parameter::CgLjParameter>,
-    pub cg_wca_parameters: Vec<crate::itp::cg_wca_parameter::CgWcaParameter>,
-    pub molecules: Vec<crate::itp::molecule::Molecule>,
+    pub atom_types: Vec<AtomType>,
+    pub cg_lj_parameters: Vec<CgLjParameter>,
+    pub cg_wca_parameters: Vec<CgWcaParameter>,
+    pub molecules: Vec<Molecule>,
 }
 
 impl fmt::Display for ItpFile {
@@ -46,15 +56,15 @@ impl fmt::Display for ItpFile {
     }
 }
 
-impl TryFrom<crate::itp::force_field::ForceField> for ItpFile {
-    type Error = crate::error::IsolfError;
+impl TryFrom<ForceField> for ItpFile {
+    type Error = IsolfError;
 
-    fn try_from(ff: crate::itp::force_field::ForceField) -> Result<Self, Self::Error> {
+    fn try_from(ff: ForceField) -> Result<Self, Self::Error> {
         // Atom types
         let atom_types = ff
             .atoms
             .iter()
-            .map(|atom| crate::itp::atom_type::AtomType {
+            .map(|atom| AtomType {
                 name: atom.name.to_uppercase(),
                 n: 1,
                 mass: atom.m,
@@ -66,78 +76,62 @@ impl TryFrom<crate::itp::force_field::ForceField> for ItpFile {
             .collect();
 
         // CG LJ Parameters
-        let polar_atoms: Vec<&crate::itp::force_field::Atom> =
-            ff.atoms.iter().filter(|atom| atom.p).collect();
-        let charged_atoms: Vec<&crate::itp::force_field::Atom> =
-            ff.atoms.iter().filter(|atom| atom.q != 0.0).collect();
-        let cg_lj_parameters_polar_polar: Vec<crate::itp::cg_lj_parameter::CgLjParameter> =
-            polar_atoms
-                .iter()
-                .flat_map(|atom1| {
-                    polar_atoms
-                        .iter()
-                        .map(|atom2| crate::itp::cg_lj_parameter::CgLjParameter {
-                            bead1: atom1.name.to_uppercase(),
-                            bead2: atom2.name.to_uppercase(),
-                            epsilon: (atom1.e * atom2.e).sqrt(),
-                            sigma: (atom1.s + atom2.s) / 2.0,
-                            cutoff: 2.5 * (atom1.s + atom2.s) / 2.0,
-                        })
+        let polar_atoms: Vec<&Bead> = ff.atoms.iter().filter(|atom| atom.p).collect();
+        let charged_atoms: Vec<&Bead> = ff.atoms.iter().filter(|atom| atom.q != 0.0).collect();
+        let cg_lj_parameters_polar_polar: Vec<CgLjParameter> = polar_atoms
+            .iter()
+            .flat_map(|atom1| {
+                polar_atoms.iter().map(|atom2| CgLjParameter {
+                    bead1: atom1.name.to_uppercase(),
+                    bead2: atom2.name.to_uppercase(),
+                    epsilon: (atom1.e * atom2.e).sqrt(),
+                    sigma: (atom1.s + atom2.s) / 2.0,
+                    cutoff: 2.5 * (atom1.s + atom2.s) / 2.0,
                 })
-                .collect();
-        let cg_lj_parameters_polar_charged: Vec<crate::itp::cg_lj_parameter::CgLjParameter> =
-            polar_atoms
-                .iter()
-                .flat_map(|atom1| {
-                    charged_atoms
-                        .iter()
-                        .map(|atom2| crate::itp::cg_lj_parameter::CgLjParameter {
-                            bead1: atom1.name.to_uppercase(),
-                            bead2: atom2.name.to_uppercase(),
-                            epsilon: (atom1.e * atom2.e).sqrt(),
-                            sigma: (atom1.s + atom2.s) / 2.0,
-                            cutoff: 2.5 * (atom1.s + atom2.s) / 2.0,
-                        })
+            })
+            .collect();
+        let cg_lj_parameters_polar_charged: Vec<CgLjParameter> = polar_atoms
+            .iter()
+            .flat_map(|atom1| {
+                charged_atoms.iter().map(|atom2| CgLjParameter {
+                    bead1: atom1.name.to_uppercase(),
+                    bead2: atom2.name.to_uppercase(),
+                    epsilon: (atom1.e * atom2.e).sqrt(),
+                    sigma: (atom1.s + atom2.s) / 2.0,
+                    cutoff: 2.5 * (atom1.s + atom2.s) / 2.0,
                 })
-                .collect();
+            })
+            .collect();
         let cg_lj_parameters = cg_lj_parameters_polar_polar
             .into_iter()
             .chain(cg_lj_parameters_polar_charged.into_iter())
             .collect();
 
         // CG WCA Parameters
-        let no_tail_atoms: Vec<&crate::itp::force_field::Atom> =
-            ff.atoms.iter().filter(|atom| atom.w.is_none()).collect();
-        let tail_atoms: Vec<&crate::itp::force_field::Atom> =
-            ff.atoms.iter().filter(|atom| atom.w.is_some()).collect();
-        let cg_wca_parameters_no_tail_no_tail: Vec<crate::itp::cg_wca_parameter::CgWcaParameter> =
-            no_tail_atoms
-                .iter()
-                .flat_map(|atom1| {
-                    no_tail_atoms
-                        .iter()
-                        .map(|atom2| crate::itp::cg_wca_parameter::CgWcaParameter {
-                            bead1: atom1.name.to_uppercase(),
-                            bead2: atom2.name.to_uppercase(),
-                            epsilon: (atom1.e * atom2.e).sqrt(),
-                            sigma: (atom1.s + atom2.s) / 2.0,
-                        })
+        let no_tail_atoms: Vec<&Bead> = ff.atoms.iter().filter(|atom| atom.w.is_none()).collect();
+        let tail_atoms: Vec<&Bead> = ff.atoms.iter().filter(|atom| atom.w.is_some()).collect();
+        let cg_wca_parameters_no_tail_no_tail: Vec<CgWcaParameter> = no_tail_atoms
+            .iter()
+            .flat_map(|atom1| {
+                no_tail_atoms.iter().map(|atom2| CgWcaParameter {
+                    bead1: atom1.name.to_uppercase(),
+                    bead2: atom2.name.to_uppercase(),
+                    epsilon: (atom1.e * atom2.e).sqrt(),
+                    sigma: (atom1.s + atom2.s) / 2.0,
                 })
-                .collect();
-        let cg_wca_parameters_no_tail_tail: Vec<crate::itp::cg_wca_parameter::CgWcaParameter> =
-            polar_atoms
-                .iter()
-                .flat_map(|atom1| {
-                    tail_atoms
-                        .iter()
-                        .map(|atom2| crate::itp::cg_wca_parameter::CgWcaParameter {
-                            bead1: atom1.name.to_uppercase(),
-                            bead2: atom2.name.to_uppercase(),
-                            epsilon: (atom1.e * atom2.e).sqrt(),
-                            sigma: (atom1.s + atom2.s) / 2.0,
-                        })
+            })
+            .collect();
+        let cg_wca_parameters_no_tail_tail: Vec<CgWcaParameter> = polar_atoms
+            .iter()
+            .flat_map(|atom1| {
+                tail_atoms.iter().map(|atom2| CgWcaParameter {
+                    bead1: atom1.name.to_uppercase(),
+                    bead2: atom2.name.to_uppercase(),
+                    epsilon: (atom1.e * atom2.e).sqrt(),
+                    sigma: (atom1.s + atom2.s) / 2.0,
                 })
-                .collect();
+            })
+            .collect();
         let cg_wca_parameters = cg_wca_parameters_no_tail_no_tail
             .into_iter()
             .chain(cg_wca_parameters_no_tail_tail.into_iter())
@@ -153,7 +147,7 @@ impl TryFrom<crate::itp::force_field::ForceField> for ItpFile {
             .lipids
             .iter()
             .map(|lipid| {
-                let mut molecule = crate::itp::molecule::Molecule::default();
+                let mut molecule = Molecule::default();
                 // Molecule type
                 molecule.molecule_type.name = lipid.name.to_uppercase();
                 // Molecule atoms
@@ -163,7 +157,7 @@ impl TryFrom<crate::itp::force_field::ForceField> for ItpFile {
                     .enumerate()
                     .map(|(id, atom)| {
                         let (mass, charge) = atoms_map.get(&atom.name).unwrap();
-                        crate::itp::atom::Atom {
+                        Atom {
                             atom_name: atom.name.to_uppercase(),
                             molecule_name: lipid.name.to_uppercase(),
                             q: *charge,
@@ -176,7 +170,7 @@ impl TryFrom<crate::itp::force_field::ForceField> for ItpFile {
                 molecule.bonds = lipid
                     .bonds
                     .iter()
-                    .map(|bond| crate::itp::bond::Bond {
+                    .map(|bond| Bond {
                         ids: [bond.ids[0] + 1, bond.ids[1] + 1],
                         k: bond.k,
                         r0: bond.r0,
@@ -186,7 +180,7 @@ impl TryFrom<crate::itp::force_field::ForceField> for ItpFile {
                 molecule.angles = lipid
                     .angles
                     .iter()
-                    .map(|angle| crate::itp::angle::Angle {
+                    .map(|angle| Angle {
                         ids: [angle.ids[0] + 1, angle.ids[1] + 1, angle.ids[2] + 1],
                         k: angle.k,
                         t0: angle.t0,
@@ -197,7 +191,7 @@ impl TryFrom<crate::itp::force_field::ForceField> for ItpFile {
             })
             .collect();
 
-        let mut itp_file = crate::itp::itp_file::ItpFile::default();
+        let mut itp_file = ItpFile::default();
         itp_file.atom_types = atom_types;
         itp_file.cg_lj_parameters = cg_lj_parameters;
         itp_file.cg_wca_parameters = cg_wca_parameters;

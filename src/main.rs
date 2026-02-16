@@ -1,7 +1,8 @@
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use colored::Colorize;
-use isolf::itp::{force_field::ForceField, itp_file::ItpFile};
+use isolf::itp::force_field::ForceField;
+use isolf::itp::itp_file::ItpFile;
 use std::fs;
 use std::path::PathBuf;
 

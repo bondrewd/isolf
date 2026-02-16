@@ -1,3 +1,7 @@
+use crate::inp::boundary::Boundary;
+use crate::inp::boundary::BoxSize;
+use crate::inp::ensemble::Ensemble;
+use crate::inp::output::Output;
 use std::fmt;
 
 #[derive(Debug, Default, Clone)]
@@ -5,8 +9,8 @@ pub struct InputFile {
     pub input_grotop: String,
     pub input_grocrd: String,
     pub input_rst: Option<String>,
-    pub output_rst: Option<crate::inp::output::Output>,
-    pub output_dcd: Option<crate::inp::output::Output>,
+    pub output_rst: Option<Output>,
+    pub output_dcd: Option<Output>,
     pub solvent_temperature: f64,
     pub solvent_ionic_strength: f64,
     pub time_step: f64,
@@ -15,8 +19,8 @@ pub struct InputFile {
     pub update_nb_period: u64,
     pub remove_tr_period: u64,
     pub seed: u16,
-    pub ensemble: crate::inp::ensemble::Ensemble,
-    pub boundary: crate::inp::boundary::Boundary,
+    pub ensemble: Ensemble,
+    pub boundary: Boundary,
 }
 
 impl fmt::Display for InputFile {
@@ -74,11 +78,11 @@ impl fmt::Display for InputFile {
         // ensemble::Ensemble
         writeln!(f, "[ENSEMBLE]")?;
         match self.ensemble {
-            crate::inp::ensemble::Ensemble::Nve => {
+            Ensemble::Nve => {
                 writeln!(f, "ensemble              = NVE")?;
                 writeln!(f, "tpcontrol             = NO")?;
             }
-            crate::inp::ensemble::Ensemble::Nvt {
+            Ensemble::Nvt {
                 temperature,
                 gamma_t,
             } => {
@@ -87,7 +91,7 @@ impl fmt::Display for InputFile {
                 writeln!(f, "temperature           = {}", temperature)?;
                 writeln!(f, "gamma_t               = {}", gamma_t)?;
             }
-            crate::inp::ensemble::Ensemble::Npt {
+            Ensemble::Npt {
                 temperature,
                 pressure,
                 gamma_t,
@@ -107,10 +111,10 @@ impl fmt::Display for InputFile {
         // Boundary
         writeln!(f, "[Boundary]",)?;
         match &self.boundary {
-            crate::inp::boundary::Boundary::NoBc => writeln!(f, "type                  = NOBC")?,
-            crate::inp::boundary::Boundary::Pbc { box_size } => {
+            Boundary::NoBc => writeln!(f, "type                  = NOBC")?,
+            Boundary::Pbc { box_size } => {
                 writeln!(f, "type                  = PBC")?;
-                if let Some(crate::inp::boundary::BoxSize { x, y, z }) = box_size {
+                if let Some(BoxSize { x, y, z }) = box_size {
                     writeln!(f, "box_size_x            = {}", x)?;
                     writeln!(f, "box_size_y            = {}", y)?;
                     writeln!(f, "box_size_z            = {}", z)?;
