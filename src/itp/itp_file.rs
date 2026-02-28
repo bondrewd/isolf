@@ -11,58 +11,14 @@ use crate::itp::molecule::Molecule;
 use std::collections::HashMap;
 use std::fmt;
 
-#[derive(Debug, Default)]
-pub struct ItpFile {
-    pub atom_types: Vec<AtomType>,
-    pub cg_lj_parameters: Vec<CgLjParameter>,
-    pub cg_wca_parameters: Vec<CgWcaParameter>,
-    pub molecules: Vec<Molecule>,
-}
+type AtomTypes = Vec<AtomType>;
+type CgLjParameters = Vec<CgLjParameter>;
+type CgWcaParameters = Vec<CgWcaParameter>;
+type Molecules = Vec<Molecule>;
 
-impl fmt::Display for ItpFile {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // Atom types
-        writeln!(f, "[ atomtypes ]")?;
-        writeln!(f, "; name   n     mass   charge ptype     rmin      eps")?;
-        writeln!(f, ";    -   -    g/mol        e     -       nm   kJ/mol")?;
-        for atom_type in &self.atom_types {
-            writeln!(f, "{atom_type}")?;
-        }
-        writeln!(f)?;
-
-        // CG LJ Parameters
-        writeln!(f, "[ cg_LJ_parameters ]")?;
-        writeln!(f, "; name  name  epsilon    sigma  cut-off")?;
-        writeln!(f, ";    -     -   kJ/mol       nm       nm")?;
-        for cg_lj_parameter in &self.cg_lj_parameters {
-            writeln!(f, "{cg_lj_parameter}")?;
-        }
-        writeln!(f)?;
-
-        // CG WCA Parameters
-        writeln!(f, "[ cg_WCA_parameters ]")?;
-        writeln!(f, "; name  name  epsilon    sigma")?;
-        writeln!(f, ";    -     -   kJ/mol       nm")?;
-        for cg_wca_parameter in &self.cg_wca_parameters {
-            writeln!(f, "{cg_wca_parameter}")?;
-        }
-
-        // Molecules
-        for molecule in &self.molecules {
-            writeln!(f, "{molecule}")?;
-        }
-
-        Ok(())
-    }
-}
-
-impl TryFrom<ForceField> for ItpFile {
-    type Error = IsolfError;
-
-    fn try_from(ff: ForceField) -> Result<Self, Self::Error> {
-        // Atom types
-        let atom_types = ff
-            .atoms
+impl From<ForceField> for AtomTypes {
+    fn from(ff: ForceField) -> Self {
+        ff.atoms
             .iter()
             .map(|atom| AtomType {
                 name: atom.name.to_uppercase(),
@@ -73,24 +29,24 @@ impl TryFrom<ForceField> for ItpFile {
                 rmin: 0.0,
                 eps: 0.0,
             })
-            .collect();
+            .collect()
+    }
+}
 
-        // CG LJ Parameters
+impl From<ForceField> for CgLjParameters {
+    fn from(ff: ForceField) -> Self {
         let polar_atoms: Vec<&Bead> = ff.atoms.iter().filter(|atom| atom.p).collect();
         let charged_atoms: Vec<&Bead> = ff.atoms.iter().filter(|atom| atom.q != 0.0).collect();
-        let cg_lj_parameters_polar_polar: Vec<CgLjParameter> = polar_atoms
-            .iter()
-            .flat_map(|atom1| {
-                polar_atoms.iter().map(|atom2| CgLjParameter {
-                    bead1: atom1.name.to_uppercase(),
-                    bead2: atom2.name.to_uppercase(),
-                    epsilon: (atom1.e * atom2.e).sqrt(),
-                    sigma: f64::midpoint(atom1.s, atom2.s),
-                    cutoff: 2.5 * (atom1.s + atom2.s) / 2.0,
-                })
+        let cg_lj_parameters_polar_polar = polar_atoms.iter().flat_map(|atom1| {
+            polar_atoms.iter().map(|atom2| CgLjParameter {
+                bead1: atom1.name.to_uppercase(),
+                bead2: atom2.name.to_uppercase(),
+                epsilon: (atom1.e * atom2.e).sqrt(),
+                sigma: f64::midpoint(atom1.s, atom2.s),
+                cutoff: 2.5 * (atom1.s + atom2.s) / 2.0,
             })
-            .collect();
-        let cg_lj_parameters_polar_charged: Vec<CgLjParameter> = polar_atoms
+        });
+        let cg_lj_parameters_polar_charged: Self = polar_atoms
             .iter()
             .flat_map(|atom1| {
                 charged_atoms.iter().map(|atom2| CgLjParameter {
@@ -102,26 +58,26 @@ impl TryFrom<ForceField> for ItpFile {
                 })
             })
             .collect();
-        let cg_lj_parameters = cg_lj_parameters_polar_polar
-            .into_iter()
+        cg_lj_parameters_polar_polar
             .chain(cg_lj_parameters_polar_charged)
-            .collect();
+            .collect()
+    }
+}
 
-        // CG WCA Parameters
+impl From<ForceField> for CgWcaParameters {
+    fn from(ff: ForceField) -> Self {
+        let polar_atoms: Vec<&Bead> = ff.atoms.iter().filter(|atom| atom.p).collect();
         let no_tail_atoms: Vec<&Bead> = ff.atoms.iter().filter(|atom| atom.w.is_none()).collect();
         let tail_atoms: Vec<&Bead> = ff.atoms.iter().filter(|atom| atom.w.is_some()).collect();
-        let cg_wca_parameters_no_tail_no_tail: Vec<CgWcaParameter> = no_tail_atoms
-            .iter()
-            .flat_map(|atom1| {
-                no_tail_atoms.iter().map(|atom2| CgWcaParameter {
-                    bead1: atom1.name.to_uppercase(),
-                    bead2: atom2.name.to_uppercase(),
-                    epsilon: (atom1.e * atom2.e).sqrt(),
-                    sigma: f64::midpoint(atom1.s, atom2.s),
-                })
+        let cg_wca_parameters_no_tail_no_tail = no_tail_atoms.iter().flat_map(|atom1| {
+            no_tail_atoms.iter().map(|atom2| CgWcaParameter {
+                bead1: atom1.name.to_uppercase(),
+                bead2: atom2.name.to_uppercase(),
+                epsilon: (atom1.e * atom2.e).sqrt(),
+                sigma: f64::midpoint(atom1.s, atom2.s),
             })
-            .collect();
-        let cg_wca_parameters_no_tail_tail: Vec<CgWcaParameter> = polar_atoms
+        });
+        let cg_wca_parameters_no_tail_tail: Self = polar_atoms
             .iter()
             .flat_map(|atom1| {
                 tail_atoms.iter().map(|atom2| CgWcaParameter {
@@ -132,19 +88,21 @@ impl TryFrom<ForceField> for ItpFile {
                 })
             })
             .collect();
-        let cg_wca_parameters = cg_wca_parameters_no_tail_no_tail
-            .into_iter()
+        cg_wca_parameters_no_tail_no_tail
             .chain(cg_wca_parameters_no_tail_tail)
-            .collect();
+            .collect()
+    }
+}
 
-        // Molecules
+impl From<ForceField> for Molecules {
+    fn from(ff: ForceField) -> Self {
         let atoms_map: HashMap<String, (f64, f64)> = ff
+            .clone()
             .atoms
             .into_iter()
             .map(|atom| (atom.name, (atom.m, atom.q)))
             .collect();
-        let molecules = ff
-            .lipids
+        ff.lipids
             .iter()
             .map(|lipid| {
                 let mut molecule = Molecule::default();
@@ -189,13 +147,64 @@ impl TryFrom<ForceField> for ItpFile {
 
                 molecule
             })
-            .collect();
+            .collect()
+    }
+}
 
-        let itp_file = ItpFile {
-            atom_types,
-            cg_lj_parameters,
-            cg_wca_parameters,
-            molecules,
+#[derive(Debug, Default)]
+pub struct ItpFile {
+    pub atom_types: AtomTypes,
+    pub cg_lj_parameters: CgLjParameters,
+    pub cg_wca_parameters: CgWcaParameters,
+    pub molecules: Molecules,
+}
+
+impl fmt::Display for ItpFile {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // Atom types
+        writeln!(f, "[ atomtypes ]")?;
+        writeln!(f, "; name   n     mass   charge ptype     rmin      eps")?;
+        writeln!(f, ";    -   -    g/mol        e     -       nm   kJ/mol")?;
+        for atom_type in &self.atom_types {
+            writeln!(f, "{atom_type}")?;
+        }
+        writeln!(f)?;
+
+        // CG LJ Parameters
+        writeln!(f, "[ cg_LJ_parameters ]")?;
+        writeln!(f, "; name  name  epsilon    sigma  cut-off")?;
+        writeln!(f, ";    -     -   kJ/mol       nm       nm")?;
+        for cg_lj_parameter in &self.cg_lj_parameters {
+            writeln!(f, "{cg_lj_parameter}")?;
+        }
+        writeln!(f)?;
+
+        // CG WCA Parameters
+        writeln!(f, "[ cg_WCA_parameters ]")?;
+        writeln!(f, "; name  name  epsilon    sigma")?;
+        writeln!(f, ";    -     -   kJ/mol       nm")?;
+        for cg_wca_parameter in &self.cg_wca_parameters {
+            writeln!(f, "{cg_wca_parameter}")?;
+        }
+
+        // Molecules
+        for molecule in &self.molecules {
+            writeln!(f, "{molecule}")?;
+        }
+
+        Ok(())
+    }
+}
+
+impl TryFrom<ForceField> for ItpFile {
+    type Error = IsolfError;
+
+    fn try_from(ff: ForceField) -> Result<Self, Self::Error> {
+        let itp_file = Self {
+            atom_types: AtomTypes::from(ff.clone()),
+            cg_lj_parameters: CgLjParameters::from(ff.clone()),
+            cg_wca_parameters: CgWcaParameters::from(ff.clone()),
+            molecules: Molecules::from(ff),
         };
 
         Ok(itp_file)

@@ -142,7 +142,7 @@ impl InputFileBuilder {
         // the ensemble temperature
         match &ensemble {
             Ensemble::Nvt { temperature, .. } | Ensemble::Npt { temperature, .. } => {
-                if *temperature != solvent_temperature {
+                if (*temperature - solvent_temperature).abs() > 1.0e-6 {
                     eprintln!(
                         "{} solvent temperature ({}) is different from ensemble temperature ({})",
                         "Warning:".yellow().bold(),
@@ -151,7 +151,7 @@ impl InputFileBuilder {
                     );
                 }
             }
-            _ => (),
+            Ensemble::Nve => (),
         }
 
         // when using a PBC boundary, the box size should not be present
@@ -166,10 +166,7 @@ impl InputFileBuilder {
 
         // when using a PBC boundary, the box size should be present if
         // running a new simulation
-        if input_rst.is_none()
-            && matches!(boundary, Boundary::Pbc { box_size: None })
-            && let Boundary::Pbc { box_size: None } = &boundary
-        {
+        if input_rst.is_none() && matches!(boundary, Boundary::Pbc { box_size: None }) {
             return Err(IsolfError::invalid_field_value(
                 "boundary",
                 "box_size",
@@ -196,87 +193,110 @@ impl InputFileBuilder {
         })
     }
 
+    #[must_use]
     pub fn input_grotop(mut self, input_grotop: &str) -> Self {
         self.input_grotop = Some(input_grotop.into());
         self
     }
 
+    #[must_use]
     pub fn input_grocrd(mut self, input_grocrd: &str) -> Self {
         self.input_grocrd = Some(input_grocrd.into());
         self
     }
 
+    #[must_use]
     pub fn input_rst(mut self, input_rst: &str) -> Self {
         self.input_rst = Some(input_rst.into());
         self
     }
 
+    #[must_use]
     pub fn output_rst(mut self, path: &str, period: u64) -> Self {
         self.output_rst = Some(Output::new(path, period));
         self
     }
 
+    #[must_use]
     pub fn output_dcd(mut self, path: &str, period: u64) -> Self {
         self.output_dcd = Some(Output::new(path, period));
         self
     }
 
-    pub fn solvent_temperature(mut self, solvent_temperature: f64) -> Self {
+    #[must_use]
+    pub const fn solvent_temperature(mut self, solvent_temperature: f64) -> Self {
         self.solvent_temperature = Some(solvent_temperature);
         self
     }
 
-    pub fn solvent_ionic_strength(mut self, solvent_ionic_strength: f64) -> Self {
+    #[must_use]
+    pub const fn solvent_ionic_strength(mut self, solvent_ionic_strength: f64) -> Self {
         self.solvent_ionic_strength = Some(solvent_ionic_strength);
         self
     }
 
-    pub fn time_step(mut self, time_step: f64) -> Self {
+    #[must_use]
+    pub const fn time_step(mut self, time_step: f64) -> Self {
         self.time_step = Some(time_step);
         self
     }
 
-    pub fn num_steps(mut self, num_steps: u64) -> Self {
+    #[must_use]
+    pub const fn num_steps(mut self, num_steps: u64) -> Self {
         self.num_steps = Some(num_steps);
         self
     }
 
-    pub fn output_ene_period(mut self, output_ene_period: u64) -> Self {
+    #[must_use]
+    pub const fn output_ene_period(mut self, output_ene_period: u64) -> Self {
         self.output_ene_period = Some(output_ene_period);
         self
     }
 
-    pub fn update_nb_period(mut self, update_nb_period: u64) -> Self {
+    #[must_use]
+    pub const fn update_nb_period(mut self, update_nb_period: u64) -> Self {
         self.update_nb_period = Some(update_nb_period);
         self
     }
 
-    pub fn remove_tr_period(mut self, remove_tr_period: u64) -> Self {
+    #[must_use]
+    pub const fn remove_tr_period(mut self, remove_tr_period: u64) -> Self {
         self.remove_tr_period = Some(remove_tr_period);
         self
     }
 
-    pub fn seed(mut self, seed: u16) -> Self {
+    #[must_use]
+    pub const fn seed(mut self, seed: u16) -> Self {
         self.seed = Some(seed);
         self
     }
 
-    pub fn nvt(mut self, temperature: f64, gamma_t: f64) -> Self {
+    #[must_use]
+    pub const fn nvt(mut self, temperature: f64, gamma_t: f64) -> Self {
         self.ensemble = Ensemble::nvt(temperature, gamma_t);
         self
     }
 
-    pub fn npt(mut self, temperature: f64, pressure: f64, gamma_t: f64, gamma_p: f64) -> Self {
+    #[must_use]
+    pub const fn npt(
+        mut self,
+        temperature: f64,
+        pressure: f64,
+        gamma_t: f64,
+        gamma_p: f64,
+    ) -> Self {
         self.ensemble = Ensemble::npt(temperature, pressure, gamma_t, gamma_p);
         self
     }
 
-    pub fn pbc(mut self) -> Self {
+    #[must_use]
+    pub const fn pbc(mut self) -> Self {
         self.boundary = Boundary::pbc();
         self
     }
 
-    pub fn pbc_with_box_size(mut self, x: f64, y: f64, z: f64) -> Self {
+    #[must_use]
+    pub const fn pbc_with_box_size(mut self, x: f64, y: f64, z: f64) -> Self {
         self.boundary = Boundary::pbc_with_box_size(x, y, z);
         self
     }

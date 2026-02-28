@@ -5,8 +5,9 @@ pub struct Output {
 }
 
 impl Output {
+    #[must_use]
     pub fn new(path: &str, period: u64) -> Self {
-        Output {
+        Self {
             path: path.to_string(),
             period,
         }

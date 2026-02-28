@@ -15,12 +15,13 @@ pub enum IsolfError {
 }
 
 impl IsolfError {
-    pub fn invalid_input(input: String, reason: String) -> Self {
-        IsolfError::InvalidInput { input, reason }
+    #[must_use]
+    pub const fn invalid_input(input: String, reason: String) -> Self {
+        Self::InvalidInput { input, reason }
     }
 
     pub fn missing_required_field<F: ToString>(field: F) -> Self {
-        IsolfError::MissingRequiredField {
+        Self::MissingRequiredField {
             field: field.to_string(),
         }
     }
@@ -30,7 +31,7 @@ impl IsolfError {
         value: V,
         reason: R,
     ) -> Self {
-        IsolfError::InvalidFieldValue {
+        Self::InvalidFieldValue {
             field: field.to_string(),
             value: value.to_string(),
             reason: reason.to_string(),

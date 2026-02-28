@@ -15,19 +15,22 @@ pub enum Ensemble {
 }
 
 impl Ensemble {
-    pub fn nve() -> Self {
-        Ensemble::Nve
+    #[must_use]
+    pub const fn nve() -> Self {
+        Self::Nve
     }
 
-    pub fn nvt(temperature: f64, gamma_t: f64) -> Self {
-        Ensemble::Nvt {
+    #[must_use]
+    pub const fn nvt(temperature: f64, gamma_t: f64) -> Self {
+        Self::Nvt {
             temperature,
             gamma_t,
         }
     }
 
-    pub fn npt(temperature: f64, pressure: f64, gamma_t: f64, gamma_p: f64) -> Self {
-        Ensemble::Npt {
+    #[must_use]
+    pub const fn npt(temperature: f64, pressure: f64, gamma_t: f64, gamma_p: f64) -> Self {
+        Self::Npt {
             temperature,
             pressure,
             gamma_t,

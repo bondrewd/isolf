@@ -6,8 +6,9 @@ pub struct BoxSize {
 }
 
 impl BoxSize {
-    pub fn new(x: f64, y: f64, z: f64) -> Self {
-        BoxSize { x, y, z }
+    #[must_use]
+    pub const fn new(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
     }
 }
 
@@ -21,16 +22,19 @@ pub enum Boundary {
 }
 
 impl Boundary {
-    pub fn nobc() -> Self {
-        Boundary::NoBc
+    #[must_use]
+    pub const fn nobc() -> Self {
+        Self::NoBc
     }
 
-    pub fn pbc() -> Self {
-        Boundary::Pbc { box_size: None }
+    #[must_use]
+    pub const fn pbc() -> Self {
+        Self::Pbc { box_size: None }
     }
 
-    pub fn pbc_with_box_size(x: f64, y: f64, z: f64) -> Self {
-        Boundary::Pbc {
+    #[must_use]
+    pub const fn pbc_with_box_size(x: f64, y: f64, z: f64) -> Self {
+        Self::Pbc {
             box_size: Some(BoxSize::new(x, y, z)),
         }
     }
