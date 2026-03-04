@@ -16,8 +16,11 @@ pub enum IsolfError {
 
 impl IsolfError {
     #[must_use]
-    pub const fn invalid_input(input: String, reason: String) -> Self {
-        Self::InvalidInput { input, reason }
+    pub fn invalid_input<I: ToString, R: ToString>(input: I, reason: R) -> Self {
+        Self::InvalidInput {
+            input: input.to_string(),
+            reason: reason.to_string(),
+        }
     }
 
     pub fn missing_required_field<F: ToString>(field: F) -> Self {
