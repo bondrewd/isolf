@@ -1,0 +1,31 @@
+[package]
+name = "isolf"
+version = "0.1.0"
+edition = "2024"
+description = "Build coarse-grained iSoLF lipid membranes and vesicles for GENESIS"
+license = "MIT OR Apache-2.0"
+# README art / demo recording — not needed in a published crate.
+exclude = ["/assets"]
+
+[lib]
+name = "isolf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "isolf"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+gif = "0.13"
+indicatif = "0.17"
+rand = "0.9"
+rayon = "1"
+thiserror = "2.0"
+ureq = "3"
+
+# Slim, self-contained release binaries for distribution.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

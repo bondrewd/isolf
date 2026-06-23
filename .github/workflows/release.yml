@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # Create the GitHub Release first so the parallel build jobs have something to
+  # upload their binaries to (otherwise each upload waits for a release that
+  # never appears and fails with "release not found").
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-assets:
+    needs: create-release
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          # aarch64-musl is cross-compiled from the x86_64 runner via cross's
+          # Docker image, which carries the aarch64 C toolchain that ring needs.
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: universal-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      # Builds the binary, archives it (.tar.gz / .zip), writes a .sha256
+      # checksum, and uploads both to the release created above.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: isolf
+          target: ${{ matrix.target }}
+          archive: isolf-$tag-$target
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}

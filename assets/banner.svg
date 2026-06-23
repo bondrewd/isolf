@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 220" width="900" height="220" role="img" aria-label="iSoLF — coarse-grained membranes, vesicles, proteins">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2dd4bf"/>
+      <stop offset="50%" stop-color="#3b82f6"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="900" height="220" rx="24" fill="#0d1117"/>
+
+  <!-- faint bilayer motif: two rows of head beads with tails between -->
+  <g opacity="0.10" fill="none" stroke="url(#grad)" stroke-width="2">
+    <line x1="70" y1="196" x2="830" y2="196"/>
+    <line x1="70" y1="210" x2="830" y2="210"/>
+  </g>
+  <g opacity="0.16" fill="url(#grad)">
+    <!-- heads, evenly spaced -->
+    <g>
+      <circle cx="84" cy="196" r="3"/><circle cx="116" cy="196" r="3"/><circle cx="148" cy="196" r="3"/>
+      <circle cx="180" cy="196" r="3"/><circle cx="212" cy="196" r="3"/><circle cx="244" cy="196" r="3"/>
+      <circle cx="276" cy="196" r="3"/><circle cx="308" cy="196" r="3"/><circle cx="340" cy="196" r="3"/>
+      <circle cx="372" cy="196" r="3"/><circle cx="404" cy="196" r="3"/><circle cx="436" cy="196" r="3"/>
+      <circle cx="468" cy="196" r="3"/><circle cx="500" cy="196" r="3"/><circle cx="532" cy="196" r="3"/>
+      <circle cx="564" cy="196" r="3"/><circle cx="596" cy="196" r="3"/><circle cx="628" cy="196" r="3"/>
+      <circle cx="660" cy="196" r="3"/><circle cx="692" cy="196" r="3"/><circle cx="724" cy="196" r="3"/>
+      <circle cx="756" cy="196" r="3"/><circle cx="788" cy="196" r="3"/><circle cx="820" cy="196" r="3"/>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <text x="450" y="122" text-anchor="middle"
+        font-family="'JetBrains Mono','SFMono-Regular',ui-monospace,Consolas,'Liberation Mono',monospace"
+        font-size="116" font-weight="700" letter-spacing="3" fill="url(#grad)">iSoLF</text>
+
+  <!-- accent underline -->
+  <rect x="398" y="142" width="104" height="5" rx="2.5" fill="url(#grad)"/>
+
+  <!-- tagline -->
+  <text x="450" y="178" text-anchor="middle"
+        font-family="'JetBrains Mono','SFMono-Regular',ui-monospace,Consolas,'Liberation Mono',monospace"
+        font-size="22" letter-spacing="1" fill="#8b98b0">coarse-grained membranes · vesicles · proteins</text>
+</svg>
