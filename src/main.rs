@@ -1,15 +1,17 @@
-//! Command-line membrane builder.
-//!
-//! Builds a simulation-ready iSoLF coarse-grained bilayer from options passed
-//! directly on the command line and writes the output files:
+//! Command-line builder for coarse-grained iSoLF membranes and vesicles.
 //!
 //! ```sh
-//! isolf --upper POPC=1,DOPS=1 --lipids-per-leaflet 512 --out ./sim --pdb --psf --inp
+//! isolf membrane --lipids "POPC=3,POPS=1" --count 512 --inp --vmd -o ./sim
+//! isolf vesicle  --lipids POPC --radius 20 --top -o ./ves
+//! isolf lipids
 //! ```
 //!
-//! `<name>.gro` is always written. `--top` adds the topology (`<name>.top` plus
-//! `isolf.itp`); `--inp` adds the GENESIS control files and implies `--top`;
-//! `.pdb`, `.psf`, `.crd`, `.cif`, and `.vmd` are added on request.
+//! `<name>.gro` and `<name>.log` are always written. `--top` adds the topology
+//! (`<name>.top` plus `isolf.itp`); `--inp` (or any `--min`/`--equil`/`--prod`
+//! override) adds GENESIS control files and implies `--top`; `--vmd` (or any
+//! `--vmd-*` flag) adds VMD scripts and implies `--psf`; `--gif` (or any
+//! `--gif-*` flag) adds a relaxation animation; `.pdb`, `.psf`, `.crd`, and
+//! `.cif` are added on request.
 
 use std::error::Error;
 use std::fs;
@@ -17,12 +19,13 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use clap::builder::styling::{AnsiColor, Styles};
-use clap::{ArgGroup, ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand};
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use isolf::composition::Composition;
+use isolf::error::BuildError;
 use isolf::force_field::ForceField;
 use isolf::membrane::{
     BuildOptions, DEFAULT_NAME, DEFAULT_PADDING, DEFAULT_TEMPERATURE, Membrane, RelaxFrame, Sizing,
@@ -37,19 +40,18 @@ mod update;
 
 /// Where the finished system is centred (`--center`). The periodic box is the
 /// same either way; only the coordinates move.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum CenterArg {
-    /// Centred on the coordinate origin `(0, 0, 0)` (default). The VMD scripts
-    /// translate the system into the box for display, so the view is unchanged.
+    /// Centred on the coordinate origin (0, 0, 0) (default).
     #[default]
     Origin,
-    /// Centred in the box `[0, box]`, matching the drawn periodic box.
+    /// Centred in the periodic box [0, box].
     Box,
 }
 
 /// Scope for `--vmd-color-by`: how lipid beads are coloured. Maps to
 /// [`isolf::vmd::LipidColoring`].
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum LipidColorScope {
     /// Colour the head bead by lipid species; the rest by bead role.
     Head,
@@ -61,164 +63,225 @@ enum LipidColorScope {
 
 /// Scope for `--gif-mode`: how `--gif` renders each frame. Maps to
 /// [`anim::GifMode`].
-#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum GifModeArg {
     /// One disc per lipid; clear for small to medium systems.
-    #[default]
     Point,
     /// Local-density heatmap; better for large, dense systems.
     Density,
 }
 
-/// Maintenance subcommands. With none given, isolf builds a structure from the
-/// options below.
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Update isolf in place to the latest release, then exit.
-    Update(Maintenance),
-    /// Uninstall isolf, removing the binary from the system, then exit.
-    Uninstall(Maintenance),
-}
-
-/// Flags shared by the maintenance subcommands: just a manual `--help`. The parent
-/// disables its auto help flag (to reposition it under "Extra options") and clap
-/// propagates that down, so without this `isolf update --help` would not work.
-#[derive(clap::Args, Debug)]
-struct Maintenance {
-    /// Print help
-    #[arg(short = 'h', long, action = clap::ArgAction::Help)]
-    help: Option<bool>,
-}
-
-/// Build coarse-grained lipid membranes and vesicles for GENESIS.
+/// Build coarse-grained iSoLF lipid membranes and vesicles for GENESIS.
 #[derive(Parser, Debug)]
-// Help/version are added explicitly (at the bottom of the struct) so the "Extra
-// options" group renders last in --help instead of clap's default of first.
 #[command(
     name = "isolf",
     version,
     about,
-    disable_help_flag = true,
-    disable_version_flag = true,
-    disable_help_subcommand = true
+    disable_help_subcommand = true,
+    arg_required_else_help = true
 )]
-#[command(long_about = "\
-Build coarse-grained starting structures for GENESIS molecular dynamics.
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-The flags you give select one of two build modes:
-  membrane   --upper <lipids> --lipids-per-leaflet <N>  (or --membrane)
-  vesicle    --upper <lipids> --vesicle <R>
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Build a flat lipid bilayer.
+    Membrane(MembraneArgs),
+    /// Build a spherical lipid vesicle.
+    Vesicle(VesicleArgs),
+    /// List all supported iSoLF lipids.
+    Lipids(LipidsArgs),
+    /// Update isolf in place to the latest release.
+    Update,
+    /// Uninstall isolf, removing the binary from the system.
+    Uninstall,
+}
 
-The structure (.gro) goes to --out. Add --top for the topology (.top + .itp),
---inp for GENESIS control files (implies --top), and --vmd for VMD scripts.")]
-// A geometry and a composition are validated together in run(); both groups are
-// optional so the cross-checks (a geometry needs a composition, and vice versa)
-// can report a helpful message instead of clap's terse one.
-#[command(group = ArgGroup::new("geometry").required(false).multiple(true)
-    .args(["lipids_per_leaflet", "membrane", "vesicle"]))]
-#[command(group = ArgGroup::new("composition").required(false).multiple(true)
-    .args(["upper", "lower"]))]
-struct Args {
+/// Arguments for `isolf membrane`.
+#[derive(clap::Args, Debug)]
+#[command(
+    about = "Build a flat lipid bilayer",
+    long_about = "\
+Build a flat coarse-grained lipid bilayer for GENESIS.
+
+Size the bilayer with --count (lipid count per leaflet), --box (in-plane nm),
+or both (pack an exact count into a fixed box). Use --lipids for a symmetric
+bilayer, or --upper / --lower for asymmetric leaflets."
+)]
+struct MembraneArgs {
     // ---- Lipid composition ----
-    /// Upper leaflet (the outer shell for a vesicle) as NAME=WEIGHT pairs.
+    /// Lipid composition for both leaflets (symmetric bilayer) as NAME=WEIGHT pairs.
     ///
     /// Examples:
-    /// --upper "POPC"                    # Upper leaflet contains POPC
-    /// --upper "POPC=1,DOPS=1"           # Upper leaflet contains 50% of POPC and 50% of DOPS
-    /// --upper "POPC=1/2,DOPS=1/2"       # Using fractions is also possible
-    /// --upper "POPC=50%,DOPS=50%"       # Using percentages is also possible
-    /// --upper "POPC=1" --upper "DOPS=1" # Adding one by one is also possible
+    ///   -L POPC
+    ///   -L "POPC=3,POPS=1"
+    ///   -L "POPC=1/2,DOPS=1/2"
+    ///   -L "POPC=70%,POPS=30%"
+    #[arg(
+        short = 'L',
+        long,
+        value_name = "SPEC",
+        conflicts_with_all = ["upper", "lower"],
+        verbatim_doc_comment,
+        help_heading = "Lipid composition"
+    )]
+    lipids: Vec<String>,
+
+    /// Upper leaflet composition as NAME=WEIGHT pairs (mirrored to lower if --lower is omitted).
     #[arg(
         short = 'u',
         long,
         value_name = "SPEC",
-        verbatim_doc_comment,
         help_heading = "Lipid composition"
     )]
     upper: Vec<String>,
 
-    /// Lower leaflet (the inner shell for a vesicle) as NAME=WEIGHT pairs.
-    ///
-    /// Examples:
-    /// --lower "POPC"                    # Lower leaflet contains POPC
-    /// --lower "POPC=1,DOPS=1"           # Lower leaflet contains 50% of POPC and 50% of DOPS
-    /// --lower "POPC=1/2,DOPS=1/2"       # Using fractions is also possible
-    /// --lower "POPC=50%,DOPS=50%"       # Using percentages is also possible
-    /// --lower "POPC=1" --lower "DOPS=1" # Adding one by one is also possible
+    /// Lower leaflet composition as NAME=WEIGHT pairs (mirrored to upper if --upper is omitted).
     #[arg(
         short = 'l',
         long,
         value_name = "SPEC",
-        verbatim_doc_comment,
         help_heading = "Lipid composition"
     )]
     lower: Vec<String>,
 
     // ---- Geometry ----
-    /// Number of lipids per leaflet in membranes.
+    /// Lipids per leaflet: <N> for both, or "up=<N>,lo=<N>".
     ///
     /// Examples:
-    /// --lipids-per-leaflet 1000                                    # Add 1000 lipids in each leaflet
-    /// --lipids-per-leaflet "up=1200,lo=800"                        # Add 1200 lipids to the upper leaflet and 800 to the lower
-    /// --lipids-per-leaflet "up=1200" --lipids-per-leaflet "lo=800" # Adding one by one is also possible
+    ///   -n 256                 # 256 lipids per leaflet in a square box
+    ///   -n "up=300,lo=200"     # different counts per leaflet
+    ///   -n 256 -b 20           # pack 256 lipids per leaflet into a 20 nm box
     #[arg(
+        short = 'n',
         long,
         value_name = "SPEC",
-        conflicts_with = "vesicle",
         verbatim_doc_comment,
         help_heading = "Geometry"
     )]
-    lipids_per_leaflet: Vec<String>,
+    count: Vec<String>,
 
-    /// Flat-membrane size in nm as "x=10,y=20".
+    /// In-plane box size in nm: <L> for a square, or "x=<L>,y=<L>".
     ///
     /// Examples:
-    /// --membrane 10                       # Make a membrane of 10 nm square (x = y = 10)
-    /// --membrane "x=10"                   # Make a membrane of x = 10 nm and make x = y
-    /// --membrane "x=10,y=20"              # Make a membrane of x = 10 nm by y = 20 nm
-    /// --membrane "x=10" --membrane "y=20" # Adding one by one is also possible
+    ///   -b 20                  # 20 x 20 nm square membrane
+    ///   -b "x=30,y=15"         # 30 x 15 nm rectangular membrane
     #[arg(
-        long,
+        short = 'b',
+        long = "box",
         value_name = "SPEC",
-        conflicts_with = "vesicle",
         verbatim_doc_comment,
         help_heading = "Geometry"
     )]
-    membrane: Vec<String>,
+    box_size: Vec<String>,
 
-    /// Vesicle radius in nm as "ro=20" (outer) or "ri=15" (inner).
-    ///
-    /// Examples:
-    /// --vesicle 20                        # Make a vesicle with an outer radius of 20 nm and determine the inner radius automatically
-    /// --vesicle "ro=20"                   # Make a vesicle with an outer radius of 20 nm and determine the inner radius automatically
-    /// --vesicle "ri=15"                   # Make a vesicle with an inner radius of 15 nm and determine the outer radius automatically
-    /// --vesicle "ri=15,ro=20"             # Make a vesicle with an inner radius of 15 nm and an outer radius of 20 nm
-    /// --vesicle "ri=15" --vesicle "ro=20" # Adding one by one is also possible
+    /// System centre: origin (0,0,0) or box (Lx/2,Ly/2,Lz/2).
     #[arg(
         long,
-        value_name = "SPEC",
-        conflicts_with_all = ["lipids_per_leaflet", "membrane"],
-        verbatim_doc_comment,
+        value_enum,
+        ignore_case = true,
+        default_value_t = CenterArg::Origin,
+        value_name = "WHERE",
         help_heading = "Geometry"
     )]
-    vesicle: Vec<String>,
-
-    /// System center position. Possible values are "origin" (0,0,0) and "box" (Lx/2,Ly/2,Lz/2)
-    #[arg(long, value_enum, ignore_case = true, default_value_t = CenterArg::Origin, hide_possible_values = true, value_name = "WHERE", help_heading = "Geometry")]
     center: CenterArg,
 
-    /// Padding in nm along z for membranes and on all sides for vesicles
-    #[arg(long, value_name = "P", default_value_t = DEFAULT_PADDING, help_heading = "Geometry")]
+    /// Vacuum padding in nm added on each side along z.
+    #[arg(
+        long,
+        value_name = "NM",
+        default_value_t = DEFAULT_PADDING,
+        help_heading = "Geometry"
+    )]
     padding: f64,
 
-    /// When both leaflet counts are set and their areas differ, the lighter leaflet is grown to match.
-    ///
-    /// When setting this flag, the program doesn't grow the smaller leaflet where there is a size difference.
-    #[arg(long, verbatim_doc_comment, help_heading = "Geometry")]
+    /// Keep unequal leaflet counts as given instead of growing the lighter leaflet to match area.
+    #[arg(long, help_heading = "Geometry")]
     no_balance: bool,
 
+    #[command(flatten)]
+    common: CommonBuildArgs,
+}
+
+/// Arguments for `isolf vesicle`.
+#[derive(clap::Args, Debug)]
+#[command(
+    about = "Build a spherical lipid vesicle",
+    long_about = "\
+Build a spherical coarse-grained lipid vesicle for GENESIS.
+
+Set the size with --radius: a bare number or ro=<R> fixes the outer radius,
+ri=<R> fixes the inner (lumen) radius, and ri=<R>,ro=<R> fixes both. Use
+--lipids for a symmetric vesicle, or --outer / --inner for asymmetric shells."
+)]
+struct VesicleArgs {
+    // ---- Lipid composition ----
+    /// Lipid composition for both shells (symmetric vesicle) as NAME=WEIGHT pairs.
+    #[arg(
+        short = 'L',
+        long,
+        value_name = "SPEC",
+        conflicts_with_all = ["outer", "inner"],
+        help_heading = "Lipid composition"
+    )]
+    lipids: Vec<String>,
+
+    /// Outer shell composition as NAME=WEIGHT pairs (copied to inner if --inner is omitted).
+    #[arg(long, value_name = "SPEC", help_heading = "Lipid composition")]
+    outer: Vec<String>,
+
+    /// Inner (lumen) shell composition as NAME=WEIGHT pairs (copied to outer if --outer is omitted).
+    #[arg(long, value_name = "SPEC", help_heading = "Lipid composition")]
+    inner: Vec<String>,
+
+    // ---- Geometry ----
+    /// Vesicle radius in nm: <R> or "ro=<R>" (outer), "ri=<R>" (inner), or both.
+    ///
+    /// Examples:
+    ///   -r 20                  # outer radius 20 nm, inner derived automatically
+    ///   -r "ri=15"             # inner radius 15 nm, outer derived automatically
+    ///   -r "ri=14,ro=20"       # both radii fixed
+    #[arg(
+        short = 'r',
+        long,
+        required = true,
+        value_name = "SPEC",
+        verbatim_doc_comment,
+        help_heading = "Geometry"
+    )]
+    radius: Vec<String>,
+
+    /// System centre: origin (0,0,0) or box (Lx/2,Ly/2,Lz/2).
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        default_value_t = CenterArg::Origin,
+        value_name = "WHERE",
+        help_heading = "Geometry"
+    )]
+    center: CenterArg,
+
+    /// Vacuum padding in nm added on every side of the cubic box.
+    #[arg(
+        long,
+        value_name = "NM",
+        default_value_t = DEFAULT_PADDING,
+        help_heading = "Geometry"
+    )]
+    padding: f64,
+
+    #[command(flatten)]
+    common: CommonBuildArgs,
+}
+
+/// Options shared between `membrane` and `vesicle`.
+#[derive(clap::Args, Debug)]
+struct CommonBuildArgs {
     // ---- Output files ----
-    /// Output directory for saving the output
+    /// Output directory.
     #[arg(
         short = 'o',
         long,
@@ -228,389 +291,305 @@ struct Args {
     )]
     out: PathBuf,
 
-    /// Base name for the structure/topology files.
-    ///
-    /// [default: membrane/vesicle depending on the geometry]
+    /// Base name for output files [default: membrane / vesicle].
     #[arg(long, value_name = "NAME", help_heading = "Output files")]
     name: Option<String>,
 
-    /// Also write a topology ".top" file and the force-field ".itp" file.
-    ///
-    /// When using the "--inp" flag, this flag is set automatically as well since
-    /// the topology is necessary for running the MD simulation.
+    /// Write topology (.top) and force-field (isolf.itp) files.
     #[arg(long, help_heading = "Output files")]
     top: bool,
 
-    /// Also write a ".pdb" coordinate file
+    /// Write GENESIS .inp control files for min, equil, and prod (implies --top).
     #[arg(long, help_heading = "Output files")]
-    pdb: bool,
+    inp: bool,
 
-    /// Also write a CHARMM ".psf" structure file
+    /// Write VMD .vmd visualization scripts (implies --psf).
     #[arg(long, help_heading = "Output files")]
-    psf: bool,
+    vmd: bool,
 
-    /// Also write a CHARMM ".crd" coordinate file
-    #[arg(long, help_heading = "Output files")]
-    crd: bool,
-
-    /// Also write an mmCIF ".cif" coordinate file
-    #[arg(long, help_heading = "Output files")]
-    cif: bool,
-
-    /// Also write an animation of the leaflet relaxation.
+    /// Write a .gif animating the leaflet relaxation.
     #[arg(long, help_heading = "Output files")]
     gif: bool,
 
-    /// Also write GENESIS ".inp" control files.
+    /// Write a .pdb coordinate file.
+    #[arg(long, help_heading = "Output files")]
+    pdb: bool,
+
+    /// Write a CHARMM .psf structure file.
+    #[arg(long, help_heading = "Output files")]
+    psf: bool,
+
+    /// Write a CHARMM .crd coordinate file.
+    #[arg(long, help_heading = "Output files")]
+    crd: bool,
+
+    /// Write an mmCIF .cif coordinate file.
+    #[arg(long, help_heading = "Output files")]
+    cif: bool,
+
+    // ---- GENESIS control files (--inp) ----
+    /// Simulation temperature in K for GENESIS .inp files [default: 323.15].
+    #[arg(
+        short = 't',
+        long,
+        value_name = "K",
+        help_heading = "GENESIS control files (--inp)"
+    )]
+    temperature: Option<f64>,
+
+    /// Minimization (min.inp) overrides as KEY=VAL or <steps> (implies --inp).
     ///
-    /// Three files are generated depending on the geometry.
-    ///
-    /// For membranes:
-    /// - min.inp: Energy minimization
-    /// - npt.inp: Equilibration in the NPT ensemble
-    /// - pro.inp: Production run in the NPT ensemble
-    ///
-    /// For vesicles:
-    /// - min.inp: Energy minimization
-    /// - nvt.inp: Equilibration in the NVT ensemble
-    /// - pro.inp: Production run in the NVT ensemble
-    #[arg(long, verbatim_doc_comment, help_heading = "Output files")]
-    inp: bool,
-
-    /// Also write VMD ".vmd" scripts for visualization.
-    ///
-    /// To execute the scripts, use the "-e" flag in VMD.
-    ///
-    /// Example:
-    /// vmd -e membrane.vmd
-    #[arg(long, verbatim_doc_comment, help_heading = "Output files")]
-    vmd: bool,
-
-    // ---- General options ----
-    /// System temperature in K for the GENESIS ".inp" files.
-    ///
-    /// The temperature of each simulation can be overwritten by specifying it
-    /// with any of the following flags:
-    /// --nvt-temperature
-    /// --npt-temperature
-    /// --pro-temperature
-    #[arg(short = 't', long, value_name = "K", default_value_t = DEFAULT_TEMPERATURE, verbatim_doc_comment, help_heading = "General options")]
-    temperature: f64,
-
-    /// Seed value for the RNG
-    ///
-    /// A random number is used if not assigned
-    #[arg(long, value_name = "SEED", help_heading = "General options")]
-    seed: Option<u64>,
-
-    #[command(flatten)]
-    min: MinControl,
-
-    #[command(flatten)]
-    nvt: NvtControl,
-
-    #[command(flatten)]
-    npt: NptControl,
-
-    #[command(flatten)]
-    pro: ProControl,
-
-    #[command(flatten)]
-    viz: VmdControl,
-
-    // ---- Relaxation visualization (--gif) ----
-    /// Visualization mode.
-    ///
-    /// How `--gif` renders: a "point" scatter or a "density" heatmap.
+    /// Keys: steps (1000), eneout (10), crdout (1000), rstout (1000), nbupdate (10).
+    /// Example: --min "steps=2000,eneout=20"
     #[arg(
         long,
-        value_enum,
-        ignore_case = true,
-        default_value_t = GifModeArg::Point,
-        value_name = "MODE",
-        help_heading = "Relaxation visualization (--gif)"
+        value_name = "SPEC",
+        verbatim_doc_comment,
+        help_heading = "GENESIS control files (--inp)"
     )]
-    gif_mode: GifModeArg,
+    min: Vec<String>,
 
-    /// Resolution scale (e.g. 2 doubles it).
+    /// Equilibration (npt.inp / nvt.inp) overrides as KEY=VAL or <steps> (implies --inp).
     ///
-    /// Scale the `--gif` resolution (e.g. 2 doubles it).
+    /// Keys: steps (20000), dt (0.01), temp (--temperature), eneout (100),
+    ///       crdout (100), rstout (1000), stoptr (10), nbupdate (10), seed (random).
+    /// Example: --equil "steps=50000,temp=310"
     #[arg(
         long,
-        value_name = "FACTOR",
-        default_value_t = 1.0,
-        help_heading = "Relaxation visualization (--gif)"
+        value_name = "SPEC",
+        verbatim_doc_comment,
+        help_heading = "GENESIS control files (--inp)"
     )]
-    gif_scale: f64,
+    equil: Vec<String>,
 
-    /// Playback speed in frames per second.
+    /// Production (pro.inp) overrides as KEY=VAL or <steps> (implies --inp).
     ///
-    /// Playback speed of the `--gif`, in frames per second.
+    /// Keys: steps (500000), dt (0.02), temp (--temperature), eneout (500),
+    ///       crdout (500), rstout (1000), stoptr (10), nbupdate (10), seed (random).
+    /// Example: --prod "steps=1000000,crdout=1000"
     #[arg(
         long,
-        value_name = "FPS",
-        default_value_t = 14,
-        help_heading = "Relaxation visualization (--gif)"
+        value_name = "SPEC",
+        verbatim_doc_comment,
+        help_heading = "GENESIS control files (--inp)"
     )]
-    gif_fps: u16,
+    prod: Vec<String>,
 
-    // The standard options, declared last (and the auto help/version disabled
-    // above) so the "Extra options" group renders at the bottom of --help.
-    /// Print only the final summary and any warnings.
-    #[arg(
-        short = 'q',
-        long,
-        conflicts_with = "verbose",
-        help_heading = "Extra options"
-    )]
-    quiet: bool,
-
-    /// Print each file written and per-phase detail.
-    #[arg(short = 'v', long, help_heading = "Extra options")]
-    verbose: bool,
-
-    /// Disable coloured terminal output.
-    #[arg(long, help_heading = "Extra options")]
-    no_color: bool,
-
-    /// Use ASCII status markers instead of Unicode glyphs.
-    #[arg(long, help_heading = "Extra options")]
-    ascii: bool,
-
-    /// Maintenance commands: `isolf update` and `isolf uninstall`.
-    #[command(subcommand)]
-    command: Option<Command>,
-
-    /// Print help (see more with '--help').
-    #[arg(short = 'h', long, action = clap::ArgAction::Help, help_heading = "Extra options")]
-    help: Option<bool>,
-
-    /// Print version.
-    #[arg(short = 'V', long, action = clap::ArgAction::Version, help_heading = "Extra options")]
-    version: Option<bool>,
-}
-
-/// Minimization control-file parameters (used with `--inp`).
-#[derive(clap::Args, Debug)]
-#[command(next_help_heading = "Minimization control file (--inp)")]
-struct MinControl {
-    /// Number of minimization steps.
-    #[arg(long, value_name = "N", default_value_t = 1000)]
-    min_num_steps: usize,
-    /// Energy output period.
-    #[arg(long, value_name = "N", default_value_t = 10)]
-    min_eneout_period: usize,
-    /// Coordinate output period.
-    #[arg(long, value_name = "N", default_value_t = 1000)]
-    min_crdout_period: usize,
-    /// Restart output period.
-    #[arg(long, value_name = "N", default_value_t = 1000)]
-    min_rstout_period: usize,
-    /// Neighbour-list update period.
-    #[arg(long, value_name = "N", default_value_t = 10)]
-    min_nbupdate_period: usize,
-}
-
-/// NVT control-file parameters (used with `--inp`).
-#[derive(clap::Args, Debug)]
-#[command(next_help_heading = "NVT control file (--inp)")]
-struct NvtControl {
-    /// Number of NVT steps.
-    #[arg(long, value_name = "N", default_value_t = 20000)]
-    nvt_num_steps: usize,
-    /// NVT time step.
-    #[arg(long, value_name = "DT", default_value_t = 0.01)]
-    nvt_time_step: f64,
-    /// NVT temperature in K (default to --temperature).
-    #[arg(long, value_name = "K")]
-    nvt_temperature: Option<f64>,
-    /// Energy output period.
-    #[arg(long, value_name = "N", default_value_t = 100)]
-    nvt_eneout_period: usize,
-    /// Coordinate output period.
-    #[arg(long, value_name = "N", default_value_t = 100)]
-    nvt_crdout_period: usize,
-    /// Restart output period.
-    #[arg(long, value_name = "N", default_value_t = 1000)]
-    nvt_rstout_period: usize,
-    /// Translational-motion removal period.
-    #[arg(long, value_name = "N", default_value_t = 10)]
-    nvt_stoptr_period: usize,
-    /// Neighbour-list update period.
-    #[arg(long, value_name = "N", default_value_t = 10)]
-    nvt_nbupdate_period: usize,
-    /// Langevin thermostat seed (random if unset).
-    #[arg(long, value_name = "SEED")]
-    nvt_seed: Option<u64>,
-}
-
-/// NPT control-file parameters (used with `--inp`).
-#[derive(clap::Args, Debug)]
-#[command(next_help_heading = "NPT control file (--inp)")]
-struct NptControl {
-    /// Number of NPT steps.
-    #[arg(long, value_name = "N", default_value_t = 20000)]
-    npt_num_steps: usize,
-    /// NPT time step.
-    #[arg(long, value_name = "DT", default_value_t = 0.01)]
-    npt_time_step: f64,
-    /// NPT temperature in K (default to --temperature).
-    #[arg(long, value_name = "K")]
-    npt_temperature: Option<f64>,
-    /// Energy output period.
-    #[arg(long, value_name = "N", default_value_t = 100)]
-    npt_eneout_period: usize,
-    /// Coordinate output period.
-    #[arg(long, value_name = "N", default_value_t = 100)]
-    npt_crdout_period: usize,
-    /// Restart output period.
-    #[arg(long, value_name = "N", default_value_t = 1000)]
-    npt_rstout_period: usize,
-    /// Translational-motion removal period.
-    #[arg(long, value_name = "N", default_value_t = 10)]
-    npt_stoptr_period: usize,
-    /// Neighbour-list update period.
-    #[arg(long, value_name = "N", default_value_t = 10)]
-    npt_nbupdate_period: usize,
-    /// Langevin thermostat seed (random if unset).
-    #[arg(long, value_name = "SEED")]
-    npt_seed: Option<u64>,
-}
-
-/// Production control-file parameters (used with `--inp`): the run continues from
-/// the equilibration restart under the same ensemble (NPT for a membrane, NVT for
-/// a vesicle).
-#[derive(clap::Args, Debug)]
-#[command(next_help_heading = "Production control file (--inp)")]
-struct ProControl {
-    /// Number of production steps.
-    #[arg(long, value_name = "N", default_value_t = 500000)]
-    pro_num_steps: usize,
-    /// Production time step.
-    #[arg(long, value_name = "DT", default_value_t = 0.02)]
-    pro_time_step: f64,
-    /// Production temperature in K (default to --temperature).
-    #[arg(long, value_name = "K")]
-    pro_temperature: Option<f64>,
-    /// Energy output period.
-    #[arg(long, value_name = "N", default_value_t = 500)]
-    pro_eneout_period: usize,
-    /// Coordinate output period.
-    #[arg(long, value_name = "N", default_value_t = 500)]
-    pro_crdout_period: usize,
-    /// Restart output period.
-    #[arg(long, value_name = "N", default_value_t = 1000)]
-    pro_rstout_period: usize,
-    /// Translational-motion removal period.
-    #[arg(long, value_name = "N", default_value_t = 10)]
-    pro_stoptr_period: usize,
-    /// Neighbour-list update period.
-    #[arg(long, value_name = "N", default_value_t = 10)]
-    pro_nbupdate_period: usize,
-    /// Langevin thermostat seed (random if unset).
-    #[arg(long, value_name = "SEED")]
-    pro_seed: Option<u64>,
-}
-
-/// VMD visualization options (used with `--vmd`).
-#[derive(clap::Args, Debug)]
-#[command(next_help_heading = "VMD visualization (--vmd)")]
-struct VmdControl {
-    /// Use a smooth QuickSurf surface instead of VDW spheres.
-    #[arg(long)]
+    // ---- VMD visualization (--vmd) ----
+    /// Use a smooth QuickSurf surface instead of VDW spheres (implies --vmd).
+    #[arg(long, help_heading = "VMD visualization (--vmd)")]
     vmd_surface: bool,
-    /// Slice the system with a clipping plane to reveal the cross-section.
-    #[arg(long)]
+
+    /// Slice the system with a clipping plane to reveal the cross-section (implies --vmd).
+    #[arg(long, help_heading = "VMD visualization (--vmd)")]
     vmd_cutaway: bool,
-    /// Append a Tachyon ray-tracing render command to each script.
-    #[arg(long)]
+
+    /// Append a Tachyon ray-tracing render command to each script (implies --vmd).
+    #[arg(long, help_heading = "VMD visualization (--vmd)")]
     vmd_render: bool,
-    /// Background colour.
-    ///
-    /// A VMD colour name.
-    #[arg(long, value_name = "COLOR", default_value = "white")]
-    vmd_background: String,
-    /// Representation material.
-    ///
-    /// A VMD material name, e.g. AOChalky or Goodsell.
-    #[arg(long, value_name = "NAME", default_value = "AOChalky")]
-    vmd_material: String,
-    /// Trajectory smoothing window, in frames.
-    #[arg(long, value_name = "N", default_value_t = 5)]
-    vmd_smooth: usize,
-    /// Colouring scheme.
-    ///
-    /// `head` tints the head bead by species (rest by role), `bead` colours every
-    /// bead by role, `whole` colours the whole lipid by species.
+
+    /// VMD background colour name [default: white] (implies --vmd).
+    #[arg(long, value_name = "COLOR", help_heading = "VMD visualization (--vmd)")]
+    vmd_background: Option<String>,
+
+    /// VMD representation material, e.g. AOChalky or Goodsell [default: AOChalky] (implies --vmd).
+    #[arg(long, value_name = "NAME", help_heading = "VMD visualization (--vmd)")]
+    vmd_material: Option<String>,
+
+    /// Trajectory smoothing window in frames [default: 5] (implies --vmd).
+    #[arg(long, value_name = "N", help_heading = "VMD visualization (--vmd)")]
+    vmd_smooth: Option<usize>,
+
+    /// Colouring scheme [default: head] (implies --vmd).
     #[arg(
         long,
         value_enum,
         ignore_case = true,
         value_name = "SCOPE",
-        default_value = "head"
+        help_heading = "VMD visualization (--vmd)"
     )]
-    vmd_color_by: LipidColorScope,
+    vmd_color_by: Option<LipidColorScope>,
+
+    // ---- Relaxation animation (--gif) ----
+    /// Render mode: point scatter or density heatmap [default: point] (implies --gif).
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        value_name = "MODE",
+        help_heading = "Relaxation animation (--gif)"
+    )]
+    gif_mode: Option<GifModeArg>,
+
+    /// Resolution multiplier, e.g. 2 doubles it [default: 1] (implies --gif).
+    #[arg(
+        long,
+        value_name = "FACTOR",
+        help_heading = "Relaxation animation (--gif)"
+    )]
+    gif_scale: Option<f64>,
+
+    /// Playback speed in frames per second [default: 14] (implies --gif).
+    #[arg(
+        long,
+        value_name = "FPS",
+        help_heading = "Relaxation animation (--gif)"
+    )]
+    gif_fps: Option<u16>,
+
+    // ---- General ----
+    /// Seed value for the RNG (random if unset).
+    #[arg(long, value_name = "SEED", help_heading = "General")]
+    seed: Option<u64>,
+
+    /// Print only the final summary and any warnings.
+    #[arg(
+        short = 'q',
+        long,
+        conflicts_with = "verbose",
+        help_heading = "General"
+    )]
+    quiet: bool,
+
+    /// Print full file paths in the Write section.
+    #[arg(short = 'v', long, help_heading = "General")]
+    verbose: bool,
+
+    /// Disable coloured terminal output.
+    #[arg(long, help_heading = "General")]
+    no_color: bool,
+
+    /// Use ASCII status markers instead of Unicode glyphs.
+    #[arg(long, help_heading = "General")]
+    ascii: bool,
 }
 
-macro_rules! impl_dynamics {
-    ($ty:ty, $temp:ident, $steps:ident, $dt:ident, $ene:ident, $crd:ident, $rst:ident, $stoptr:ident, $nb:ident, $seed:ident) => {
-        impl $ty {
-            /// Build GENESIS dynamics parameters, drawing a random thermostat seed when unset.
-            fn dynamics(&self, default_temperature: f64, rng: &mut StdRng) -> isolf::inp::Dynamics {
-                isolf::inp::Dynamics {
-                    temperature: self.$temp.unwrap_or(default_temperature),
-                    num_steps: self.$steps,
-                    time_step: self.$dt,
-                    eneout_period: self.$ene,
-                    crdout_period: self.$crd,
-                    rstout_period: self.$rst,
-                    stoptr_period: self.$stoptr,
-                    nbupdate_period: self.$nb,
-                    seed: self
-                        .$seed
-                        .unwrap_or_else(|| rng.random_range(1..=MAX_ISEED)),
-                }
-            }
+impl CommonBuildArgs {
+    fn want_inp(&self) -> bool {
+        self.inp || !self.min.is_empty() || !self.equil.is_empty() || !self.prod.is_empty()
+    }
+
+    fn want_vmd(&self) -> bool {
+        self.vmd
+            || self.vmd_surface
+            || self.vmd_cutaway
+            || self.vmd_render
+            || self.vmd_background.is_some()
+            || self.vmd_material.is_some()
+            || self.vmd_smooth.is_some()
+            || self.vmd_color_by.is_some()
+    }
+
+    fn want_gif(&self) -> bool {
+        self.gif || self.gif_mode.is_some() || self.gif_scale.is_some() || self.gif_fps.is_some()
+    }
+}
+
+/// Arguments for `isolf lipids`.
+#[derive(clap::Args, Debug)]
+struct LipidsArgs {
+    /// Disable coloured terminal output.
+    #[arg(long)]
+    no_color: bool,
+
+    /// Use ASCII punctuation instead of Unicode glyphs.
+    #[arg(long)]
+    ascii: bool,
+}
+
+/// Parsed minimization stage settings (before attaching the final box size).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MinSpec {
+    num_steps: usize,
+    eneout_period: usize,
+    crdout_period: usize,
+    rstout_period: usize,
+    nbupdate_period: usize,
+}
+
+impl Default for MinSpec {
+    fn default() -> Self {
+        Self {
+            num_steps: 1000,
+            eneout_period: 10,
+            crdout_period: 1000,
+            rstout_period: 1000,
+            nbupdate_period: 10,
         }
-    };
+    }
 }
 
-impl_dynamics!(
-    NvtControl,
-    nvt_temperature,
-    nvt_num_steps,
-    nvt_time_step,
-    nvt_eneout_period,
-    nvt_crdout_period,
-    nvt_rstout_period,
-    nvt_stoptr_period,
-    nvt_nbupdate_period,
-    nvt_seed
-);
-impl_dynamics!(
-    NptControl,
-    npt_temperature,
-    npt_num_steps,
-    npt_time_step,
-    npt_eneout_period,
-    npt_crdout_period,
-    npt_rstout_period,
-    npt_stoptr_period,
-    npt_nbupdate_period,
-    npt_seed
-);
-impl_dynamics!(
-    ProControl,
-    pro_temperature,
-    pro_num_steps,
-    pro_time_step,
-    pro_eneout_period,
-    pro_crdout_period,
-    pro_rstout_period,
-    pro_stoptr_period,
-    pro_nbupdate_period,
-    pro_seed
-);
+impl MinSpec {
+    fn to_params(self, box_size: [f64; 3], temperature: f64) -> isolf::inp::Minimization {
+        isolf::inp::Minimization {
+            box_size,
+            temperature,
+            num_steps: self.num_steps,
+            eneout_period: self.eneout_period,
+            crdout_period: self.crdout_period,
+            rstout_period: self.rstout_period,
+            nbupdate_period: self.nbupdate_period,
+        }
+    }
+}
+
+/// Parsed dynamics stage settings (`--equil` or `--prod`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DynSpec {
+    num_steps: usize,
+    time_step: f64,
+    temperature: Option<f64>,
+    eneout_period: usize,
+    crdout_period: usize,
+    rstout_period: usize,
+    stoptr_period: usize,
+    nbupdate_period: usize,
+    seed: Option<u64>,
+}
+
+impl DynSpec {
+    fn default_equil() -> Self {
+        Self {
+            num_steps: 20_000,
+            time_step: 0.01,
+            temperature: None,
+            eneout_period: 100,
+            crdout_period: 100,
+            rstout_period: 1000,
+            stoptr_period: 10,
+            nbupdate_period: 10,
+            seed: None,
+        }
+    }
+
+    fn default_prod() -> Self {
+        Self {
+            num_steps: 500_000,
+            time_step: 0.02,
+            temperature: None,
+            eneout_period: 500,
+            crdout_period: 500,
+            rstout_period: 1000,
+            stoptr_period: 10,
+            nbupdate_period: 10,
+            seed: None,
+        }
+    }
+
+    fn to_params(self, default_temperature: f64, seed: u64) -> isolf::inp::Dynamics {
+        isolf::inp::Dynamics {
+            temperature: self.temperature.unwrap_or(default_temperature),
+            num_steps: self.num_steps,
+            time_step: self.time_step,
+            eneout_period: self.eneout_period,
+            crdout_period: self.crdout_period,
+            rstout_period: self.rstout_period,
+            stoptr_period: self.stoptr_period,
+            nbupdate_period: self.nbupdate_period,
+            seed: self.seed.unwrap_or(seed),
+        }
+    }
+}
 
 /// Upper bound for a randomly drawn Langevin thermostat seed.
 const MAX_ISEED: u64 = 999_999;
@@ -629,7 +608,7 @@ fn help_styles() -> Styles {
 }
 
 fn main() {
-    // Detected before parsing so it can also colour `--help` and error output.
+    // Detected before parsing so `--help` and clap errors also respect `--no-color`.
     let no_color =
         std::env::args().any(|arg| arg == "--no-color") || std::env::var_os("NO_COLOR").is_some();
     let color = if no_color {
@@ -637,144 +616,297 @@ fn main() {
     } else {
         ColorChoice::Auto
     };
-    let command = Args::command().color(color).styles(help_styles());
-    let args = Args::from_arg_matches(&command.get_matches()).unwrap_or_else(|e| e.exit());
-    let color_on = !no_color && std::io::stdout().is_terminal();
-    report::init(color_on, !args.ascii, args.quiet, args.verbose);
+    let command = Cli::command().color(color).styles(help_styles());
+    let cli = Cli::from_arg_matches(&command.get_matches()).unwrap_or_else(|e| e.exit());
 
-    if let Err(error) = run(args) {
+    let (ascii, quiet, verbose, flag_no_color) = match &cli.command {
+        Command::Membrane(a) => (
+            a.common.ascii,
+            a.common.quiet,
+            a.common.verbose,
+            a.common.no_color,
+        ),
+        Command::Vesicle(a) => (
+            a.common.ascii,
+            a.common.quiet,
+            a.common.verbose,
+            a.common.no_color,
+        ),
+        Command::Lipids(a) => (a.ascii, false, false, a.no_color),
+        Command::Update | Command::Uninstall => (false, false, false, false),
+    };
+    let color_on = !(no_color || flag_no_color) && std::io::stdout().is_terminal();
+    report::init(color_on, !ascii, quiet, verbose);
+
+    if let Err(error) = dispatch(cli.command, color_on, !ascii) {
         report::error(&error.to_string());
         std::process::exit(1);
     }
 }
 
-fn run(args: Args) -> Result<(), Box<dyn Error>> {
-    if let Some(command) = &args.command {
-        return match command {
-            Command::Update(_) => update::run(),
-            Command::Uninstall(_) => update::uninstall(),
+fn dispatch(command: Command, color: bool, unicode: bool) -> Result<(), Box<dyn Error>> {
+    match command {
+        Command::Membrane(args) => run_membrane(args),
+        Command::Vesicle(args) => run_vesicle(args),
+        Command::Lipids(_) => {
+            print_lipids(&ForceField::isolf(), color, unicode);
+            Ok(())
+        }
+        Command::Update => update::run(),
+        Command::Uninstall => update::uninstall(),
+    }
+}
+
+/// Validated GENESIS `.inp` stage specs ready to write after the build finishes.
+struct ControlSpecs {
+    temperature: f64,
+    min: MinSpec,
+    equil: DynSpec,
+    prod: DynSpec,
+}
+
+/// Parse and pre-validate `--min`, `--equil`, `--prod`, and `--temperature`
+/// before building so bad period multiples fail immediately.
+fn prepare_controls(
+    common: &CommonBuildArgs,
+    geometry: Geometry,
+) -> Result<(ControlSpecs, Option<String>), Box<dyn Error>> {
+    if let Some(t) = common.temperature
+        && (!t.is_finite() || t <= 0.0)
+    {
+        return Err(format!("--temperature: '{t}' is not a positive temperature in K").into());
+    }
+    let temperature = common.temperature.unwrap_or(DEFAULT_TEMPERATURE);
+    let min = parse_min_spec(&common.min)?;
+    let equil = parse_dyn_spec("--equil", &common.equil, DynSpec::default_equil())?;
+    let prod = parse_dyn_spec("--prod", &common.prod, DynSpec::default_prod())?;
+
+    let want_inp = common.want_inp();
+    if want_inp {
+        // Validate step/period divisibility up front (placeholder seed & box).
+        isolf::inp::minimization("x", &min.to_params([1.0; 3], temperature))
+            .map_err(|e| format!("--min: {e}"))?;
+        let check_dyn = |flag: &str, spec: DynSpec| -> Result<(), Box<dyn Error>> {
+            let p = spec.to_params(temperature, 1);
+            let res = if geometry.is_npt() {
+                isolf::inp::npt("x", "x", "x", &p)
+            } else {
+                isolf::inp::nvt("x", "x", "x", &p)
+            };
+            res.map(|_| ()).map_err(|e| format!("{flag}: {e}").into())
         };
+        check_dyn("--equil", equil)?;
+        check_dyn("--prod", prod)?;
     }
-    report::header();
+
+    let temp_note = (common.temperature.is_some() && !want_inp).then(|| {
+        "--temperature only affects GENESIS .inp files (pass --inp to write them)".to_string()
+    });
+    Ok((
+        ControlSpecs {
+            temperature,
+            min,
+            equil,
+            prod,
+        },
+        temp_note,
+    ))
+}
+
+fn validate_padding(padding: f64) -> Result<(), Box<dyn Error>> {
+    if !padding.is_finite() || padding < 0.0 {
+        return Err(format!("--padding: '{padding}' must be a non-negative number of nm").into());
+    }
+    Ok(())
+}
+
+/// Resolve the two leaflet/shell compositions from symmetric `--lipids` or
+/// paired (`--upper`/`--lower`, `--outer`/`--inner`) specs.
+fn resolve_compositions(
+    lipids: &[String],
+    first: &[String],
+    second: &[String],
+    first_flag: &str,
+    second_flag: &str,
+) -> Result<(Composition, Composition), Box<dyn Error>> {
+    let sym = join_specs(lipids);
+    if !sym.is_empty() {
+        let comp = Composition::parse(&sym)?;
+        return Ok((comp.clone(), comp));
+    }
+    let a = join_specs(first);
+    let b = join_specs(second);
+    let a_opt = (!a.is_empty()).then_some(a.as_str());
+    let b_opt = (!b.is_empty()).then_some(b.as_str());
+    let first_spec = a_opt.or(b_opt).ok_or_else(|| {
+        format!("missing lipid composition: pass --lipids <SPEC> (or {first_flag}/{second_flag})")
+    })?;
+    let second_spec = b_opt.or(a_opt).unwrap_or(first_spec);
+    Ok((
+        Composition::parse(first_spec)?,
+        Composition::parse(second_spec)?,
+    ))
+}
+
+fn run_membrane(args: MembraneArgs) -> Result<(), Box<dyn Error>> {
     let force_field = ForceField::isolf();
-    // Always materialise a seed (random when none is given) so the run log can
-    // record a command that reproduces this build exactly.
-    let seed = args.seed.unwrap_or_else(|| rand::rng().random());
+    validate_padding(args.padding)?;
+
+    // Parse & validate all arguments before printing the banner.
+    let (upper, lower) =
+        resolve_compositions(&args.lipids, &args.upper, &args.lower, "--upper", "--lower")?;
+    let counts = parse_count_spec(&args.count)?;
+    let box_xy = parse_box_spec(&args.box_size)?;
+    if counts.is_none() && box_xy.is_none() {
+        return Err("missing membrane size: pass --count <N>, --box <L>, or both".into());
+    }
+    let (sizing, balance_note) = resolve_membrane_sizing(
+        args.no_balance,
+        &force_field,
+        &upper,
+        &lower,
+        counts,
+        box_xy,
+    )
+    .map_err(|e| enrich_build_error(&force_field, e))?;
+    let (controls, temp_note) = prepare_controls(&args.common, Geometry::Membrane)?;
+
+    let seed = args.common.seed.unwrap_or_else(|| rand::rng().random());
     let mut rng = StdRng::seed_from_u64(seed);
-
-    let membrane_counts = parse_lipids_per_leaflet(&args.lipids_per_leaflet)?;
-    let membrane_box = parse_membrane(&args.membrane)?;
-    let vesicle = parse_vesicle(&args.vesicle)?;
-    let want_membrane = membrane_counts.is_some() || membrane_box.is_some() || vesicle.is_some();
-
-    // Combine the (repeatable, comma-separated) leaflet specs into one string each.
-    let upper_input = join_specs(&args.upper);
-    let lower_input = join_specs(&args.lower);
-    let upper_given = !upper_input.is_empty();
-    let lower_given = !lower_input.is_empty();
-
-    // A composition with no size can't build a membrane; refuse rather than
-    // silently dropping the lipids.
-    if (upper_given || lower_given) && !want_membrane {
-        return Err("a lipid composition (--upper/--lower) needs a size:\n  \
-             membrane:  --lipids-per-leaflet <N>  (or --membrane <L>)\n  \
-             vesicle:   --vesicle <R>"
-            .into());
-    }
-    if !want_membrane {
-        return Err("nothing to build. Choose a mode:\n  \
-             membrane:  --upper <lipids> --lipids-per-leaflet <N>  (or --membrane <L>)\n  \
-             vesicle:   --upper <lipids> --vesicle <R>"
-            .into());
-    }
-
-    // The build mode follows from the flags: a vesicle if a radius was given,
-    // otherwise a flat membrane.
-    let geometry = if vesicle.is_some() {
-        Geometry::Vesicle
-    } else {
-        Geometry::Membrane
-    };
-    report::section("Build");
-
-    // A leaflet may be omitted; it then copies the other.
-    let upper_opt = upper_given.then_some(&upper_input);
-    let lower_opt = lower_given.then_some(&lower_input);
-    let upper_spec = upper_opt
-        .or(lower_opt)
-        .ok_or("a membrane needs a composition (--upper or --lower)")?;
-    let lower_spec = lower_opt.or(upper_opt).unwrap_or(upper_spec);
-    let upper = Composition::parse(upper_spec)?;
-    let lower = Composition::parse(lower_spec)?;
     let options = BuildOptions {
         padding: args.padding,
     };
-    let kind = geometry.label();
-    let spin = report::spin(&format!("building {kind}"));
-    let (mut membrane, note, gif_frames) = match geometry {
-        Geometry::Vesicle => {
-            let radius = vesicle.expect("a vesicle geometry has a radius");
-            let (membrane, frames) = if args.gif {
-                build_vesicle_recorded(
-                    &force_field,
-                    geometry.title(),
-                    &upper,
-                    &lower,
-                    radius,
-                    &options,
-                    &mut rng,
-                )?
-            } else {
-                let membrane = build_vesicle(
-                    &force_field,
-                    geometry.title(),
-                    &upper,
-                    &lower,
-                    radius,
-                    &options,
-                    &mut rng,
-                )?;
-                (membrane, Vec::new())
-            };
-            (membrane, None, frames)
-        }
-        Geometry::Membrane => {
-            let (sizing, note) = resolve_membrane_sizing(
-                &args,
-                &force_field,
-                &upper,
-                &lower,
-                membrane_counts,
-                membrane_box,
-            )?;
-            let (membrane, frames) = if args.gif {
-                Membrane::build_recorded(
-                    &force_field,
-                    geometry.title(),
-                    &upper,
-                    &lower,
-                    sizing,
-                    &options,
-                    &mut rng,
-                )?
-            } else {
-                let membrane = Membrane::build(
-                    &force_field,
-                    geometry.title(),
-                    &upper,
-                    &lower,
-                    sizing,
-                    &options,
-                    &mut rng,
-                )?;
-                (membrane, Vec::new())
-            };
-            (membrane, note, frames)
-        }
+
+    report::header();
+    report::section("Build");
+    let spin = report::spin("building membrane");
+    let built = if args.common.want_gif() {
+        Membrane::build_recorded(
+            &force_field,
+            Geometry::Membrane.title(),
+            &upper,
+            &lower,
+            sizing,
+            &options,
+            &mut rng,
+        )
+    } else {
+        Membrane::build(
+            &force_field,
+            Geometry::Membrane.title(),
+            &upper,
+            &lower,
+            sizing,
+            &options,
+            &mut rng,
+        )
+        .map(|m| (m, Vec::new()))
     };
     spin.finish();
+    let (membrane, gif_frames) = built.map_err(|e| enrich_build_error(&force_field, e))?;
+
+    let mut notes = Vec::new();
+    if let Some(n) = balance_note {
+        notes.push(n);
+    }
+    if let Some(n) = temp_note {
+        notes.push(n);
+    }
+    finish_build(
+        membrane,
+        gif_frames,
+        &force_field,
+        &args.common,
+        Geometry::Membrane,
+        args.center,
+        &controls,
+        &notes,
+        seed,
+        &mut rng,
+    )
+}
+
+fn run_vesicle(args: VesicleArgs) -> Result<(), Box<dyn Error>> {
+    let force_field = ForceField::isolf();
+    validate_padding(args.padding)?;
+
+    // Parse & validate all arguments before printing the banner.
+    let (outer, inner) =
+        resolve_compositions(&args.lipids, &args.outer, &args.inner, "--outer", "--inner")?;
+    let radius = parse_radius_spec(&args.radius)?
+        .ok_or("missing vesicle radius: pass --radius <R> (e.g. 20, ri=15, or ri=14,ro=20)")?;
+    // Validate lipid names before printing the banner.
+    isolf::membrane::area_per_lipid(&force_field, &outer)
+        .map_err(|e| enrich_build_error(&force_field, e))?;
+    isolf::membrane::area_per_lipid(&force_field, &inner)
+        .map_err(|e| enrich_build_error(&force_field, e))?;
+    let (controls, temp_note) = prepare_controls(&args.common, Geometry::Vesicle)?;
+
+    let seed = args.common.seed.unwrap_or_else(|| rand::rng().random());
+    let mut rng = StdRng::seed_from_u64(seed);
+    let options = BuildOptions {
+        padding: args.padding,
+    };
+
+    report::header();
+    report::section("Build");
+    let spin = report::spin("building vesicle");
+    let built = if args.common.want_gif() {
+        build_vesicle_recorded(
+            &force_field,
+            Geometry::Vesicle.title(),
+            &outer,
+            &inner,
+            radius,
+            &options,
+            &mut rng,
+        )
+    } else {
+        build_vesicle(
+            &force_field,
+            Geometry::Vesicle.title(),
+            &outer,
+            &inner,
+            radius,
+            &options,
+            &mut rng,
+        )
+        .map(|m| (m, Vec::new()))
+    };
+    spin.finish();
+    let (membrane, gif_frames) = built.map_err(|e| enrich_build_error(&force_field, e))?;
+
+    let notes: Vec<String> = temp_note.into_iter().collect();
+    finish_build(
+        membrane,
+        gif_frames,
+        &force_field,
+        &args.common,
+        Geometry::Vesicle,
+        args.center,
+        &controls,
+        &notes,
+        seed,
+        &mut rng,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_build(
+    mut membrane: Membrane,
+    gif_frames: Vec<RelaxFrame>,
+    force_field: &ForceField,
+    common: &CommonBuildArgs,
+    geometry: Geometry,
+    center: CenterArg,
+    controls: &ControlSpecs,
+    notes: &[String],
+    seed: u64,
+    rng: &mut StdRng,
+) -> Result<(), Box<dyn Error>> {
+    let identity = geometry.label();
     report::ok(
-        kind,
+        identity,
         &format!(
             "{} lipids {} {} beads",
             report::thousands(membrane.total_lipids()),
@@ -782,40 +914,37 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
             report::thousands(membrane.particles.len()),
         ),
     );
-    if let Some(note) = note {
-        report::warn(&note);
+    for note in notes {
+        report::warn(note);
     }
 
-    // Output file base name: `--name`, else the build-mode default. Shared by the
-    // written files and the run log below.
-    let base = args
+    let base = common
         .name
         .clone()
         .unwrap_or_else(|| geometry.label().to_string());
 
     write_outputs(
         &mut membrane,
-        &force_field,
-        &args,
+        force_field,
+        common,
         geometry,
+        center,
+        controls,
         &base,
         &gif_frames,
-        &mut rng,
+        rng,
     )?;
 
-    // Box, particle count, and mode label, shared by the run log and the summary.
-    let out_dir = args.out.display().to_string();
+    let out_dir = common.out.display().to_string();
     let box_size = membrane.box_size;
     let beads = membrane.particles.len();
-    let identity = geometry.label();
 
-    // The always-on run log, written next to the output and listed within it.
     let files: Vec<String> = report::recorded_files()
         .iter()
         .filter_map(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
         .collect();
-    let command = reproduce_command(seed, args.seed.is_some());
-    let log_path = args.out.join(format!("{base}.log"));
+    let command = reproduce_command(seed, common.seed.is_some());
+    let log_path = common.out.join(format!("{base}.log"));
     runlog::Run {
         command: &command,
         seed,
@@ -829,17 +958,13 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     .write(&log_path)?;
     report::record(&log_path);
 
-    // The grouped Write section (now including the log) and the closing summary.
     report::write_section(&out_dir);
-    let next = args.inp.then(|| {
+    let next = common.want_inp().then(|| {
         let equil = if geometry.is_npt() {
             "npt.inp"
         } else {
             "nvt.inp"
         };
-        // atdyn resolves the .inp's relative include paths against the working
-        // directory, so it must run inside the output dir. Prefix a `cd` only when
-        // a real `--out` was given (skip the pointless `cd .` for the default).
         let cd = if out_dir == "." {
             String::new()
         } else {
@@ -857,6 +982,148 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
         next,
     });
     Ok(())
+}
+
+/// Turn an [`UnknownLipid`](BuildError::UnknownLipid) into an actionable message
+/// with close matches and a pointer to `isolf lipids`.
+fn enrich_build_error(force_field: &ForceField, err: BuildError) -> Box<dyn Error> {
+    if let BuildError::UnknownLipid(ref name) = err {
+        let suggestions = suggest_lipids(force_field, name);
+        if suggestions.is_empty() {
+            return format!(
+                "unknown lipid '{name}' (run 'isolf lipids' to list all {} supported lipids)",
+                force_field.lipids.len()
+            )
+            .into();
+        }
+        return format!(
+            "unknown lipid '{name}' — did you mean {}? (run 'isolf lipids' to list all {})",
+            suggestions.join(", "),
+            force_field.lipids.len()
+        )
+        .into();
+    }
+    err.into()
+}
+
+/// Suggest up to 5 closest lipid names within Levenshtein edit distance 2.
+fn suggest_lipids<'a>(force_field: &'a ForceField, query: &str) -> Vec<&'a str> {
+    let q = query.to_ascii_uppercase();
+    let mut ranked: Vec<(usize, &str)> = force_field
+        .lipids
+        .iter()
+        .filter_map(|l| {
+            let d = edit_distance(&q, &l.name);
+            (d <= 2).then_some((d, l.name.as_str()))
+        })
+        .collect();
+    ranked.sort_by_key(|&(d, name)| (d, name));
+    if let Some(&(best, _)) = ranked.first() {
+        ranked.retain(|&(d, _)| d == best);
+    }
+    ranked.into_iter().take(5).map(|(_, n)| n).collect()
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// Print the 7×5 iSoLF lipid table directly from the force field.
+fn print_lipids(ff: &ForceField, color: bool, unicode: bool) {
+    let paint = |s: &str, code: &str| {
+        if color {
+            format!("\x1b[{code}m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
+    };
+    let tails = [
+        ("DL", "lauroyl (12:0)"),
+        ("DM", "myristoyl (14:0)"),
+        ("DP", "palmitoyl (16:0)"),
+        ("DS", "stearoyl (18:0)"),
+        ("DO", "dioleoyl (18:1)"),
+        ("PO", "16:0 / 18:1"),
+        ("SO", "18:0 / 18:1"),
+    ];
+    let heads = ["PC", "PE", "PG", "PS", "PA"];
+    let sep = if unicode { "×" } else { "x" };
+
+    println!(
+        "{} ({} species: {} {sep} {}, named <tail><head>)\n",
+        paint("iSoLF lipids", "1;36"),
+        ff.lipids.len(),
+        tails.len(),
+        heads.len(),
+    );
+
+    // Header row with each head group's net charge computed from the force field.
+    let head_cols: Vec<String> = heads
+        .iter()
+        .map(|h| {
+            let sample = format!("PO{h}");
+            let q: f64 = ff
+                .lipid(&sample)
+                .map(|l| {
+                    l.beads
+                        .iter()
+                        .filter_map(|b| ff.bead_type(b))
+                        .map(|b| b.charge)
+                        .sum()
+                })
+                .unwrap_or(0.0);
+            let q_label = if q.abs() < 0.01 {
+                "0".to_string()
+            } else {
+                format!("{q:+.0}")
+            };
+            format!("{h} ({q_label})")
+        })
+        .collect();
+
+    println!(
+        "  {}  {}  {}  {}  {}  {}  {}  {}",
+        paint(&format!("{:<4}", "Tail"), "1"),
+        paint(&format!("{:<18}", "Acyl chains"), "1"),
+        paint(&format!("{:<8}", head_cols[0]), "1"),
+        paint(&format!("{:<8}", head_cols[1]), "1"),
+        paint(&format!("{:<8}", head_cols[2]), "1"),
+        paint(&format!("{:<8}", head_cols[3]), "1"),
+        paint(&format!("{:<8}", head_cols[4]), "1"),
+        paint("Beads", "1"),
+    );
+
+    for (tail, desc) in tails {
+        let names: Vec<String> = heads.iter().map(|h| format!("{tail}{h}")).collect();
+        let pc_beads = ff.lipid(&names[0]).map_or(0, |l| l.beads.len());
+        let pa_beads = ff.lipid(&names[4]).map_or(0, |l| l.beads.len());
+        println!(
+            "  {}  {:<18}  {:<8}  {:<8}  {:<8}  {:<8}  {:<8}  {}",
+            paint(&format!("{tail:<4}"), "36"),
+            desc,
+            names[0],
+            names[1],
+            names[2],
+            names[3],
+            names[4],
+            paint(&format!("{pc_beads} (PA: {pa_beads})"), "2"),
+        );
+    }
+    println!(
+        "\n  {}  isolf membrane -L \"POPC=3,POPS=1\" -n 256 --top -o my_membrane",
+        paint("Example:", "2")
+    );
 }
 
 /// Reconstruct the invocation as a re-runnable, shell-quoted line, with the seed
@@ -928,24 +1195,32 @@ impl Geometry {
     }
 }
 
-/// Parse a single positive numeric dimension (nm), trimming whitespace.
-fn parse_dim(value: &str) -> Result<f64, Box<dyn Error>> {
+/// Parse a single positive finite floating-point number, trimming whitespace.
+fn parse_pos_f64(value: &str, unit: &str) -> Result<f64, Box<dyn Error>> {
     let value = value.trim();
     value
         .parse::<f64>()
         .ok()
         .filter(|v| v.is_finite() && *v > 0.0)
-        .ok_or_else(|| format!("'{value}' is not a positive number of nm").into())
+        .ok_or_else(|| format!("'{value}' is not a positive {unit}").into())
 }
 
-/// Parse a positive lipid count, trimming whitespace.
-fn parse_count(value: &str) -> Result<usize, Box<dyn Error>> {
+/// Parse a positive integer (`>= 1`), trimming whitespace.
+fn parse_pos_usize(value: &str, what: &str) -> Result<usize, Box<dyn Error>> {
     let value = value.trim();
     value
         .parse::<usize>()
         .ok()
         .filter(|n| *n > 0)
-        .ok_or_else(|| format!("'{value}' is not a positive lipid count").into())
+        .ok_or_else(|| format!("'{value}' is not a positive {what}").into())
+}
+
+/// Parse a non-negative integer (`>= 0`), trimming whitespace.
+fn parse_usize(value: &str, what: &str) -> Result<usize, Box<dyn Error>> {
+    let value = value.trim();
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("'{value}' is not a non-negative {what}").into())
 }
 
 /// Walk non-empty comma-separated `KEY=VALUE` (or bare `VALUE`) tokens across
@@ -969,29 +1244,23 @@ fn for_each_kv(
     Ok(seen)
 }
 
-/// Parse the repeatable `--lipids-per-leaflet` occurrences into per-leaflet lipid
-/// counts `(upper, lower)`, or `None` if the flag was absent. Each occurrence is a
-/// comma-separated list of `up=<N>`, `lo=<N>`, or a bare number (sets `up`); an
-/// unspecified leaflet copies the other, so `1000` and `up=1000` both mean 1000
-/// lipids in each leaflet.
-fn parse_lipids_per_leaflet(specs: &[String]) -> Result<Option<(usize, usize)>, Box<dyn Error>> {
+/// Parse `--count` occurrences into `(upper, lower)` lipid counts.
+fn parse_count_spec(specs: &[String]) -> Result<Option<(usize, usize)>, Box<dyn Error>> {
     let (mut up, mut lo) = (None, None);
     let seen = for_each_kv(specs, |key, val| match key {
         None => {
-            up = Some(parse_count(val)?);
+            up = Some(parse_pos_usize(val, "lipid count")?);
             Ok(())
         }
         Some(k) if k.eq_ignore_ascii_case("up") || k.eq_ignore_ascii_case("upper") => {
-            up = Some(parse_count(val)?);
+            up = Some(parse_pos_usize(val, "lipid count")?);
             Ok(())
         }
         Some(k) if k.eq_ignore_ascii_case("lo") || k.eq_ignore_ascii_case("lower") => {
-            lo = Some(parse_count(val)?);
+            lo = Some(parse_pos_usize(val, "lipid count")?);
             Ok(())
         }
-        Some(other) => {
-            Err(format!("--lipids-per-leaflet: unknown key '{other}' (use up or lo)").into())
-        }
+        Some(other) => Err(format!("--count: unknown key '{other}' (use up or lo)").into()),
     })?;
     if !seen {
         return Ok(None);
@@ -999,32 +1268,27 @@ fn parse_lipids_per_leaflet(specs: &[String]) -> Result<Option<(usize, usize)>, 
     match (up, lo) {
         (Some(u), Some(l)) => Ok(Some((u, l))),
         (Some(n), None) | (None, Some(n)) => Ok(Some((n, n))),
-        (None, None) => {
-            Err("--lipids-per-leaflet needs a value, e.g. `1000` or `up=1000,lo=2000`".into())
-        }
+        (None, None) => Err("--count needs a value, e.g. `256` or `up=300,lo=200`".into()),
     }
 }
 
-/// Parse the repeatable `--membrane` occurrences into a flat-membrane box
-/// `(x, y)` in nm, or `None` if the flag was absent. Each occurrence is a
-/// comma-separated list of `x=<nm>`, `y=<nm>`, or a bare number (sets `x`); an
-/// unspecified side copies the other, so `10` and `x=10` both mean a 10 nm square.
-fn parse_membrane(specs: &[String]) -> Result<Option<(f64, f64)>, Box<dyn Error>> {
+/// Parse `--box` occurrences into `(x, y)` dimensions in nm.
+fn parse_box_spec(specs: &[String]) -> Result<Option<(f64, f64)>, Box<dyn Error>> {
     let (mut x, mut y) = (None, None);
     let seen = for_each_kv(specs, |key, val| match key {
         None => {
-            x = Some(parse_dim(val)?);
+            x = Some(parse_pos_f64(val, "number of nm")?);
             Ok(())
         }
         Some(k) if k.eq_ignore_ascii_case("x") => {
-            x = Some(parse_dim(val)?);
+            x = Some(parse_pos_f64(val, "number of nm")?);
             Ok(())
         }
         Some(k) if k.eq_ignore_ascii_case("y") => {
-            y = Some(parse_dim(val)?);
+            y = Some(parse_pos_f64(val, "number of nm")?);
             Ok(())
         }
-        Some(other) => Err(format!("--membrane: unknown key '{other}' (use x or y)").into()),
+        Some(other) => Err(format!("--box: unknown key '{other}' (use x or y)").into()),
     })?;
     if !seen {
         return Ok(None);
@@ -1032,31 +1296,27 @@ fn parse_membrane(specs: &[String]) -> Result<Option<(f64, f64)>, Box<dyn Error>
     match (x, y) {
         (Some(x), Some(y)) => Ok(Some((x, y))),
         (Some(s), None) | (None, Some(s)) => Ok(Some((s, s))),
-        (None, None) => Err("--membrane needs a value, e.g. `10` or `x=10,y=20`".into()),
+        (None, None) => Err("--box needs a value, e.g. `20` or `x=30,y=15`".into()),
     }
 }
 
-/// Parse the repeatable `--vesicle` occurrences into a [`VesicleRadius`], or
-/// `None` if the flag was absent. Each occurrence is a comma-separated list of
-/// `ri=<nm>` (inner/lumen radius), `ro=<nm>` (outer radius), or a bare number (sets
-/// the outer radius). With one radius the other is derived from the bilayer
-/// thickness; with both, [`build_vesicle`] checks the gap holds the bilayer.
-fn parse_vesicle(specs: &[String]) -> Result<Option<VesicleRadius>, Box<dyn Error>> {
+/// Parse `--radius` occurrences into a [`VesicleRadius`].
+fn parse_radius_spec(specs: &[String]) -> Result<Option<VesicleRadius>, Box<dyn Error>> {
     let (mut inner, mut outer) = (None, None);
     let seen = for_each_kv(specs, |key, val| match key {
         None => {
-            outer = Some(parse_dim(val)?);
+            outer = Some(parse_pos_f64(val, "number of nm")?);
             Ok(())
         }
-        Some(k) if k.eq_ignore_ascii_case("ri") => {
-            inner = Some(parse_dim(val)?);
+        Some(k) if k.eq_ignore_ascii_case("ri") || k.eq_ignore_ascii_case("inner") => {
+            inner = Some(parse_pos_f64(val, "number of nm")?);
             Ok(())
         }
-        Some(k) if k.eq_ignore_ascii_case("ro") => {
-            outer = Some(parse_dim(val)?);
+        Some(k) if k.eq_ignore_ascii_case("ro") || k.eq_ignore_ascii_case("outer") => {
+            outer = Some(parse_pos_f64(val, "number of nm")?);
             Ok(())
         }
-        Some(other) => Err(format!("--vesicle: unknown key '{other}' (use ro or ri)").into()),
+        Some(other) => Err(format!("--radius: unknown key '{other}' (use ro or ri)").into()),
     })?;
     if !seen {
         return Ok(None);
@@ -1065,14 +1325,112 @@ fn parse_vesicle(specs: &[String]) -> Result<Option<VesicleRadius>, Box<dyn Erro
         (Some(inner), Some(outer)) => Ok(Some(VesicleRadius::Both { inner, outer })),
         (Some(inner), None) => Ok(Some(VesicleRadius::Inner(inner))),
         (None, Some(outer)) => Ok(Some(VesicleRadius::Outer(outer))),
-        (None, None) => Err("--vesicle needs a value, e.g. `20` or `ri=15,ro=20`".into()),
+        (None, None) => Err("--radius needs a value, e.g. `20` or `ri=14,ro=20`".into()),
     }
 }
 
-/// Combine the repeatable, comma-separated occurrences of a leaflet flag
-/// (`--upper POPC=1 --upper DPPC=1` or `--upper "POPC=1,DPPC=1"`) into a single
-/// `NAME=WEIGHT,…` string, dropping blank occurrences. The combined string is then
-/// parsed by [`Composition::parse`].
+/// Parse `--min` override tokens into a [`MinSpec`].
+fn parse_min_spec(specs: &[String]) -> Result<MinSpec, Box<dyn Error>> {
+    let mut out = MinSpec::default();
+    for_each_kv(specs, |key, val| match key {
+        None => {
+            out.num_steps = parse_pos_usize(val, "step count")?;
+            Ok(())
+        }
+        Some(k) => match k.to_ascii_lowercase().as_str() {
+            "steps" | "nsteps" | "num_steps" => {
+                out.num_steps = parse_pos_usize(val, "step count")?;
+                Ok(())
+            }
+            "eneout" | "eneout_period" => {
+                out.eneout_period = parse_usize(val, "period")?;
+                Ok(())
+            }
+            "crdout" | "crdout_period" => {
+                out.crdout_period = parse_usize(val, "period")?;
+                Ok(())
+            }
+            "rstout" | "rstout_period" => {
+                out.rstout_period = parse_usize(val, "period")?;
+                Ok(())
+            }
+            "nbupdate" | "nbupdate_period" => {
+                out.nbupdate_period = parse_usize(val, "period")?;
+                Ok(())
+            }
+            other => Err(format!(
+                "--min: unknown key '{other}' (use steps, eneout, crdout, rstout, nbupdate)"
+            )
+            .into()),
+        },
+    })?;
+    Ok(out)
+}
+
+/// Parse `--equil` or `--prod` override tokens into a [`DynSpec`].
+fn parse_dyn_spec(
+    flag: &str,
+    specs: &[String],
+    mut out: DynSpec,
+) -> Result<DynSpec, Box<dyn Error>> {
+    for_each_kv(specs, |key, val| {
+        match key {
+        None => {
+            out.num_steps = parse_pos_usize(val, "step count")?;
+            Ok(())
+        }
+        Some(k) => match k.to_ascii_lowercase().as_str() {
+            "steps" | "nsteps" | "num_steps" => {
+                out.num_steps = parse_pos_usize(val, "step count")?;
+                Ok(())
+            }
+            "dt" | "timestep" | "time_step" => {
+                out.time_step = parse_pos_f64(val, "time step")?;
+                Ok(())
+            }
+            "temp" | "temperature" => {
+                out.temperature = Some(parse_pos_f64(val, "temperature in K")?);
+                Ok(())
+            }
+            "eneout" | "eneout_period" => {
+                out.eneout_period = parse_usize(val, "period")?;
+                Ok(())
+            }
+            "crdout" | "crdout_period" => {
+                out.crdout_period = parse_usize(val, "period")?;
+                Ok(())
+            }
+            "rstout" | "rstout_period" => {
+                out.rstout_period = parse_usize(val, "period")?;
+                Ok(())
+            }
+            "stoptr" | "stoptr_period" => {
+                out.stoptr_period = parse_usize(val, "period")?;
+                Ok(())
+            }
+            "nbupdate" | "nbupdate_period" => {
+                out.nbupdate_period = parse_usize(val, "period")?;
+                Ok(())
+            }
+            "seed" | "iseed" => {
+                let s = val
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| format!("'{val}' is not a valid seed"))?;
+                out.seed = Some(s);
+                Ok(())
+            }
+            other => Err(format!(
+                "{flag}: unknown key '{other}' (use steps, dt, temp, eneout, crdout, rstout, stoptr, nbupdate, seed)"
+            )
+            .into()),
+        },
+    }
+    })?;
+    Ok(out)
+}
+
+/// Combine repeatable, comma-separated composition flags into one string.
 fn join_specs(specs: &[String]) -> String {
     specs
         .iter()
@@ -1082,53 +1440,33 @@ fn join_specs(specs: &[String]) -> String {
         .join(",")
 }
 
-/// Map the count/box options to a [`Sizing`]:
-/// counts only → minimum square box; box only → fill it; both → pack into the box.
-fn resolve_sizing(
-    counts: Option<(usize, usize)>,
-    box_xy: Option<(f64, f64)>,
-) -> Result<Sizing, Box<dyn Error>> {
-    match (counts, box_xy) {
-        (Some((upper, lower)), None) => Ok(Sizing::Count { upper, lower }),
-        (None, Some((x, y))) => Ok(Sizing::Box { x, y }),
-        (Some((upper, lower)), Some((x, y))) => Ok(Sizing::CountInBox { upper, lower, x, y }),
-        // A flat-membrane geometry always carries a count or a box.
-        (None, None) => unreachable!("a membrane geometry has a count or a box"),
-    }
-}
-
-/// Resolve the flat-membrane sizing, matching the two leaflets' areas. Returns
-/// the sizing and an optional note for the user. Balancing applies only to count
-/// mode; an explicit box already fills each leaflet at its own target density.
+/// Resolve the flat-membrane sizing, matching the two leaflets' areas in count
+/// mode unless `no_balance` is set. Also validates all lipid names up front.
 fn resolve_membrane_sizing(
-    args: &Args,
+    no_balance: bool,
     force_field: &ForceField,
     upper: &Composition,
     lower: &Composition,
     counts: Option<(usize, usize)>,
     box_xy: Option<(f64, f64)>,
-) -> Result<(Sizing, Option<String>), Box<dyn Error>> {
-    let (Some((upper_count, lower_count)), None) = (counts, box_xy) else {
-        return Ok((resolve_sizing(counts, box_xy)?, None));
-    };
+) -> Result<(Sizing, Option<String>), BuildError> {
     let upper_apl = isolf::membrane::area_per_lipid(force_field, upper)?;
     let lower_apl = isolf::membrane::area_per_lipid(force_field, lower)?;
-    let (upper, lower, note) = balanced_counts(
-        upper_apl,
-        lower_apl,
-        upper_count,
-        lower_count,
-        !args.no_balance,
-    );
-    Ok((Sizing::Count { upper, lower }, note))
+    match (counts, box_xy) {
+        (Some((upper_count, lower_count)), None) => {
+            let (u, l, note) =
+                balanced_counts(upper_apl, lower_apl, upper_count, lower_count, !no_balance);
+            Ok((Sizing::Count { upper: u, lower: l }, note))
+        }
+        (None, Some((x, y))) => Ok((Sizing::Box { x, y }, None)),
+        (Some((upper, lower)), Some((x, y))) => {
+            Ok((Sizing::CountInBox { upper, lower, x, y }, None))
+        }
+        (None, None) => unreachable!("membrane requires --count or --box"),
+    }
 }
 
-/// Resolve the per-leaflet counts so the leaflets start at matched area (the same
-/// lateral density), from each leaflet's area per lipid (nm²).
-///
-/// If the two leaflets' areas differ by more than 2%, the counts are kept and a
-/// note returned (the lighter leaflet would start under-dense, a possible pore),
-/// unless `balance` grows the lighter leaflet to match. Returns (upper, lower, note).
+/// Resolve per-leaflet counts so both leaflets start at matched area.
 fn balanced_counts(
     upper_apl: f64,
     lower_apl: f64,
@@ -1148,7 +1486,6 @@ fn balanced_counts(
     let heavy_area = upper_area.max(lower_area);
     let upper_light = upper_area < lower_area;
     if balance {
-        // Grow the lighter leaflet to the heavier leaflet's area.
         if upper_light {
             let grown = count_for(heavy_area, upper_apl);
             let note = format!(
@@ -1172,7 +1509,7 @@ fn balanced_counts(
         let pct = (mismatch * 100.0).round();
         let note = format!(
             "leaflet areas differ by {pct}%: the {name} leaflet will start under-dense \
-             (a possible pore). Set {key}={to_match} in --lipids-per-leaflet (from {count_now}), \
+             (a possible pore). Set {key}={to_match} in --count (from {count_now}), \
              or drop --no-balance to grow it to match automatically"
         );
         (upper, lower, Some(note))
@@ -1211,8 +1548,6 @@ fn leaflet_split(m: &Membrane, geometry: Geometry) -> Vec<report::Leaflet> {
         }
     };
 
-    // Particles are contiguous per molecule and grouped by species, so we count
-    // in one linear scan with no HashMaps or String clones.
     let threshold = m.particles.iter().map(|p| scalar(p.position)).sum::<f64>() / n;
     let n_species = m.lipid_counts.len();
     let mut far = vec![0usize; n_species];
@@ -1258,35 +1593,34 @@ fn leaflet_split(m: &Membrane, geometry: Geometry) -> Vec<report::Leaflet> {
 fn write_outputs(
     membrane: &mut Membrane,
     force_field: &ForceField,
-    args: &Args,
+    common: &CommonBuildArgs,
     geometry: Geometry,
+    center: CenterArg,
+    controls: &ControlSpecs,
     base: &str,
     gif_frames: &[RelaxFrame],
     rng: &mut StdRng,
 ) -> Result<(), Box<dyn Error>> {
-    fs::create_dir_all(&args.out)?;
-    let named = |extension: &str| args.out.join(format!("{base}.{extension}"));
+    fs::create_dir_all(&common.out)?;
+    let named = |extension: &str| common.out.join(format!("{base}.{extension}"));
 
-    // Centre the finished system in the box in place (a no-op for an already
-    // centred vesicle), then shift to the coordinate origin if `--center origin`.
-    // The periodic box is unchanged; only the coordinates move.
     membrane.center_in_box();
     let box_size = membrane.box_size;
-    if matches!(args.center, CenterArg::Origin) {
+    if matches!(center, CenterArg::Origin) {
         membrane.translate([-box_size[0] / 2.0, -box_size[1] / 2.0, -box_size[2] / 2.0]);
     }
     let membrane: &Membrane = membrane;
 
-    // Structure/coordinate formats: `.gro` is always written; optional formats
-    // (`--pdb`, `--psf`/`--vmd`, `--crd`, `--cif`) each parallelise internally
-    // over particles, so writing them one at a time keeps peak memory low while
-    // saturating all cores.
+    let want_inp = common.want_inp();
+    let want_vmd = common.want_vmd();
+    let want_gif = common.want_gif();
+
     let formats: [StructureFormat; 5] = [
         (true, "gro", Membrane::to_gro),
-        (args.pdb, "pdb", Membrane::to_pdb),
-        (args.psf || args.vmd, "psf", Membrane::to_psf),
-        (args.crd, "crd", Membrane::to_crd),
-        (args.cif, "cif", Membrane::to_cif),
+        (common.pdb, "pdb", Membrane::to_pdb),
+        (common.psf || want_vmd, "psf", Membrane::to_psf),
+        (common.crd, "crd", Membrane::to_crd),
+        (common.cif, "cif", Membrane::to_cif),
     ];
     for (enabled, ext, render) in formats {
         if enabled {
@@ -1294,85 +1628,82 @@ fn write_outputs(
         }
     }
 
-    // Topology files (`.top` plus the force-field `.itp`) with --top, or implied
-    // by --inp, since a run needs them.
-    if args.top || args.inp {
+    if common.top || want_inp {
         write(&named("top"), &membrane.to_top())?;
-        write(&args.out.join("isolf.itp"), &force_field.to_itp())?;
+        write(&common.out.join("isolf.itp"), &force_field.to_itp())?;
     }
 
-    // The relaxation animation for --gif. A membrane records box (x, y) positions;
-    // a vesicle records a Lambert azimuthal equal-area map in the disc of radius 2.
-    if args.gif && !gif_frames.is_empty() {
+    if want_gif && !gif_frames.is_empty() {
         let bounds = match geometry {
             Geometry::Membrane => [0.0, 0.0, box_size[0], box_size[1]],
             Geometry::Vesicle => [-2.0, -2.0, 2.0, 2.0],
         };
         let opts = anim::GifOptions {
-            mode: match args.gif_mode {
+            mode: match common.gif_mode.unwrap_or(GifModeArg::Point) {
                 GifModeArg::Point => anim::GifMode::Point,
                 GifModeArg::Density => anim::GifMode::Density,
             },
-            scale: args.gif_scale,
-            fps: args.gif_fps,
+            scale: common.gif_scale.unwrap_or(1.0),
+            fps: common.gif_fps.unwrap_or(14),
         };
         let path = named("gif");
         anim::write_gif(&path, gif_frames, bounds, &opts)?;
         report::record(&path);
     }
 
-    if args.inp {
-        write_control_files(&args.out, base, geometry, box_size, args, rng)?;
+    if want_inp {
+        write_control_files(&common.out, base, geometry, box_size, controls, rng)?;
     }
-    if args.vmd {
-        write_vmd_scripts(&args.out, base, geometry, membrane, force_field, args)?;
+    if want_vmd {
+        write_vmd_scripts(
+            &common.out,
+            base,
+            geometry,
+            center,
+            membrane,
+            force_field,
+            common,
+            controls,
+        )?;
     }
     Ok(())
 }
 
 /// Write the GENESIS control files: minimize, then equilibrate and run
-/// production under the build mode's ensemble — NPT for a flat membrane (which
-/// relaxes the area), NVT for a vesicle (fixed volume). Production continues from
-/// the equilibration restart.
+/// production under the build mode's ensemble (NPT for a flat membrane, NVT for
+/// a vesicle).
 fn write_control_files(
     out: &Path,
     base: &str,
     geometry: Geometry,
     box_size: [f64; 3],
-    args: &Args,
+    controls: &ControlSpecs,
     rng: &mut StdRng,
 ) -> Result<(), Box<dyn Error>> {
-    let temperature = args.temperature;
-    let minimization = isolf::inp::Minimization {
-        box_size,
-        temperature,
-        num_steps: args.min.min_num_steps,
-        eneout_period: args.min.min_eneout_period,
-        crdout_period: args.min.min_crdout_period,
-        rstout_period: args.min.min_rstout_period,
-        nbupdate_period: args.min.min_nbupdate_period,
-    };
+    let min_params = controls.min.to_params(box_size, controls.temperature);
     write(
         &out.join("min.inp"),
-        &isolf::inp::minimization(base, &minimization)?,
+        &isolf::inp::minimization(base, &min_params)?,
     )?;
 
-    let production = args.pro.dynamics(temperature, rng);
+    let prod_seed = rng.random_range(1..=MAX_ISEED);
+    let equil_seed = rng.random_range(1..=MAX_ISEED);
+    let production = controls.prod.to_params(controls.temperature, prod_seed);
+    let equilibration = controls.equil.to_params(controls.temperature, equil_seed);
+
     if geometry.is_npt() {
-        let npt = args.npt.dynamics(temperature, rng);
         write(
             &out.join("npt.inp"),
-            &isolf::inp::npt(base, "min.rst", "npt", &npt)?,
+            &isolf::inp::npt(base, "min.rst", "npt", &equilibration)?,
         )?;
         write(
             &out.join("pro.inp"),
             &isolf::inp::npt(base, "npt.rst", "pro", &production)?,
         )?;
     } else {
-        let nvt = args.nvt.dynamics(temperature, rng);
         write(
             &out.join("nvt.inp"),
-            &isolf::inp::nvt(base, "min.rst", "nvt", &nvt)?,
+            &isolf::inp::nvt(base, "min.rst", "nvt", &equilibration)?,
         )?;
         write(
             &out.join("pro.inp"),
@@ -1382,30 +1713,34 @@ fn write_control_files(
     Ok(())
 }
 
-/// Write one VMD visualization script per simulation stage, each loading that
-/// stage's trajectory. The frame count is the stage's nsteps / coordinate-output
-/// period.
+/// Write VMD visualization scripts for the built structure (and per MD stage
+/// when `--inp` is enabled).
+#[allow(clippy::too_many_arguments)]
 fn write_vmd_scripts(
     out: &Path,
     base: &str,
     geometry: Geometry,
+    center: CenterArg,
     membrane: &Membrane,
     force_field: &ForceField,
-    args: &Args,
+    common: &CommonBuildArgs,
+    controls: &ControlSpecs,
 ) -> Result<(), Box<dyn Error>> {
+    let background = common.vmd_background.as_deref().unwrap_or("white");
+    let material = common.vmd_material.as_deref().unwrap_or("AOChalky");
     let options = VmdOptions {
-        surface: args.viz.vmd_surface,
-        cutaway: args.viz.vmd_cutaway,
-        render: args.viz.vmd_render,
-        background: &args.viz.vmd_background,
-        material: &args.viz.vmd_material,
-        smooth: args.viz.vmd_smooth,
-        lipid_coloring: match args.viz.vmd_color_by {
+        surface: common.vmd_surface,
+        cutaway: common.vmd_cutaway,
+        render: common.vmd_render,
+        background,
+        material,
+        smooth: common.vmd_smooth.unwrap_or(5),
+        lipid_coloring: match common.vmd_color_by.unwrap_or(LipidColorScope::Head) {
             LipidColorScope::Head => isolf::vmd::LipidColoring::Head,
             LipidColorScope::Bead => isolf::vmd::LipidColoring::Role,
             LipidColorScope::Whole => isolf::vmd::LipidColoring::Whole,
         },
-        recenter_to_box: matches!(args.center, CenterArg::Origin),
+        recenter_to_box: matches!(center, CenterArg::Origin),
     };
     let layout = geometry.layout();
     let script = |source| {
@@ -1419,24 +1754,21 @@ fn write_vmd_scripts(
         )
     };
 
-    // Always: a script for the initial built structure (`<base>.vmd`).
     write(
         &out.join(format!("{base}.vmd")),
         &script(VmdSource::Structure),
     )?;
 
-    // Only with --inp: one script per simulation stage's trajectory. The
-    // equilibration stage is NPT for a flat membrane, NVT otherwise.
-    if args.inp {
-        let (equil, equil_steps, equil_crdout) = if geometry.is_npt() {
-            ("npt", args.npt.npt_num_steps, args.npt.npt_crdout_period)
-        } else {
-            ("nvt", args.nvt.nvt_num_steps, args.nvt.nvt_crdout_period)
-        };
+    if common.want_inp() {
+        let equil_name = if geometry.is_npt() { "npt" } else { "nvt" };
         let stages = [
-            ("min", args.min.min_num_steps, args.min.min_crdout_period),
-            (equil, equil_steps, equil_crdout),
-            ("pro", args.pro.pro_num_steps, args.pro.pro_crdout_period),
+            ("min", controls.min.num_steps, controls.min.crdout_period),
+            (
+                equil_name,
+                controls.equil.num_steps,
+                controls.equil.crdout_period,
+            ),
+            ("pro", controls.prod.num_steps, controls.prod.crdout_period),
         ];
         for (name, num_steps, crdout_period) in stages {
             let frames = (crdout_period > 0).then(|| num_steps / crdout_period);
@@ -1461,19 +1793,142 @@ mod tests {
 
     #[test]
     fn balanced_counts_covers_the_leaflet_cases() {
-        // Symmetric (equal area per lipid, equal counts): unchanged, no note.
         let (u, l, note) = balanced_counts(0.64, 0.64, 200, 200, false);
         assert_eq!((u, l), (200, 200));
         assert!(note.is_none());
 
-        // Mismatch, no balance: keep counts, suggest the fix via --lipids-per-leaflet.
         let (u, l, note) = balanced_counts(0.64, 0.64, 200, 150, false);
         assert_eq!((u, l), (200, 150));
-        assert!(note.unwrap().contains("lo=200 in --lipids-per-leaflet"));
+        assert!(note.unwrap().contains("lo=200 in --count"));
 
-        // Mismatch, balance on: grow the lighter leaflet to match.
         let (u, l, note) = balanced_counts(0.64, 0.64, 200, 150, true);
         assert_eq!((u, l), (200, 200));
         assert!(note.unwrap().contains("balanced"));
+    }
+
+    #[test]
+    fn parses_geometry_specs() {
+        assert_eq!(parse_count_spec(&["256".into()]).unwrap(), Some((256, 256)));
+        assert_eq!(
+            parse_count_spec(&["up=300,lo=200".into()]).unwrap(),
+            Some((300, 200))
+        );
+        assert!(parse_count_spec(&["foo=10".into()]).is_err());
+
+        assert_eq!(parse_box_spec(&["15".into()]).unwrap(), Some((15.0, 15.0)));
+        assert_eq!(
+            parse_box_spec(&["x=10".into(), "y=20".into()]).unwrap(),
+            Some((10.0, 20.0))
+        );
+        assert!(parse_box_spec(&["z=10".into()]).is_err());
+
+        assert_eq!(
+            parse_radius_spec(&["20".into()]).unwrap(),
+            Some(VesicleRadius::Outer(20.0))
+        );
+        assert_eq!(
+            parse_radius_spec(&["ri=14,ro=20".into()]).unwrap(),
+            Some(VesicleRadius::Both {
+                inner: 14.0,
+                outer: 20.0
+            })
+        );
+        assert!(parse_radius_spec(&["r=20".into()]).is_err());
+    }
+
+    #[test]
+    fn parses_stage_override_specs() {
+        let m = parse_min_spec(&["2000".into(), "eneout=20,crdout=500".into()]).unwrap();
+        assert_eq!(m.num_steps, 2000);
+        assert_eq!(m.eneout_period, 20);
+        assert_eq!(m.crdout_period, 500);
+        assert_eq!(m.nbupdate_period, 10);
+        assert!(parse_min_spec(&["dt=0.01".into()]).is_err());
+
+        let d = parse_dyn_spec(
+            "--equil",
+            &["steps=50000,dt=0.015,temp=310,seed=7".into()],
+            DynSpec::default_equil(),
+        )
+        .unwrap();
+        assert_eq!(d.num_steps, 50_000);
+        assert_eq!(d.time_step, 0.015);
+        assert_eq!(d.temperature, Some(310.0));
+        assert_eq!(d.seed, Some(7));
+        assert!(parse_dyn_spec("--prod", &["bad=1".into()], DynSpec::default_prod()).is_err());
+    }
+
+    #[test]
+    fn suggests_close_lipid_names() {
+        let ff = ForceField::isolf();
+        let hits = suggest_lipids(&ff, "POPX");
+        assert!(hits.contains(&"POPC"));
+        assert!(hits.contains(&"POPS"));
+        assert!(suggest_lipids(&ff, "ZZZZZZ").is_empty());
+    }
+
+    #[test]
+    fn cli_subcommands_and_auto_enabled_flags() {
+        // Symmetric membrane with auto-enabled --inp, --vmd, --gif.
+        let cli = Cli::try_parse_from([
+            "isolf",
+            "membrane",
+            "-L",
+            "POPC=3,POPS=1",
+            "-n",
+            "256",
+            "--equil",
+            "steps=50000",
+            "--vmd-cutaway",
+            "--gif-mode",
+            "density",
+        ])
+        .unwrap();
+        let Command::Membrane(args) = cli.command else {
+            panic!("expected membrane subcommand");
+        };
+        assert!(args.common.want_inp());
+        assert!(args.common.want_vmd());
+        assert!(args.common.want_gif());
+
+        // --lipids conflicts with --upper.
+        assert!(
+            Cli::try_parse_from([
+                "isolf", "membrane", "-L", "POPC", "--upper", "DOPC", "-n", "64"
+            ])
+            .is_err()
+        );
+
+        // Membrane sized by --box (including combined --count + --box).
+        let cli = Cli::try_parse_from([
+            "isolf",
+            "membrane",
+            "-L",
+            "POPC",
+            "--box",
+            "x=20,y=10",
+            "--count",
+            "100",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Membrane(_)));
+
+        // Vesicle with asymmetric shells.
+        let cli = Cli::try_parse_from([
+            "isolf",
+            "vesicle",
+            "--outer",
+            "POPC",
+            "--inner",
+            "POPS",
+            "-r",
+            "ri=14,ro=20",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Vesicle(_)));
+
+        // Discovery subcommand.
+        let cli = Cli::try_parse_from(["isolf", "lipids"]).unwrap();
+        assert!(matches!(cli.command, Command::Lipids(_)));
     }
 }

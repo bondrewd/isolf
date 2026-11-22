@@ -1,13 +1,13 @@
 # iSoLF examples
 
-Common builds and the flags behind them. Every option and its default is in `isolf --help`; this page shows how to combine them. Each command writes its files into the folder you give with `--out`. Add `--top` for the topology, or `--inp` for a full GENESIS setup (which implies `--top`).
+Common builds and the flags behind them. Run `isolf membrane --help` or `isolf vesicle --help` for every option and default. Each command writes its files into `-o`/`--out`. Add `--top` for the topology, or `--inp` for a full GENESIS setup (which implies `--top`).
 
 - [Lipids and compositions](#lipids-and-compositions)
 - [Membranes](#membranes)
 - [Vesicles](#vesicles)
 - [Leaflet balancing](#leaflet-balancing)
 - [Centering and padding](#centering-and-padding)
-- [Temperature and seed](#temperature-and-seed)
+- [GENESIS control files and temperature](#genesis-control-files-and-temperature)
 - [Viewing in VMD](#viewing-in-vmd)
 - [Animating the relaxation](#animating-the-relaxation)
 - [Output files](#output-files)
@@ -17,100 +17,110 @@ Common builds and the flags behind them. Every option and its default is in `iso
 A composition lists lipids and how much of each, written `NAME=WEIGHT` and separated by commas. Weights are ratios: plain numbers, fractions, or percentages.
 
 ```text
-POPC=1                 only POPC
+POPC                   only POPC (bare name means weight 1)
 POPC=3,POPS=1          3 parts POPC to 1 part POPS  (75% / 25%)
 POPC=70%,POPS=30%      the same, as percentages
 DPPC=1/2,DOPC=1/2      half and half
 ```
 
-A bare name means weight 1, so `--upper POPC` is the same as `--upper POPC=1`. You can also repeat the flag instead of using commas: `--upper POPC=3 --upper POPS=1`.
+Repeat a composition flag instead of using commas if you prefer: `-L POPC=3 -L POPS=1`. Use `-L`/`--lipids` when both leaflets (or shells) share the same composition, `--upper`/`--lower` for asymmetric membranes, and `--outer`/`--inner` for asymmetric vesicles.
 
-A lipid name has 4 letters: the first 2 are the tails, the last 2 are the head group.
-
-| Tails | | Head group | |
-| --- | --- | --- | --- |
-| `DL` | lauroyl (12:0) | `PC` | phosphatidylcholine |
-| `DM` | myristoyl (14:0) | `PE` | phosphatidylethanolamine |
-| `DP` | palmitoyl (16:0) | `PG` | phosphatidylglycerol |
-| `DS` | stearoyl (18:0) | `PS` | phosphatidylserine |
-| `DO` | dioleoyl (18:1) | `PA` | phosphatidic acid |
-| `PO` | palmitoyl-oleoyl | | |
-| `SO` | stearoyl-oleoyl | | |
-
-So `POPC`, `DOPS`, `DPPE`, and the rest: 35 lipids in all. Common choices are POPC, DOPC, DPPC, POPE, and POPS.
+Run `isolf lipids` at any time to list all 35 supported lipids with their acyl chains, net charges, and bead counts.
 
 ## Membranes
 
-A flat bilayer. Give the lipids and how many per leaflet:
+A flat bilayer built with `isolf membrane`. Give the lipids and how many per leaflet with `-n`/`--count`:
 
 ```bash
-isolf --upper POPC=1 --lipids-per-leaflet 256 --out membrane
+isolf membrane --lipids POPC --count 256 -o membrane
 ```
 
-Add `--lower` for a different bottom leaflet. Cell membranes are usually asymmetric:
+Use `--upper` and `--lower` for an asymmetric membrane:
 
 ```bash
-isolf --upper POPC=1 --lower "POPC=3,POPS=1" --lipids-per-leaflet 256 --out asymmetric
+isolf membrane --upper POPC --lower "POPC=3,POPS=1" --count 256 -o asymmetric
 ```
 
-Set the two counts apart with `up=` and `lo=`:
+Set different counts per leaflet with `up=` and `lo=`:
 
 ```bash
-isolf --upper POPC=1 --lower "POPC=3,POPS=1" --lipids-per-leaflet "up=256,lo=200" --out uneven
+isolf membrane --upper POPC --lower "POPC=3,POPS=1" --count "up=256,lo=200" -o uneven
 ```
 
-Or give the box size in nm and let `isolf` fill it, as a square or a rectangle:
+Or size by in-plane box dimensions in nm with `-b`/`--box` (square or rectangular):
 
 ```bash
-isolf --upper POPC=1 --membrane 20 --out box_20nm
-isolf --upper POPC=1 --membrane "x=30,y=15" --out box_30x15
+isolf membrane --lipids POPC --box 20 -o box_20nm
+isolf membrane --lipids POPC --box "x=30,y=15" -o box_30x15
+```
+
+You can also combine `--count` and `--box` to pack an exact lipid count into a fixed box:
+
+```bash
+isolf membrane --lipids POPC --count 200 --box 20 -o sparse_20nm
 ```
 
 ## Vesicles
 
-A closed sphere. Give the composition and a radius in nm. `ro=` sets the outer radius, `ri=` the inner (lumen) radius, and you can give both. A bare `--vesicle 20` is the same as `--vesicle "ro=20"`.
+A closed spherical bilayer built with `isolf vesicle`. Give the composition and `-r`/`--radius` in nm. `ro=` sets the outer radius, `ri=` the inner (lumen) radius, and you can set both. A bare `-r 20` is the same as `-r "ro=20"`.
 
 ```bash
-isolf --upper POPC=1 --vesicle 20 --out vesicle           # outer radius 20 nm, inner found for you
-isolf --upper POPC=1 --vesicle "ri=15" --out vesicle_ri   # inner radius 15 nm, outer found for you
-isolf --upper POPC=1 --vesicle "ri=14,ro=20" --out shell  # both radii fixed
+isolf vesicle --lipids POPC --radius 20 -o vesicle               # outer radius 20 nm, inner derived
+isolf vesicle --lipids POPC --radius "ri=15" -o vesicle_ri       # inner radius 15 nm, outer derived
+isolf vesicle --lipids POPC --radius "ri=14,ro=20" -o shell      # both radii fixed
 ```
 
-`--upper` is the outer shell and `--lower` the inner (lumen-facing) shell. If you fix both radii and the gap is thinner than the bilayer, `isolf` stops and prints the minimum width it needs.
+Use `--outer` and `--inner` for asymmetric shells:
+
+```bash
+isolf vesicle --outer POPC --inner "POPC=3,POPS=1" --radius 20 -o asym_vesicle
+```
+
+If you fix both radii and the gap is thinner than the bilayer, `isolf` stops and prints the minimum width it needs.
 
 ## Leaflet balancing
 
-When you set both leaflet counts and the two leaflets cover different areas, the lighter leaflet is grown to match the denser one, so the shared box holds both. This is on by default. Turn it off with `--no-balance` to keep the counts exactly as given.
+In count mode (`--count` without `--box`), if the two leaflets cover different areas, the lighter leaflet is grown to match the denser one so the shared box holds both at matched lateral density. Turn this off with `--no-balance` to keep the exact counts given:
 
 ```bash
-isolf --upper DOPC=1 --lower DPPC=1 --lipids-per-leaflet "up=256,lo=256" --no-balance --out raw_counts
+isolf membrane --upper DOPC --lower DPPC --count "up=256,lo=256" --no-balance -o raw_counts
 ```
 
 ## Centering and padding
 
-By default the finished system sits on the coordinate origin `(0, 0, 0)` (`--center origin`); the VMD scripts shift it back into the periodic box for display, so the rendered view is unaffected. Pass `--center box` to center it in the box `[0, box]` instead. Either way only the coordinates move, the box is unchanged, and the two modes differ by exactly half the box.
+By default the finished system sits on the coordinate origin `(0, 0, 0)` (`--center origin`); VMD scripts shift it back into the periodic box for display, so the rendered view is unaffected. Pass `--center box` to centre it in `[0, box]` instead.
 
-`--padding` sets the empty space in nm added along z for a membrane, or on every side for a vesicle (10 nm by default).
-
-```bash
-isolf --upper POPC=1 --lipids-per-leaflet 256 --center box --padding 15 --out padded
-```
-
-## Temperature and seed
-
-`--temperature <K>` sets the thermostat temperature written into the GENESIS control files (323.15 K by default). The geometry is independent of it: lipids start at a fixed clash-free spacing that an NPT run compresses to the real density.
-
-Placement is random, then relaxed to an even, clash-free layout. The build is reproducible: pass `--seed` and the same command gives byte-identical coordinates. Without `--seed`, `isolf` picks a random one and records it in the log, so you can reproduce any run from there.
+`--padding` sets the empty space in nm added on each side (along z for a membrane, on every side for a vesicle; 10 nm by default):
 
 ```bash
-isolf --upper POPC=1 --lipids-per-leaflet 256 --temperature 310 --seed 1 --out body_temp
+isolf membrane --lipids POPC --count 256 --center box --padding 15 -o padded
 ```
 
-A per-stage flag overrides `--temperature` for one control file: `--nvt-temperature`, `--npt-temperature`, `--pro-temperature`. The step counts and output periods for each stage are in `isolf --help`.
+## GENESIS control files and temperature
+
+`--inp` writes the three-stage GENESIS control files (`min.inp`, `npt.inp` or `nvt.inp`, `pro.inp`) and implies `--top`.
+
+`-t`/`--temperature <K>` sets the thermostat temperature in the control files (323.15 K by default). The starting geometry itself is temperature-independent.
+
+Override per-stage parameters with `--min`, `--equil`, and `--prod` (each accepts a bare step count or comma-separated `KEY=VALUE` pairs, and implies `--inp`):
+
+```bash
+isolf membrane --lipids "POPC=4,POPS=1" --count 256 \
+      --temperature 310 --equil "steps=50000,dt=0.01" --prod "steps=1000000,crdout=1000" \
+      --seed 1 -o body_temp
+```
+
+| Stage flag | Keys and defaults |
+| --- | --- |
+| `--min` | `steps=1000`, `eneout=10`, `crdout=1000`, `rstout=1000`, `nbupdate=10` |
+| `--equil` | `steps=20000`, `dt=0.01`, `temp=--temperature`, `eneout=100`, `crdout=100`, `rstout=1000`, `stoptr=10`, `nbupdate=10`, `seed=random` |
+| `--prod` | `steps=500000`, `dt=0.02`, `temp=--temperature`, `eneout=500`, `crdout=500`, `rstout=1000`, `stoptr=10`, `nbupdate=10`, `seed=random` |
+
+Placement is random, then relaxed deterministically: pass `--seed` and the same command reproduces byte-identical coordinates. Without `--seed`, `isolf` picks a random one and records it in `<name>.log`.
 
 ## Viewing in VMD
 
-`--vmd` writes a `.vmd` script and the `.psf` it loads. Open it with `vmd -e membrane.vmd`. A few flags change the look:
+`--vmd` writes a `.vmd` script and the `.psf` it loads (passing any `--vmd-*` flag enables `--vmd` automatically). Open it with `vmd -e membrane.vmd`.
 
 | Option | Default | Effect |
 | --- | --- | --- |
@@ -123,62 +133,49 @@ A per-stage flag overrides `--temperature` for one control file: `--nvt-temperat
 | `--vmd-smooth` | `5` | trajectory smoothing window, in frames |
 
 ```bash
-isolf --upper "POPC=3,POPS=1" --lipids-per-leaflet 400 \
-      --vmd --vmd-cutaway --vmd-color-by whole --out viewable
+isolf membrane --lipids "POPC=3,POPS=1" --count 400 \
+      --vmd-cutaway --vmd-color-by whole -o viewable
 ```
 
-With `--inp`, `--vmd` also writes one script per simulation step (`min.vmd`, `npt.vmd` or `nvt.vmd`, `pro.vmd`) for the trajectories.
+With `--inp`, `--vmd` also writes one script per simulation stage (`min.vmd`, `npt.vmd` or `nvt.vmd`, `pro.vmd`) for the trajectories.
 
 ## Animating the relaxation
 
-`--gif` writes a `.gif` of the build: the Lloyd relaxation spreading the random start to an even layout, then the soft-sphere de-clash settling it. The upper leaflet (the outer shell of a vesicle) is the left panel, the lower leaflet (the inner shell) the right.
-
-```bash
-isolf --upper POPC=1 --lipids-per-leaflet 256 --gif --out membrane
-```
-
-Three flags change it:
+`--gif` writes a `.gif` of the build: Lloyd relaxation spreading the random start, then soft-sphere de-clash settling it (passing any `--gif-*` flag enables `--gif` automatically).
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `--gif-mode` | `point` | `point` draws one dot per lipid; `density` draws a heatmap of the local density |
-| `--gif-scale` | `1` | resolution multiplier, so `2` doubles each panel and `0.5` halves it |
+| `--gif-mode` | `point` | `point` draws one dot per lipid; `density` draws a local-density heatmap |
+| `--gif-scale` | `1` | resolution multiplier (`2` doubles each panel, `0.5` halves it) |
 | `--gif-fps` | `14` | playback speed in frames per second |
 
-`point` reads clearly up to a few thousand lipids per leaflet. Past that the dots overlap into a filled disc, so use `density`: it colours each pixel by how many lipids sit near it and stays legible at any count. The heatmap fills every pixel, so its file is several times larger than the point scatter, and `--gif-scale 0.5` brings it back down.
-
 ```bash
-isolf --upper POPC=1 --vesicle 30 --gif --gif-mode density --out vesicle
+isolf membrane --lipids POPC --count 256 --gif -o membrane
+isolf vesicle  --lipids POPC --radius 30 --gif-mode density -o vesicle
 ```
-
-A vesicle is shown as a disc: each shell is flattened with an equal-area projection, so an even spread of lipids on the sphere stays even on the disc.
 
 ## Output files
 
-Files go in the `--out` folder. The base name is the build mode (`membrane` or `vesicle`); change it with `--name`.
+Files go in `-o`/`--out`. The base name defaults to the subcommand (`membrane` or `vesicle`); change it with `--name`.
 
 | File | When | What it is |
 | --- | --- | --- |
-| `<name>.gro` | always | the structure (coordinates) |
-| `<name>.log` | always | a run log for reproducibility (see below) |
-| `<name>.top` | with `--top` or `--inp` | the topology |
-| `isolf.itp` | with `--top` or `--inp` | the iSoLF lipid force field |
-| `<name>.pdb` | with `--pdb` | coordinates in PDB format |
-| `<name>.psf` | with `--psf` (or `--vmd`) | a CHARMM structure file |
-| `<name>.crd`, `<name>.cif` | with `--crd`, `--cif` | other coordinate formats |
-| `min.inp`, `npt.inp`/`nvt.inp`, `pro.inp` | with `--inp` | GENESIS control files |
-| `<name>.vmd` | with `--vmd` | a VMD script for the built structure |
-| `<name>.gif` | with `--gif` | an animation of the leaflet relaxation, Lloyd then de-clash |
-| `min.vmd`, … | with `--vmd --inp` | a VMD script per simulation step |
-
-`--inp` writes the control files for a 3-step run (minimization, equilibration, production) and implies `--top`, since a run reads the topology. A membrane equilibrates under NPT (`npt.inp`); a vesicle under NVT (`nvt.inp`).
-
-`<name>.log` is written on every run. It records the exact command with the seed pinned in, plus the time, host, user, working directory, and what was built. To reproduce a build, copy the `command` line from the log and run it again.
+| `<name>.gro` | always | coordinates in GROMACS format |
+| `<name>.log` | always | reproducible run log |
+| `<name>.top` | `--top` or `--inp` | system topology |
+| `isolf.itp` | `--top` or `--inp` | iSoLF lipid force field |
+| `<name>.pdb` | `--pdb` | coordinates in PDB format |
+| `<name>.psf` | `--psf` or `--vmd` | CHARMM structure file |
+| `<name>.crd`, `<name>.cif` | `--crd`, `--cif` | CHARMM / mmCIF coordinate formats |
+| `min.inp`, `npt.inp`/`nvt.inp`, `pro.inp` | `--inp` | GENESIS control files |
+| `<name>.vmd` | `--vmd` | VMD script for the built structure |
+| `min.vmd`, … | `--vmd --inp` | VMD script per simulation stage |
+| `<name>.gif` | `--gif` | relaxation animation |
 
 A mixed membrane at body temperature, with a fixed seed and all the extra files:
 
 ```bash
-isolf --upper "POPC=4,POPS=1" --lipids-per-leaflet 256 \
+isolf membrane --lipids "POPC=4,POPS=1" --count 256 \
       --temperature 310 --seed 1 \
-      --pdb --inp --vmd --out my_system
+      --pdb --inp --vmd -o my_system
 ```

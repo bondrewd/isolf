@@ -17,7 +17,7 @@ You give `isolf` a lipid recipe, and it writes the coordinates. With `--top` or 
 
 ## 🗺️ Map
 
-[Install](#-install) · [Quick start](#-quick-start) · [Build modes](#-build-modes) · [Examples](EXAMPLES.md) · [Output](#-output) · [Run in GENESIS](#-run-in-genesis) · [License](#-license)
+[Install](#-install) · [Quick start](#-quick-start) · [Commands](#-commands) · [Examples](EXAMPLES.md) · [Output](#-output) · [Run in GENESIS](#-run-in-genesis) · [License](#-license)
 
 ## 📦 Install
 
@@ -57,36 +57,35 @@ You can also download a prebuilt binary from the [Releases page](https://github.
 ## 🚀 Quick start
 
 ```bash
-isolf --upper POPC=1 --lipids-per-leaflet 256 --top --out my_first_membrane
+isolf membrane --lipids POPC --count 256 --top -o my_first_membrane
 ```
 
 This writes `my_first_membrane/` with the structure (`membrane.gro`), the topology (`membrane.top`), and the lipid force field (`isolf.itp`). Add `--inp` for a full GENESIS setup, or `--vmd` for a viewer script.
 
-## 🧱 Build modes
+## 🧱 Commands
 
-The flags you pass choose one of 2 modes:
-
-| Mode | Example |
+| Command | Example |
 | --- | --- |
-| **Membrane** | `isolf --upper POPC=1 --lipids-per-leaflet 256 --out m` |
-| **Vesicle** | `isolf --upper POPC=1 --vesicle 20 --out v` |
+| **`membrane`** | `isolf membrane -L "POPC=3,POPS=1" -n 256 -o m` |
+| **`vesicle`** | `isolf vesicle -L POPC -r 20 -o v` |
+| **`lipids`** | `isolf lipids` (lists all 35 supported lipids) |
 
-Lipids are `NAME=WEIGHT` recipes like `"POPC=3,POPS=1"` (repeat `--upper`/`--lower` or comma-separate to combine). A name has 4 letters, `<tails><head>`, and there are 35 in all. Set a different bottom leaflet with `--lower`. Size a membrane by lipid count or `--membrane` (e.g. `x=10,y=20`); size a vesicle by `--vesicle` (`ro=20`, `ri=15`, or both).
+Lipids are `NAME=WEIGHT` recipes like `"POPC=3,POPS=1"` (repeat or comma-separate to combine). Use `-L`/`--lipids` for symmetric bilayers/vesicles, `--upper`/`--lower` for asymmetric membranes, and `--outer`/`--inner` for asymmetric vesicles. Size a membrane by lipid count (`-n`/`--count`), box size (`-b`/`--box`, e.g. `x=10,y=20`), or both; size a vesicle by `-r`/`--radius` (`20`, `ro=20`, `ri=15`, or `ri=14,ro=20`).
 
-While it runs, `isolf` prints each phase and a closing summary: the composition, the box, the particle count, the time, and the command to run next. Use `-q` for the summary alone, `-v` for every file path, `--ascii` for plain glyphs.
+While it runs, `isolf` prints each phase and a closing summary: the composition, the box, the particle count, the time, and the command to run next. Use `-q` for the summary alone, `-v` for full file paths, `--ascii` for plain glyphs.
 
-> 🧪 More recipes are in **[EXAMPLES.md](EXAMPLES.md)**: asymmetric leaflets, rectangular and box-sized membranes, vesicles, and the output formats.
+> 🧪 More recipes are in **[EXAMPLES.md](EXAMPLES.md)**: asymmetric leaflets, rectangular and box-sized membranes, vesicles, MD stage overrides, and output formats.
 
 ## 📦 Output
 
-Everything lands in the `--out` folder. The `.gro` structure and a `.log` run log are always written. The rest are opt-in:
+Everything lands in the `-o`/`--out` folder. The `.gro` structure and a `.log` run log are always written. The rest are opt-in:
 
 | Flag | Adds |
 | --- | --- |
 | `--top` | the topology (`.top`) and the force-field include (`isolf.itp`) |
-| `--inp` | GENESIS control files for a 3-step run (implies `--top`) |
-| `--vmd` | a VMD script (and the `.psf` it loads) to view the structure |
-| `--gif` | a GIF animating the leaflet relaxation |
+| `--inp` | GENESIS control files for a 3-step run (implies `--top`; also enabled by `--min`/`--equil`/`--prod`) |
+| `--vmd` | a VMD script and `.psf` (also enabled by any `--vmd-*` flag) |
+| `--gif` | a GIF animating the leaflet relaxation (also enabled by any `--gif-*` flag) |
 | `--pdb` `--psf` `--crd` `--cif` | extra coordinate and structure formats |
 
 The full file table and the reproducible run log are in [EXAMPLES.md → Output files](EXAMPLES.md#output-files).
@@ -101,7 +100,7 @@ atdyn npt.inp     # 2. equilibration  (nvt.inp for a vesicle)
 atdyn pro.inp     # 3. production
 ```
 
-Every option, grouped by topic with its default, is in `isolf --help`.
+Run `isolf membrane --help` or `isolf vesicle --help` to see every option and its default.
 
 ## 🙏 Acknowledgements
 

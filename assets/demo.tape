@@ -19,7 +19,7 @@ Hide
 Type "clear" Enter
 Show
 
-Type "isolf --upper 'DOPC=3,DPPC=1' --lower 'DOPC=1,DPPC=1' --membrane 18 --inp --vmd --out demo"
+Type "isolf membrane --upper 'DOPC=3,DPPC=1' --lower 'DOPC=1,DPPC=1' --box 18 --inp --vmd -o demo"
 Sleep 700ms
 Enter
 Sleep 4s

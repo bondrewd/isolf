@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn render_has_the_essentials() {
         let run = Run {
-            command: "isolf --upper POPC=1 --membrane 40 --seed 7 --out m",
+            command: "isolf membrane -L POPC -b 40 --seed 7 -o m",
             seed: 7,
             duration_secs: 2.4,
             identity: "membrane",
