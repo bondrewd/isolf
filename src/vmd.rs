@@ -13,6 +13,7 @@ use std::fmt::Write;
 
 use crate::force_field::{ForceField, Interaction};
 use crate::membrane::Particle;
+use crate::protein::params::aa_rmin;
 
 /// nm → ångström, with the factor of a half that turns a σ into a bead radius.
 const SIGMA_TO_RADIUS: f64 = 5.0;
@@ -26,6 +27,8 @@ pub enum Layout {
     Vesicle,
     /// Cylindrical tubule (periodic along z): a perspective side view.
     Tubule,
+    /// Standalone protein: a perspective view centred on the protein.
+    Protein,
 }
 
 /// How lipid beads are coloured in the VMD script (the `--vmd-color-by` scope).
@@ -157,14 +160,29 @@ pub fn vmd_script(
     present.sort_unstable();
     present.dedup();
 
-    // Present beads grouped into the roles that have at least one bead.
+    let has_protein = present.contains(&"CA");
+    let mut protein_resnames: Vec<&str> = if has_protein {
+        let mut names: Vec<&str> = particles
+            .iter()
+            .filter(|p| p.bead == "CA")
+            .map(|p| p.residue.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    } else {
+        Vec::new()
+    };
+    let _ = &mut protein_resnames;
+
+    // Present lipid beads grouped into the roles that have at least one bead.
     let groups: Vec<(Role, Vec<&str>)> = Role::ORDER
         .into_iter()
         .filter_map(|role| {
             let beads: Vec<&str> = present
                 .iter()
                 .copied()
-                .filter(|&name| role_of(name, force_field) == role)
+                .filter(|&name| name != "CA" && role_of(name, force_field) == role)
                 .collect();
             (!beads.is_empty()).then_some((role, beads))
         })
@@ -175,6 +193,7 @@ pub fn vmd_script(
         Layout::Membrane => "membrane",
         Layout::Vesicle => "vesicle",
         Layout::Tubule => "tubule",
+        Layout::Protein => "protein",
     };
     let _ = writeln!(s, "# isolf visualization — {label} ({shape})");
     let _ = writeln!(s, "mol new ./{base}.psf type psf waitfor all");
@@ -202,18 +221,33 @@ pub fn vmd_script(
         let _ = writeln!(s, "}}\n$isolf_sel delete\n");
     }
 
-    // Physical bead radii from σ (the .psf carries no radii for CG bead names).
-    let _ = writeln!(s, "# Physical bead radii from the iSoLF sigma (angstrom).");
-    for &name in &present {
-        let radius = if let Some(bead) = force_field.bead_type(name) {
-            bead.interaction.sigma() * SIGMA_TO_RADIUS
-        } else {
-            continue;
-        };
+    // Physical bead radii from σ / AICG2+ rmin (the .psf carries no radii for CG beads).
+    if !groups.is_empty() {
+        let _ = writeln!(s, "# Physical bead radii from the iSoLF sigma (angstrom).");
+        for &name in &present {
+            let radius = if let Some(bead) = force_field.bead_type(name) {
+                bead.interaction.sigma() * SIGMA_TO_RADIUS
+            } else {
+                continue;
+            };
+            let _ = writeln!(
+                s,
+                "set sel [atomselect top \"name {name}\"]; $sel set radius {radius:.2}; $sel delete"
+            );
+        }
+    }
+    if has_protein {
         let _ = writeln!(
             s,
-            "set sel [atomselect top \"name {name}\"]; $sel set radius {radius:.2}; $sel delete"
+            "# Physical protein CA bead radii from AICG2+ rmin (angstrom)."
         );
+        for &res in &protein_resnames {
+            let radius = aa_rmin(res) * SIGMA_TO_RADIUS;
+            let _ = writeln!(
+                s,
+                "set sel [atomselect top \"name CA and resname {res}\"]; $sel set radius {radius:.2}; $sel delete"
+            );
+        }
     }
 
     // Representation style: spheres by default, a smooth surface with --vmd-surface.
@@ -224,11 +258,29 @@ pub fn vmd_script(
     };
     let _ = writeln!(s, "\nset repstyle {{{repstyle}}}");
 
-    // One representation per present bead role.
-    let _ = writeln!(
-        s,
-        "\n# One representation per bead role present in the system."
-    );
+    let mut total_reps = 0usize;
+    if has_protein {
+        let prot_style = if options.surface {
+            "QuickSurf 1.0 0.5 1.0 1.0"
+        } else {
+            "Tube 1.8 12.0"
+        };
+        let _ = writeln!(s, "\n# protein (AICG2+ CA trace)");
+        let _ = writeln!(s, "mol representation {prot_style}");
+        let _ = writeln!(s, "mol color SegName");
+        let _ = writeln!(s, "mol selection {{name CA}}");
+        let _ = writeln!(s, "mol material {}", options.material);
+        let _ = writeln!(s, "mol addrep top");
+        total_reps += 1;
+    }
+
+    // One representation per present lipid bead role.
+    if !groups.is_empty() {
+        let _ = writeln!(
+            s,
+            "\n# One representation per bead role present in the system."
+        );
+    }
     for (role, beads) in &groups {
         let selection = beads
             .iter()
@@ -252,6 +304,7 @@ pub fn vmd_script(
         let _ = writeln!(s, "mol selection {{{selection}}}");
         let _ = writeln!(s, "mol material {}", options.material);
         let _ = writeln!(s, "mol addrep top");
+        total_reps += 1;
     }
 
     // Periodic box (drawn for every source). A trajectory is also wrapped over
@@ -290,7 +343,7 @@ pub fn vmd_script(
     // Camera.
     let projection = match layout {
         Layout::Membrane => "orthographic",
-        Layout::Vesicle | Layout::Tubule => "perspective",
+        Layout::Vesicle | Layout::Tubule | Layout::Protein => "perspective",
     };
     let _ = writeln!(s, "\n# Camera.");
     if matches!(layout, Layout::Membrane | Layout::Tubule) {
@@ -311,7 +364,7 @@ pub fn vmd_script(
     // Smooth every representation's trajectory (only meaningful with frames).
     if is_trajectory {
         let _ = writeln!(s, "\n# Smooth the trajectory.");
-        for rep in 0..groups.len() {
+        for rep in 0..total_reps {
             let _ = writeln!(s, "mol smoothrep 0 {rep} {}", options.smooth);
         }
     }

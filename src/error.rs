@@ -57,6 +57,18 @@ pub enum BuildError {
 
     /// A tubule length was not positive and finite.
     InvalidLength(f64),
+
+    /// A protein structure file (PDB/mmCIF) could not be read or parsed.
+    StructureParse(String),
+
+    /// A structure contained no coarse-grainable protein residues.
+    EmptyProtein,
+
+    /// A residue selection or charge table could not be parsed.
+    InvalidSelection(String),
+
+    /// A protein placement parameter was invalid or incompatible with the system.
+    InvalidPlacement(String),
 }
 
 impl fmt::Display for BuildError {
@@ -106,6 +118,10 @@ impl fmt::Display for BuildError {
                 "outer radius {outer:.2} nm is smaller than the bilayer thickness {thickness:.2} nm"
             ),
             Self::InvalidLength(len) => write!(f, "tubule length {len} nm must be positive"),
+            Self::StructureParse(msg) => write!(f, "structure parse error: {msg}"),
+            Self::EmptyProtein => f.write_str("structure contains no protein residues"),
+            Self::InvalidSelection(msg) => write!(f, "invalid selection: {msg}"),
+            Self::InvalidPlacement(msg) => write!(f, "invalid protein placement: {msg}"),
         }
     }
 }

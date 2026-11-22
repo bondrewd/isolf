@@ -1,12 +1,13 @@
 # iSoLF examples
 
-Common builds and the flags behind them. Run `isolf membrane --help`, `isolf vesicle --help`, or `isolf tubule --help` for every option and default. Each command writes its files into `-o`/`--out`. Add `--top` for the topology, or `--inp` for a full GENESIS setup (which implies `--top`).
+Common builds and the flags behind them. Run `isolf membrane --help`, `isolf vesicle --help`, `isolf tubule --help`, or `isolf protein --help` for every option and default. Each command writes its files into `-o`/`--out`. Add `--top` for the topology, or `--inp` for a full GENESIS setup (which implies `--top`).
 
 - [Lipids and compositions](#lipids-and-compositions)
 - [Membranes](#membranes)
 - [Vesicles](#vesicles)
 - [Tubules](#tubules)
 - [Phase-separated domains](#phase-separated-domains)
+- [Proteins (standalone and embedded)](#proteins-standalone-and-embedded)
 - [Leaflet balancing](#leaflet-balancing)
 - [Centering and padding](#centering-and-padding)
 - [GENESIS control files and temperature](#genesis-control-files-and-temperature)
@@ -115,6 +116,44 @@ isolf tubule  -L "DPPC=1,POPC=3" -r 10 -l 25 --phase raft --anti-register --gif 
 
 `--anti-register` offsets the domains on the opposite leaflet/shell (half-period shift for stripes/rings, opposite corner/pole/side for rafts).
 
+## Proteins (standalone and embedded)
+
+### Standalone protein coarse-graining (`isolf protein`)
+
+Convert any all-atom `.pdb` or `.cif`/`.mmcif` protein into a GENESIS RESIDCG AICG2+ (default) or Clementi Gō model. Writes `<name>.gro`, `<name>.itp`, `aicg2p.itp`, `<name>.top`, and `<name>.log` automatically:
+
+```bash
+# Default AICG2+ model with GENESIS NVT control files and VMD script
+isolf protein 1aki.pdb --inp --vmd -o lysozyme_cg
+
+# Intrinsically disordered N-terminal tail (1-25) + RESPAC charges
+isolf protein protein.cif --idr-local "1-25" --idr-nonlocal "1-18" --charges respac.dat -o idr_cg
+
+# Clementi Gō Cα model
+isolf protein protein.pdb --model clementi --center origin -o go_cg
+```
+
+### Embedding proteins into membranes, vesicles, and tubules (`-p`/`--protein`)
+
+Pass repeatable `-p`/`--protein PATH[,KEY=VAL,...]` on `membrane`, `vesicle`, or `tubule`. By default, input orientation and `z` position are preserved (matching OPM-aligned membrane proteins whose bilayer midplane sits at `z = 0`). Overlapping lipids are carved, remaining lipids relax smoothly around the protein via pinned-site Voronoi CVT and obstacle-aware de-clash, and `--top` / `--inp` emits the combined topology (`aicg2p.itp`, `isolf.itp`, `<prot>.itp`, and `<name>.top`):
+
+```bash
+# OPM-oriented channel centered laterally in a 20 x 20 nm bilayer
+isolf membrane -L "POPC=3,POPS=1" -b 20 -p channel_opm.pdb --inp --vmd -o channel_mem
+
+# Non-OPM protein centered at the midplane, tilted 15 deg, with 0.2 nm clearance
+isolf membrane -L POPC -n 400 -p helix.pdb,z=center,tilt=15,clearance=0.2 --top --vmd -o tilted
+
+# Two different proteins placed side by side
+isolf membrane -L POPC -b "x=24,y=14" -p a.pdb,x=-5 -p b.pdb,x=5,rot=90 --top -o dimer_mem
+
+# Multiple copies distributed evenly over a vesicle (Fibonacci sphere) or tubule (helical)
+isolf vesicle -L POPC -r 18 -p channel_opm.pdb,copies=6 --inp --vmd -o prot_vesicle
+isolf tubule  -L POPC -r 10 -l 30 -p channel_opm.pdb,copies=4 --inp --vmd -o prot_tubule
+```
+
+Supported `-p` keys: `z=<nm|center|keep>`, `x=<nm>`, `y=<nm>`, `tilt=<deg>`, `rot=<deg>`, `copies=<N>`, `clearance=<nm>` (default `0.15`), `model=<aicg2+|clementi>`, `scale=<general|average>`, `safe-dihedral=<0|1|3>`, `idr=<ranges>`, `idr-local=<ranges>`, `idr-nonlocal=<ranges>` (separate multiple ranges with `+` or `;`), `charges=<file>`, `name=<molname>`.
+
 ## Leaflet balancing
 
 In count mode (`--count` without `--box`), if the two leaflets cover different areas, the lighter leaflet is grown to match the denser one so the shared box holds both at matched lateral density. Turn this off with `--no-balance` to keep the exact counts given:
@@ -199,8 +238,9 @@ Files go in `-o`/`--out`. The base name defaults to the subcommand (`membrane`, 
 | --- | --- | --- |
 | `<name>.gro` | always | coordinates in GROMACS format |
 | `<name>.log` | always | reproducible run log |
-| `<name>.top` | `--top` or `--inp` | system topology |
-| `isolf.itp` | `--top` or `--inp` | iSoLF lipid force field |
+| `<name>.top` | `--top` or `--inp` (always on `protein`) | system topology |
+| `isolf.itp` | `--top` or `--inp` (lipid systems) | iSoLF lipid force field |
+| `aicg2p.itp`, `<prot>.itp` | `--top`/`--inp` with `-p`, or `protein` | AICG2+ force field and per-protein topology |
 | `<name>.pdb` | `--pdb` | coordinates in PDB format |
 | `<name>.psf` | `--psf` or `--vmd` | CHARMM structure file |
 | `<name>.crd`, `<name>.cif` | `--crd`, `--cif` | CHARMM / mmCIF coordinate formats |

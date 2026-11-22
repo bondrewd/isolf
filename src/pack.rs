@@ -134,6 +134,67 @@ fn wrap_cell(g: u32, d: isize, n: usize) -> usize {
 
 // ============================ Planar ============================
 
+/// A fixed spherical obstacle (e.g. a coarse-grained protein bead plus
+/// clearance margin) that lipids must flow around during CVT and de-clash.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Obstacle {
+    /// Cartesian position (nm) in the same coordinate frame as `positions`.
+    pub pos: [f64; 3],
+    /// Effective excluded radius (nm).
+    pub radius: f64,
+}
+
+/// Minimum spacing (nm) between projected pinned CVT obstacle sites so dense
+/// protein cores form a clean boundary without redundant duplicates.
+const PINNED_SITE_SPACING: f64 = 0.35;
+
+/// Deduplicate 2D periodic pinned sites closer than `min_dist` (nm).
+fn dedup_plane_sites(candidates: Vec<[f64; 2]>, box_xy: [f64; 2], min_dist: f64) -> Vec<[f64; 2]> {
+    let min_d2 = min_dist * min_dist;
+    let half_x = 0.5 * box_xy[0];
+    let half_y = 0.5 * box_xy[1];
+    let mut kept: Vec<[f64; 2]> = Vec::new();
+    for p in candidates {
+        let too_close = kept.iter().any(|q| {
+            let mut dx = p[0] - q[0];
+            if dx > half_x {
+                dx -= box_xy[0];
+            } else if dx < -half_x {
+                dx += box_xy[0];
+            }
+            let mut dy = p[1] - q[1];
+            if dy > half_y {
+                dy -= box_xy[1];
+            } else if dy < -half_y {
+                dy += box_xy[1];
+            }
+            dx * dx + dy * dy < min_d2
+        });
+        if !too_close {
+            kept.push(p);
+        }
+    }
+    kept
+}
+
+/// Deduplicate unit sphere directions closer than `min_chord` in 3D chord distance.
+fn dedup_sphere_dirs(candidates: Vec<[f64; 3]>, min_chord: f64) -> Vec<[f64; 3]> {
+    let min_d2 = min_chord * min_chord;
+    let mut kept: Vec<[f64; 3]> = Vec::new();
+    for d in candidates {
+        let too_close = kept.iter().any(|q| {
+            let dx = d[0] - q[0];
+            let dy = d[1] - q[1];
+            let dz = d[2] - q[2];
+            dx * dx + dy * dy + dz * dz < min_d2
+        });
+        if !too_close {
+            kept.push(d);
+        }
+    }
+    kept
+}
+
 /// An observer called with the current bead positions after each relaxation step
 /// (each Lloyd round, then each de-clash iteration), so the binary can record
 /// frames for the `--gif` animation. `None`, the usual case, adds no work.
@@ -152,6 +213,31 @@ pub fn equalize_plane(
     box_xy: [f64; 2],
     iterations: usize,
     tolerance: f64,
+    observer: Option<StepObserver>,
+) -> f64 {
+    equalize_plane_with_obstacles(
+        positions,
+        radii,
+        leaflets,
+        &[],
+        box_xy,
+        iterations,
+        tolerance,
+        observer,
+    )
+}
+
+/// Like [`equalize_plane`], but treats `obstacles` as fixed spheres that clip
+/// nearby lipids' Voronoi cells and repel overlapping lipid beads during de-clash.
+#[allow(clippy::too_many_arguments)]
+pub fn equalize_plane_with_obstacles(
+    positions: &mut [[f64; 3]],
+    radii: &[f64],
+    leaflets: &[&[Range<usize>]],
+    obstacles: &[Obstacle],
+    box_xy: [f64; 2],
+    iterations: usize,
+    tolerance: f64,
     mut observer: Option<StepObserver>,
 ) -> f64 {
     let all: Vec<Range<usize>> = leaflets.iter().flat_map(|l| l.iter().cloned()).collect();
@@ -162,20 +248,46 @@ pub fn equalize_plane(
     let converged = CVT_CONVERGED_FRACTION * (box_xy[0] * box_xy[1] / total as f64).sqrt();
     let mut cvt = PlaneCvtWorkspace::new();
 
-    // Run CVT directly on per-lipid 2D sites rather than reading and shifting
-    // every bead on every round; apply the net displacement once at the end
-    // (or per round when an observer records frames for `--gif`).
+    let max_lipid_r = radii.iter().copied().fold(0.0_f64, f64::max);
+    // Run CVT directly on per-lipid 2D sites, appending deduplicated pinned
+    // obstacle sites that overlap each leaflet's z-slab.
     let init_sites: Vec<Vec<[f64; 2]>> = leaflets
         .iter()
         .map(|l| extract_plane_sites(positions, l, box_xy))
         .collect();
-    let mut cur_sites = init_sites.clone();
+    let mut cur_sites: Vec<(usize, Vec<[f64; 2]>)> = leaflets
+        .iter()
+        .zip(&init_sites)
+        .map(|(l, sites)| {
+            let n_mov = sites.len();
+            let mut combined = sites.clone();
+            if !obstacles.is_empty() && !l.is_empty() {
+                let (mut z_lo, mut z_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+                for range in *l {
+                    for k in range.clone() {
+                        z_lo = z_lo.min(positions[k][2]);
+                        z_hi = z_hi.max(positions[k][2]);
+                    }
+                }
+                let raw: Vec<[f64; 2]> = obstacles
+                    .iter()
+                    .filter(|o| {
+                        let reach = o.radius + max_lipid_r;
+                        o.pos[2] + reach >= z_lo && o.pos[2] - reach <= z_hi
+                    })
+                    .map(|o| [wrap(o.pos[0], box_xy[0]), wrap(o.pos[1], box_xy[1])])
+                    .collect();
+                combined.extend(dedup_plane_sites(raw, box_xy, PINNED_SITE_SPACING));
+            }
+            (n_mov, combined)
+        })
+        .collect();
     let record_each = observer.is_some();
 
     for _ in 0..CVT_ROUNDS {
         let mut moved = 0.0_f64;
-        for (leaflet, sites) in leaflets.iter().zip(&mut cur_sites) {
-            moved = moved.max(cvt.step_sites(sites, box_xy));
+        for (leaflet, (n_mov, sites)) in leaflets.iter().zip(&mut cur_sites) {
+            moved = moved.max(cvt.step_sites_pinned(sites, *n_mov, box_xy));
             if record_each {
                 for (range, &[dx, dy]) in leaflet.iter().zip(cvt.last_displacements()) {
                     for k in range.clone() {
@@ -193,7 +305,7 @@ pub fn equalize_plane(
         }
     }
     if !record_each {
-        for (leaflet, (init, cur)) in leaflets.iter().zip(init_sites.iter().zip(&cur_sites)) {
+        for (leaflet, (init, (_, cur))) in leaflets.iter().zip(init_sites.iter().zip(&cur_sites)) {
             for (range, (&s0, &s1)) in leaflet.iter().zip(init.iter().zip(cur)) {
                 let dx = s1[0] - s0[0];
                 let dy = s1[1] - s0[1];
@@ -205,28 +317,36 @@ pub fn equalize_plane(
         }
     }
     relax(
-        positions, radii, &all, box_xy, iterations, tolerance, observer,
+        positions, radii, &all, obstacles, box_xy, iterations, tolerance, observer,
     )
 }
 
-/// De-clash `lipids` laterally so no bead overlaps another lipid's bead, in a
-/// periodic box `box_xy` (nm). Each lipid translates rigidly in x/y; z is fixed.
-/// Stops when the largest overlap drops below `tolerance` (nm) or after
-/// `iterations`. Returns the largest remaining overlap.
+/// De-clash `lipids` laterally so no bead overlaps another lipid's bead or any
+/// fixed `obstacles`, in a periodic box `box_xy` (nm). Each lipid translates
+/// rigidly in x/y; z is fixed. Stops when the largest overlap drops below
+/// `tolerance` (nm) or after `iterations`. Returns the largest remaining overlap.
+#[allow(clippy::too_many_arguments)]
 fn relax(
     positions: &mut [[f64; 3]],
     radii: &[f64],
     lipids: &[Range<usize>],
+    obstacles: &[Obstacle],
     box_xy: [f64; 2],
     iterations: usize,
     tolerance: f64,
     mut observer: Option<StepObserver>,
 ) -> f64 {
-    let max_radius = radii.iter().copied().fold(0.0_f64, f64::max);
+    let max_radius = radii
+        .iter()
+        .copied()
+        .chain(obstacles.iter().map(|o| o.radius))
+        .fold(0.0_f64, f64::max);
     if max_radius <= 0.0 || lipids.is_empty() {
         return 0.0;
     }
     let n_beads = positions.len();
+    let n_obs = obstacles.len();
+    let n_total = n_beads + n_obs;
     let owner = bead_owners(n_beads, lipids);
 
     // Cells at least one bead diameter wide, so any overlapping pair is in adjacent
@@ -253,12 +373,24 @@ fn relax(
     };
     let max_step = MAX_STEP_FRACTION * max_radius;
 
+    // Pre-wrap fixed obstacles once.
+    let obs_wrapped: Vec<([f64; 3], u32, u32, f64)> = obstacles
+        .iter()
+        .map(|o| {
+            let wx = wrap(o.pos[0], bx);
+            let wy = wrap(o.pos[1], by);
+            let gx = ((wx * inv_wx) as usize).min(nx - 1) as u32;
+            let gy = ((wy * inv_wy) as usize).min(ny - 1) as u32;
+            ([wx, wy, o.pos[2]], gx, gy, o.radius)
+        })
+        .collect();
+
     // Reusable CSR cell-list buffers across iterations (zero hot-loop allocs).
     let mut wrapped = vec![[0.0_f64; 3]; n_beads];
     let mut bead_cell = vec![(0u32, 0u32); n_beads];
     let mut counts = vec![0u32; ncells];
     let mut offsets = vec![0u32; ncells + 1];
-    let mut sorted = vec![PackBead::default(); n_beads];
+    let mut sorted = vec![PackBead::default(); n_total];
     let mut force = vec![[0.0_f64; 2]; lipids.len()];
 
     let mut max_overlap = 0.0_f64;
@@ -274,6 +406,9 @@ fn relax(
             bead_cell[i] = (gx as u32, gy as u32);
             counts[gy * nx + gx] += 1;
         }
+        for &(_, gx, gy, _) in &obs_wrapped {
+            counts[gy as usize * nx + gx as usize] += 1;
+        }
         prefix_sum(&mut counts, &mut offsets);
         for i in 0..n_beads {
             let (gx, gy) = bead_cell[i];
@@ -284,6 +419,16 @@ fn relax(
                 pos: wrapped[i],
                 r: radii[i],
                 lipid: owner[i],
+            };
+        }
+        for &(pos, gx, gy, r) in &obs_wrapped {
+            let c = gy as usize * nx + gx as usize;
+            let slot = counts[c] as usize;
+            counts[c] += 1;
+            sorted[slot] = PackBead {
+                pos,
+                r,
+                lipid: u32::MAX,
             };
         }
 
@@ -396,6 +541,31 @@ pub fn equalize_on_sphere(
     center: [f64; 3],
     iterations: usize,
     tolerance: f64,
+    observer: Option<StepObserver>,
+) -> f64 {
+    equalize_on_sphere_with_obstacles(
+        positions,
+        radii,
+        shells,
+        &[],
+        center,
+        iterations,
+        tolerance,
+        observer,
+    )
+}
+
+/// Like [`equalize_on_sphere`], but treats `obstacles` as fixed spheres that
+/// clip nearby spherical Voronoi cells and repel overlapping lipid beads.
+#[allow(clippy::too_many_arguments)]
+pub fn equalize_on_sphere_with_obstacles(
+    positions: &mut [[f64; 3]],
+    radii: &[f64],
+    shells: &[(&[Range<usize>], f64)],
+    obstacles: &[Obstacle],
+    center: [f64; 3],
+    iterations: usize,
+    tolerance: f64,
     mut observer: Option<StepObserver>,
 ) -> f64 {
     let all: Vec<Range<usize>> = shells.iter().flat_map(|(s, _)| s.iter().cloned()).collect();
@@ -411,27 +581,67 @@ pub fn equalize_on_sphere(
         .fold(f64::MAX, f64::min);
     let mut cvt = SphereCvtWorkspace::new();
 
-    // Run spherical CVT directly on per-lipid unit directions rather than
-    // averaging and Rodrigues-rotating every bead on every round; apply one
-    // net rotation per lipid at the end (or per round when recording `--gif`).
+    let max_lipid_r = radii.iter().copied().fold(0.0_f64, f64::max);
     let init_dirs: Vec<Vec<[f64; 3]>> = shells
         .iter()
         .map(|(s, _)| extract_sphere_dirs(positions, s, center))
         .collect();
-    let mut cur_dirs = init_dirs.clone();
+    let mut cur_dirs: Vec<(usize, Vec<[f64; 3]>)> = shells
+        .iter()
+        .zip(&init_dirs)
+        .map(|((shell, radius), dirs)| {
+            let n_mov = dirs.len();
+            let mut combined = dirs.clone();
+            if !obstacles.is_empty() && !shell.is_empty() && *radius > 0.0 {
+                let (mut r_lo, mut r_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+                for range in *shell {
+                    for k in range.clone() {
+                        let d = [
+                            positions[k][0] - center[0],
+                            positions[k][1] - center[1],
+                            positions[k][2] - center[2],
+                        ];
+                        let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                        r_lo = r_lo.min(r);
+                        r_hi = r_hi.max(r);
+                    }
+                }
+                let raw: Vec<[f64; 3]> = obstacles
+                    .iter()
+                    .filter_map(|o| {
+                        let d = [
+                            o.pos[0] - center[0],
+                            o.pos[1] - center[1],
+                            o.pos[2] - center[2],
+                        ];
+                        let r = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                        let reach = o.radius + max_lipid_r;
+                        (r > 1e-6 && r + reach >= r_lo && r - reach <= r_hi).then_some([
+                            d[0] / r,
+                            d[1] / r,
+                            d[2] / r,
+                        ])
+                    })
+                    .collect();
+                let min_chord = (PINNED_SITE_SPACING / *radius).min(0.5);
+                combined.extend(dedup_sphere_dirs(raw, min_chord));
+            }
+            (n_mov, combined)
+        })
+        .collect();
     let record_each = observer.is_some();
 
     for _ in 0..CVT_ROUNDS {
         let mut moved = 0.0_f64;
-        for ((shell, radius), dirs) in shells.iter().zip(&mut cur_dirs) {
+        for ((shell, radius), (n_mov, dirs)) in shells.iter().zip(&mut cur_dirs) {
             if record_each {
-                let prev = dirs.clone();
-                moved = moved.max(cvt.step_dirs(dirs, *radius));
+                let prev = dirs[..*n_mov].to_vec();
+                moved = moved.max(cvt.step_dirs_pinned(dirs, *n_mov, *radius));
                 for (range, (&from, &to)) in shell.iter().zip(prev.iter().zip(dirs.iter())) {
                     rotate_lipid_from_to(positions, range.clone(), center, from, to);
                 }
             } else {
-                moved = moved.max(cvt.step_dirs(dirs, *radius));
+                moved = moved.max(cvt.step_dirs_pinned(dirs, *n_mov, *radius));
             }
         }
         if let Some(observe) = observer.as_deref_mut() {
@@ -442,46 +652,64 @@ pub fn equalize_on_sphere(
         }
     }
     if !record_each {
-        for ((shell, _), (init, cur)) in shells.iter().zip(init_dirs.iter().zip(&cur_dirs)) {
+        for ((shell, _), (init, (_, cur))) in shells.iter().zip(init_dirs.iter().zip(&cur_dirs)) {
             for (range, (&from, &to)) in shell.iter().zip(init.iter().zip(cur)) {
                 rotate_lipid_from_to(positions, range.clone(), center, from, to);
             }
         }
     }
     relax_on_sphere(
-        positions, radii, &all, center, iterations, tolerance, observer,
+        positions, radii, &all, obstacles, center, iterations, tolerance, observer,
     )
 }
 
-/// De-clash `lipids` over their shells so no bead overlaps another lipid's bead.
-/// Each lipid slides rigidly over its shell about `center` (its bead radii from the
-/// centre are preserved). Stops when the largest overlap drops below `tolerance`
-/// (nm) or after `iterations`. Returns the largest remaining overlap.
+/// De-clash `lipids` over their shells so no bead overlaps another lipid's bead
+/// or any fixed `obstacles`. Each lipid slides rigidly over its shell about
+/// `center` (its bead radii from the centre are preserved).
+#[allow(clippy::too_many_arguments)]
 fn relax_on_sphere(
     positions: &mut [[f64; 3]],
     radii: &[f64],
     lipids: &[Range<usize>],
+    obstacles: &[Obstacle],
     center: [f64; 3],
     iterations: usize,
     tolerance: f64,
     mut observer: Option<StepObserver>,
 ) -> f64 {
-    let max_radius = radii.iter().copied().fold(0.0_f64, f64::max);
+    let max_radius = radii
+        .iter()
+        .copied()
+        .chain(obstacles.iter().map(|o| o.radius))
+        .fold(0.0_f64, f64::max);
     if max_radius <= 0.0 || lipids.is_empty() {
         return 0.0;
     }
     let n_beads = positions.len();
+    let n_total = n_beads + obstacles.len();
     let owner = bead_owners(n_beads, lipids);
     let cell = 2.0 * max_radius;
     let inv_cell = 1.0 / cell;
     let max_step = MAX_STEP_FRACTION * max_radius;
 
-    // A flat CSR 3D cell list over the padded bounding box of the lipids.
+    // A flat CSR 3D cell list over the padded bounding box of the lipids + obstacles.
     let pad = 2.0 * cell;
     let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
     for p in positions.iter() {
         lo = [lo[0].min(p[0]), lo[1].min(p[1]), lo[2].min(p[2])];
         hi = [hi[0].max(p[0]), hi[1].max(p[1]), hi[2].max(p[2])];
+    }
+    for o in obstacles {
+        lo = [
+            lo[0].min(o.pos[0]),
+            lo[1].min(o.pos[1]),
+            lo[2].min(o.pos[2]),
+        ];
+        hi = [
+            hi[0].max(o.pos[0]),
+            hi[1].max(o.pos[1]),
+            hi[2].max(o.pos[2]),
+        ];
     }
     lo = [lo[0] - pad, lo[1] - pad, lo[2] - pad];
     hi = [hi[0] + pad, hi[1] + pad, hi[2] + pad];
@@ -489,10 +717,20 @@ fn relax_on_sphere(
     let (nx, ny, nz) = (dim(0), dim(1), dim(2));
     let ncells = nx * ny * nz;
 
+    let obs_cells: Vec<([f64; 3], [u16; 3], f64)> = obstacles
+        .iter()
+        .map(|o| {
+            let ix = (((o.pos[0] - lo[0]) * inv_cell) as isize).clamp(0, nx as isize - 1) as u16;
+            let iy = (((o.pos[1] - lo[1]) * inv_cell) as isize).clamp(0, ny as isize - 1) as u16;
+            let iz = (((o.pos[2] - lo[2]) * inv_cell) as isize).clamp(0, nz as isize - 1) as u16;
+            (o.pos, [ix, iy, iz], o.radius)
+        })
+        .collect();
+
     let mut bead_cell = vec![[0u16; 3]; n_beads];
     let mut counts = vec![0u32; ncells];
     let mut offsets = vec![0u32; ncells + 1];
-    let mut sorted = vec![PackBead::default(); n_beads];
+    let mut sorted = vec![PackBead::default(); n_total];
     let mut force = vec![[0.0_f64; 3]; lipids.len()];
 
     let mut max_overlap = 0.0_f64;
@@ -506,6 +744,9 @@ fn relax_on_sphere(
             bead_cell[i] = [ix as u16, iy as u16, iz as u16];
             counts[(iz * ny + iy) * nx + ix] += 1;
         }
+        for &(_, [ix, iy, iz], _) in &obs_cells {
+            counts[(iz as usize * ny + iy as usize) * nx + ix as usize] += 1;
+        }
         prefix_sum(&mut counts, &mut offsets);
         for i in 0..n_beads {
             let [ix, iy, iz] = bead_cell[i];
@@ -516,6 +757,16 @@ fn relax_on_sphere(
                 pos: positions[i],
                 r: radii[i],
                 lipid: owner[i],
+            };
+        }
+        for &(pos, [ix, iy, iz], r) in &obs_cells {
+            let c = (iz as usize * ny + iy as usize) * nx + ix as usize;
+            let slot = counts[c] as usize;
+            counts[c] += 1;
+            sorted[slot] = PackBead {
+                pos,
+                r,
+                lipid: u32::MAX,
             };
         }
 
@@ -714,6 +965,31 @@ pub fn equalize_on_cylinder(
     length: f64,
     iterations: usize,
     tolerance: f64,
+    observer: Option<StepObserver>,
+) -> f64 {
+    equalize_on_cylinder_with_obstacles(
+        positions,
+        radii,
+        shells,
+        &[],
+        length,
+        iterations,
+        tolerance,
+        observer,
+    )
+}
+
+/// Like [`equalize_on_cylinder`], but treats `obstacles` as fixed spheres that
+/// clip nearby cylindrical Voronoi cells and repel overlapping lipid beads.
+#[allow(clippy::too_many_arguments)]
+pub fn equalize_on_cylinder_with_obstacles(
+    positions: &mut [[f64; 3]],
+    radii: &[f64],
+    shells: &[(&[Range<usize>], f64)],
+    obstacles: &[Obstacle],
+    length: f64,
+    iterations: usize,
+    tolerance: f64,
     mut observer: Option<StepObserver>,
 ) -> f64 {
     let all: Vec<Range<usize>> = shells.iter().flat_map(|(s, _)| s.iter().cloned()).collect();
@@ -727,21 +1003,55 @@ pub fn equalize_on_cylinder(
         .fold(f64::MAX, f64::min);
     let mut cvt = PlaneCvtWorkspace::new();
 
+    let max_lipid_r = radii.iter().copied().fold(0.0_f64, f64::max);
     let init_sites: Vec<Vec<[f64; 2]>> = shells
         .iter()
         .map(|(s, r)| extract_cylinder_sites(positions, s, *r, length))
         .collect();
-    let mut cur_sites = init_sites.clone();
+    let mut cur_sites: Vec<(usize, Vec<[f64; 2]>)> = shells
+        .iter()
+        .zip(&init_sites)
+        .map(|((shell, radius), sites)| {
+            let n_mov = sites.len();
+            let mut combined = sites.clone();
+            if !obstacles.is_empty() && !shell.is_empty() && *radius > 0.0 {
+                let (mut r_lo, mut r_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+                for range in *shell {
+                    for k in range.clone() {
+                        let r = positions[k][0].hypot(positions[k][1]);
+                        r_lo = r_lo.min(r);
+                        r_hi = r_hi.max(r);
+                    }
+                }
+                let circ = TAU * *radius;
+                let raw: Vec<[f64; 2]> = obstacles
+                    .iter()
+                    .filter_map(|o| {
+                        let r = o.pos[0].hypot(o.pos[1]);
+                        let reach = o.radius + max_lipid_r;
+                        if r > 1e-6 && r + reach >= r_lo && r - reach <= r_hi {
+                            let theta = o.pos[1].atan2(o.pos[0]).rem_euclid(TAU);
+                            Some([wrap(theta * *radius, circ), wrap(o.pos[2], length)])
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                combined.extend(dedup_plane_sites(raw, [circ, length], PINNED_SITE_SPACING));
+            }
+            (n_mov, combined)
+        })
+        .collect();
     let record_each = observer.is_some();
 
     for _ in 0..CVT_ROUNDS {
         let mut moved = 0.0_f64;
-        for ((shell, radius), sites) in shells.iter().zip(&mut cur_sites) {
+        for ((shell, radius), (n_mov, sites)) in shells.iter().zip(&mut cur_sites) {
             if shell.is_empty() || *radius <= 0.0 {
                 continue;
             }
             let box_sz = [TAU * *radius, length];
-            moved = moved.max(cvt.step_sites(sites, box_sz));
+            moved = moved.max(cvt.step_sites_pinned(sites, *n_mov, box_sz));
             if record_each {
                 let inv_r = 1.0 / *radius;
                 for (range, &[ds, dz]) in shell.iter().zip(cvt.last_displacements()) {
@@ -757,7 +1067,9 @@ pub fn equalize_on_cylinder(
         }
     }
     if !record_each {
-        for ((shell, radius), (init, cur)) in shells.iter().zip(init_sites.iter().zip(&cur_sites)) {
+        for ((shell, radius), (init, (_, cur))) in
+            shells.iter().zip(init_sites.iter().zip(&cur_sites))
+        {
             if shell.is_empty() || *radius <= 0.0 {
                 continue;
             }
@@ -770,27 +1082,34 @@ pub fn equalize_on_cylinder(
         }
     }
     relax_on_cylinder(
-        positions, radii, &all, length, iterations, tolerance, observer,
+        positions, radii, &all, obstacles, length, iterations, tolerance, observer,
     )
 }
 
 /// De-clash `lipids` on concentric cylindrical shells about the `z`-axis,
 /// periodic in `z ∈ [0, length)`. Each lipid slides rigidly in `(θ, z)` while
 /// preserving every bead's exact radial distance from the axis.
+#[allow(clippy::too_many_arguments)]
 fn relax_on_cylinder(
     positions: &mut [[f64; 3]],
     radii: &[f64],
     lipids: &[Range<usize>],
+    obstacles: &[Obstacle],
     length: f64,
     iterations: usize,
     tolerance: f64,
     mut observer: Option<StepObserver>,
 ) -> f64 {
-    let max_radius = radii.iter().copied().fold(0.0_f64, f64::max);
+    let max_radius = radii
+        .iter()
+        .copied()
+        .chain(obstacles.iter().map(|o| o.radius))
+        .fold(0.0_f64, f64::max);
     if max_radius <= 0.0 || lipids.is_empty() || length <= 0.0 {
         return 0.0;
     }
     let n_beads = positions.len();
+    let n_total = n_beads + obstacles.len();
     let owner = bead_owners(n_beads, lipids);
     let cell = 2.0 * max_radius;
     let inv_cell = 1.0 / cell;
@@ -801,6 +1120,7 @@ fn relax_on_cylinder(
     let max_r = positions
         .iter()
         .map(|p| p[0].hypot(p[1]))
+        .chain(obstacles.iter().map(|o| o.pos[0].hypot(o.pos[1])))
         .fold(0.0_f64, f64::max);
     let pad = 2.0 * cell;
     let lo_xy = -(max_r + pad);
@@ -816,11 +1136,22 @@ fn relax_on_cylinder(
     };
     let ncells = nxy * nxy * nz;
 
+    let obs_cells: Vec<([f64; 3], [u32; 3], f64)> = obstacles
+        .iter()
+        .map(|o| {
+            let wz = wrap(o.pos[2], length);
+            let ix = (((o.pos[0] - lo_xy) * inv_cell) as isize).clamp(0, nxy as isize - 1) as u32;
+            let iy = (((o.pos[1] - lo_xy) * inv_cell) as isize).clamp(0, nxy as isize - 1) as u32;
+            let iz = ((wz * inv_wz) as usize).min(nz - 1) as u32;
+            ([o.pos[0], o.pos[1], wz], [ix, iy, iz], o.radius)
+        })
+        .collect();
+
     let mut wrapped = vec![[0.0_f64; 3]; n_beads];
     let mut bead_cell = vec![[0u32; 3]; n_beads];
     let mut counts = vec![0u32; ncells];
     let mut offsets = vec![0u32; ncells + 1];
-    let mut sorted = vec![PackBead::default(); n_beads];
+    let mut sorted = vec![PackBead::default(); n_total];
     let mut force = vec![[0.0_f64; 3]; lipids.len()];
 
     let mut max_overlap = 0.0_f64;
@@ -836,6 +1167,9 @@ fn relax_on_cylinder(
             bead_cell[i] = [ix as u32, iy as u32, iz as u32];
             counts[(iz * nxy + iy) * nxy + ix] += 1;
         }
+        for &(_, [ix, iy, iz], _) in &obs_cells {
+            counts[(iz as usize * nxy + iy as usize) * nxy + ix as usize] += 1;
+        }
         prefix_sum(&mut counts, &mut offsets);
         for i in 0..n_beads {
             let [ix, iy, iz] = bead_cell[i];
@@ -846,6 +1180,16 @@ fn relax_on_cylinder(
                 pos: wrapped[i],
                 r: radii[i],
                 lipid: owner[i],
+            };
+        }
+        for &(pos, [ix, iy, iz], r) in &obs_cells {
+            let c = (iz as usize * nxy + iy as usize) * nxy + ix as usize;
+            let slot = counts[c] as usize;
+            counts[c] += 1;
+            sorted[slot] = PackBead {
+                pos,
+                r,
+                lipid: u32::MAX,
             };
         }
 
@@ -964,10 +1308,68 @@ mod tests {
         let mut pos = [[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]];
         let radii = [0.5, 0.5];
         let lipids = [0..1, 1..2];
-        let max = relax(&mut pos, &radii, &lipids, [20.0, 20.0], 500, 1e-3, None);
+        let max = relax(
+            &mut pos,
+            &radii,
+            &lipids,
+            &[],
+            [20.0, 20.0],
+            500,
+            1e-3,
+            None,
+        );
         let d = ((pos[0][0] - pos[1][0]).powi(2) + (pos[0][1] - pos[1][1]).powi(2)).sqrt();
         assert!(max < 1e-3, "residual overlap {max}");
         assert!(d >= 1.0 - 1e-2, "beads still overlap: d = {d}");
+    }
+
+    #[test]
+    fn equalize_plane_with_obstacles_keeps_lipids_outside_obstacle() {
+        let box_xy = [16.0, 16.0];
+        let obs = Obstacle {
+            pos: [8.0, 8.0, 0.0],
+            radius: 2.0,
+        };
+        let mut positions = Vec::new();
+        let mut lipids = Vec::new();
+        for i in 0..10 {
+            for j in 0..10 {
+                let x = 0.8 + i as f64 * 1.5;
+                let y = 0.8 + j as f64 * 1.5;
+                if (x - 8.0).hypot(y - 8.0) < 2.6 {
+                    continue;
+                }
+                let k = positions.len();
+                positions.push([x, y, 0.0]);
+                lipids.push(k..k + 1);
+            }
+        }
+        let radii = vec![0.4; positions.len()];
+        let leaflet: Vec<_> = lipids.clone();
+        let overlap = equalize_plane_with_obstacles(
+            &mut positions,
+            &radii,
+            &[&leaflet],
+            &[obs],
+            box_xy,
+            1000,
+            0.01,
+            None,
+        );
+        assert!(overlap < 0.05, "residual obstacle overlap {overlap}");
+        for p in &positions {
+            let dx = (p[0].rem_euclid(16.0) - 8.0)
+                .abs()
+                .min(16.0 - (p[0].rem_euclid(16.0) - 8.0).abs());
+            let dy = (p[1].rem_euclid(16.0) - 8.0)
+                .abs()
+                .min(16.0 - (p[1].rem_euclid(16.0) - 8.0).abs());
+            assert!(
+                dx.hypot(dy) >= 2.35,
+                "lipid penetrated obstacle: d = {}",
+                dx.hypot(dy)
+            );
+        }
     }
 
     #[test]

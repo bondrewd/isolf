@@ -2,7 +2,7 @@
 
 <img src="assets/banner.svg" alt="iSoLF" width="660">
 
-**Coarse-grained starting structures for [GENESIS](https://mdgenesis.org/) molecular dynamics: lipid membranes, vesicles, and tubules.**
+**Coarse-grained starting structures for [GENESIS](https://mdgenesis.org/) molecular dynamics: iSoLF membranes, vesicles, and tubules, plus AICG2+ proteins.**
 
 [![release](https://img.shields.io/github/v/release/bondrewd/isolf?sort=semver&color=2dd4bf&label=release)](https://github.com/bondrewd/isolf/releases)
 [![ci](https://img.shields.io/github/actions/workflow/status/bondrewd/isolf/ci.yml?branch=main&color=3b82f6&label=ci)](https://github.com/bondrewd/isolf/actions)
@@ -11,7 +11,7 @@
 
 </div>
 
-You give `isolf` a lipid recipe, and it writes the coordinates. With `--top` or `--inp` it also writes the topology and force-field files GENESIS reads. Lipids use the iSoLF implicit-solvent model, so there's no water to add. It's a single binary, with nothing else to install.
+You give `isolf` a lipid recipe (and optionally PDB/mmCIF proteins), and it writes the coarse-grained coordinates and topologies GENESIS RESIDCG reads. Lipids use the iSoLF implicit-solvent model and proteins use AICG2+ (or Clementi Gō), so there's no water to add. It's a single binary, with nothing else to install.
 
 <p align="center"><img src="assets/demo.gif" alt="iSoLF building a membrane" width="760"></p>
 
@@ -69,21 +69,22 @@ This writes `my_first_membrane/` with the structure (`membrane.gro`), the topolo
 | **`membrane`** | `isolf membrane -L "POPC=3,POPS=1" -n 256 -o m` |
 | **`vesicle`** | `isolf vesicle -L POPC -r 20 -o v` |
 | **`tubule`** | `isolf tubule -L POPC -r 10 -l 25 -o t` |
+| **`protein`** | `isolf protein 1aki.pdb --inp --vmd -o p` |
 | **`lipids`** | `isolf lipids` (lists all 35 supported lipids) |
 
-Lipids are `NAME=WEIGHT` recipes like `"POPC=3,POPS=1"` (repeat or comma-separate to combine). Use `-L`/`--lipids` for symmetric systems, `--upper`/`--lower` for asymmetric membranes, and `--outer`/`--inner` for asymmetric vesicles and tubules. Add `--phase stripe` or `--phase raft` (with `;`-separated multi-lipid domains and optional `--anti-register`) to build phase-separated domains on any geometry. Size a membrane by lipid count (`-n`/`--count`), box size (`-b`/`--box`, e.g. `x=10,y=20`), or both; size a vesicle by `-r`/`--radius` (`20`, `ro=20`, `ri=15`, or `ri=14,ro=20`); size a tubule by `-r`/`--radius` and periodic `-l`/`--length`.
+Lipids are `NAME=WEIGHT` recipes like `"POPC=3,POPS=1"` (repeat or comma-separate to combine). Use `-L`/`--lipids` for symmetric systems, `--upper`/`--lower` for asymmetric membranes, and `--outer`/`--inner` for asymmetric vesicles and tubules. Add `--phase stripe` or `--phase raft` (with `;`-separated multi-lipid domains and optional `--anti-register`) to build phase-separated domains on any geometry. Embed one or more all-atom PDB/mmCIF proteins into any lipid geometry with repeatable `-p`/`--protein PATH[,z=center,copies=2,...]` (preserving OPM orientation by default, carving overlapping lipids and relaxing around the protein with pinned-site Voronoi CVT). Or coarse-grain a standalone protein with `isolf protein <PDB/CIF>` using AICG2+ (or `--model clementi`) with optional IDR selections and RESPAC charge tables.
 
 While it runs, `isolf` prints each phase and a closing summary: the composition, the box, the particle count, the time, and the command to run next. Use `-q` for the summary alone, `-v` for full file paths, `--ascii` for plain glyphs.
 
-> 🧪 More recipes are in **[EXAMPLES.md](EXAMPLES.md)**: asymmetric leaflets, rectangular membranes, vesicles, tubules, phase-separated domains, MD stage overrides, and output formats.
+> 🧪 More recipes are in **[EXAMPLES.md](EXAMPLES.md)**: asymmetric leaflets, rectangular membranes, vesicles, tubules, phase-separated domains, standalone & embedded proteins, MD stage overrides, and output formats.
 
 ## 📦 Output
 
-Everything lands in the `-o`/`--out` folder. The `.gro` structure and a `.log` run log are always written. The rest are opt-in:
+Everything lands in the `-o`/`--out` folder. The `.gro` structure and a `.log` run log are always written (`isolf protein` also writes `.itp`, `aicg2p.itp`, and `.top` by default). The rest are opt-in:
 
 | Flag | Adds |
 | --- | --- |
-| `--top` | the topology (`.top`) and the force-field include (`isolf.itp`) |
+| `--top` | the topology (`.top`) and force-field includes (`isolf.itp`, plus `aicg2p.itp` and `<prot>.itp` when proteins are embedded) |
 | `--inp` | GENESIS control files for a 3-step run (implies `--top`; also enabled by `--min`/`--equil`/`--prod`) |
 | `--vmd` | a VMD script and `.psf` (also enabled by any `--vmd-*` flag) |
 | `--gif` | a GIF animating the leaflet relaxation (also enabled by any `--gif-*` flag) |
@@ -97,11 +98,11 @@ Run the control files in order. Each one continues from the previous step's rest
 
 ```bash
 atdyn min.inp     # 1. minimization
-atdyn npt.inp     # 2. equilibration  (nvt.inp for a vesicle or tubule)
+atdyn npt.inp     # 2. equilibration  (nvt.inp for a vesicle, tubule, or protein)
 atdyn pro.inp     # 3. production
 ```
 
-Run `isolf membrane --help`, `isolf vesicle --help`, or `isolf tubule --help` to see every option and its default.
+Run `isolf membrane --help`, `isolf vesicle --help`, `isolf tubule --help`, or `isolf protein --help` to see every option and its default.
 
 ## 🙏 Acknowledgements
 

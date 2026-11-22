@@ -1,5 +1,6 @@
 //! Build coarse-grained starting structures for GENESIS molecular dynamics:
-//! iSoLF (Implicit Solvent Lipid Force Field) lipid membranes and vesicles.
+//! iSoLF (Implicit Solvent Lipid Force Field) membranes, vesicles, and tubules,
+//! plus AICG2+ / Clementi Gō coarse-grained proteins (standalone or embedded).
 //!
 //! Where to start, by area:
 //!
@@ -7,9 +8,13 @@
 //!   it to a GENESIS/GROMACS `.itp`. [`membrane`] lays out a flat bilayer from
 //!   per-leaflet [`composition`]s, [`vesicle`] wraps one into a sphere, and
 //!   [`tubule`] wraps one into a periodic cylinder.
+//! - **Proteins.** [`protein`] reads all-atom PDB/mmCIF files and builds
+//!   AICG2+ or Clementi Gō coarse-grained topologies; [`embed`] embeds one or
+//!   more proteins into membranes, vesicles, or tubules with lipid carving and
+//!   obstacle-aware relaxation.
 //! - **Packing.** [`pack`] is a Lloyd density-equalization / de-clash relaxation
 //!   engine for lipid coordinates (lateral for a bilayer, over a shell for a
-//!   vesicle or tubule).
+//!   vesicle or tubule), with pinned-site obstacle support.
 //! - **Output.** Coordinates and topology in `.gro` ([`gro`]), `.top` ([`top`]),
 //!   `.pdb` ([`pdb`]), `.psf` ([`psf`]), `.crd` ([`crd`]), and `.cif` ([`cif`]);
 //!   GENESIS run-control files ([`inp`]); VMD visualization scripts ([`vmd`]).
@@ -40,6 +45,7 @@
 pub mod cif;
 pub mod composition;
 pub mod crd;
+pub mod embed;
 pub mod error;
 pub mod force_field;
 pub mod gro;
@@ -48,6 +54,7 @@ pub mod itp;
 pub mod membrane;
 pub mod pack;
 pub mod pdb;
+pub mod protein;
 pub mod psf;
 pub mod top;
 pub mod tubule;

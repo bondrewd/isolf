@@ -280,7 +280,7 @@ pub fn header() {
                 4 => format!("   {}", paint("coarse-grained", "2", s.color)),
                 5 => format!(
                     "   {}",
-                    paint("membranes · vesicles · tubules", "2", s.color)
+                    paint("membranes · vesicles · tubules · proteins", "2", s.color)
                 ),
                 _ => String::new(),
             };
@@ -404,6 +404,8 @@ pub type Leaflet = (&'static str, Vec<(String, usize)>);
 pub struct Summary<'a> {
     pub identity: &'a str,
     pub box_nm: [f64; 3],
+    /// Embedded or standalone protein species and molecule counts.
+    pub proteins: &'a [(String, usize)],
     /// Lipid species and molecule counts (the composition panel).
     pub lipids: &'a [(String, usize)],
     /// Optional per-leaflet breakdown (the two leaflets, labelled), shown under the
@@ -492,7 +494,8 @@ fn hjoin(a: &[String], b: &[String], gap: usize) -> Vec<String> {
 pub fn summary(sum: &Summary) {
     let s = state();
     let g = glyphs(s.unicode);
-    let total: usize = sum.lipids.iter().map(|(_, n)| n).sum();
+    let total_lipids: usize = sum.lipids.iter().map(|(_, n)| n).sum();
+    let total_proteins: usize = sum.proteins.iter().map(|(_, n)| n).sum();
 
     if s.quiet {
         let parts = [
@@ -512,17 +515,29 @@ pub fn summary(sum: &Summary) {
         return;
     }
 
-    // Composition panel: one proportion bar per species, then a total.
+    // Composition panel: proteins (if any) + one proportion bar per lipid species.
     let (fill, empty) = if s.unicode {
         ("█", "░")
     } else {
         ("#", "-")
     };
     let mut comp = Vec::new();
+    for (name, count) in sum.proteins {
+        let copies = if *count == 1 { "copy" } else { "copies" };
+        comp.push(format!(
+            "{}  {} {}",
+            rgb(name, TITLE_ACCENT, s.depth, true),
+            thousands(*count),
+            paint(copies, "2", s.color)
+        ));
+    }
+    if !sum.proteins.is_empty() && !sum.lipids.is_empty() {
+        comp.push(String::new());
+    }
     for (i, (name, count)) in sum.lipids.iter().enumerate() {
-        let pct = (count * 100).checked_div(total).unwrap_or(0);
-        let on = if total > 0 {
-            (count * 10).div_ceil(total).min(10)
+        let pct = (count * 100).checked_div(total_lipids).unwrap_or(0);
+        let on = if total_lipids > 0 {
+            (count * 10).div_ceil(total_lipids).min(10)
         } else {
             0
         };
@@ -533,15 +548,15 @@ pub fn summary(sum: &Summary) {
         );
         comp.push(format!("{name:<6} {count:>5}   {bar} {pct:>2}%"));
     }
-    if !comp.is_empty() {
+    if !sum.lipids.is_empty() {
         comp.push(String::new());
+        comp.push(paint(
+            &format!("total  {} lipids", thousands(total_lipids)),
+            "2",
+            s.color,
+        ));
     }
-    comp.push(paint(
-        &format!("total  {} lipids", thousands(total)),
-        "2",
-        s.color,
-    ));
-    // Per-leaflet breakdown: upper/lower for a membrane, outer/inner for a vesicle.
+    // Per-leaflet breakdown: upper/lower for a membrane, outer/inner for a vesicle/tubule.
     if let Some(leaflets) = sum.leaflets {
         comp.push(String::new());
         // Right-align each count to the widest count in its column, so the dots
@@ -579,10 +594,17 @@ pub fn summary(sum: &Summary) {
 
     // Geometry panel: dim keys, plain values.
     let key = |k: &str| paint(&format!("{k:<8}"), "2", s.color);
-    let mut geom = vec![
-        format!("{} {}", key("box"), box_desc(sum.box_nm, s.unicode)),
-        format!("{} {}", key("lipids"), thousands(total)),
-    ];
+    let mut geom = vec![format!(
+        "{} {}",
+        key("box"),
+        box_desc(sum.box_nm, s.unicode)
+    )];
+    if total_proteins > 0 {
+        geom.push(format!("{} {}", key("proteins"), thousands(total_proteins)));
+    }
+    if total_lipids > 0 {
+        geom.push(format!("{} {}", key("lipids"), thousands(total_lipids)));
+    }
     geom.push(format!("{} {}", key("beads"), thousands(sum.beads)));
     geom.push(format!(
         "{} {:.1} s",

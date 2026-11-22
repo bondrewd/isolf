@@ -1,21 +1,25 @@
-//! Command-line builder for coarse-grained iSoLF membranes, vesicles, and tubules.
+//! Command-line builder for coarse-grained iSoLF membranes, vesicles, tubules,
+//! and AICG2+ proteins for GENESIS.
 //!
 //! ```sh
 //! isolf membrane --lipids "POPC=3,POPS=1" --count 512 --inp --vmd -o ./sim
+//! isolf membrane --lipids POPC --box 20 -p channel.pdb --inp --vmd -o ./prot_mem
 //! isolf vesicle  --lipids POPC --radius 20 --top -o ./ves
 //! isolf tubule   --lipids "DPPC=1,POPC=3" --phase raft --radius 10 --length 25 -o ./tube
+//! isolf protein  1aki.pdb --inp --vmd -o ./prot
 //! isolf lipids
 //! ```
 //!
 //! `<name>.gro` and `<name>.log` are always written. `--top` adds the topology
-//! (`<name>.top` plus `isolf.itp`); `--inp` (or any `--min`/`--equil`/`--prod`
-//! override) adds GENESIS control files and implies `--top`; `--vmd` (or any
-//! `--vmd-*` flag) adds VMD scripts and implies `--psf`; `--gif` (or any
-//! `--gif-*` flag) adds a relaxation animation; `.pdb`, `.psf`, `.crd`, and
-//! `.cif` are added on request.
+//! (`<name>.top` plus `isolf.itp`, and `aicg2p.itp` + `<prot>.itp` when proteins
+//! are present); `--inp` (or any `--min`/`--equil`/`--prod` override) adds
+//! GENESIS control files and implies `--top`; `--vmd` (or any `--vmd-*` flag)
+//! adds VMD scripts and implies `--psf`; `--gif` (or any `--gif-*` flag) adds a
+//! relaxation animation; `.pdb`, `.psf`, `.crd`, and `.cif` are added on request.
 
 use std::error::Error;
 use std::f64::consts::TAU;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -27,14 +31,23 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use isolf::composition::Composition;
+use isolf::embed::{
+    EmbeddedSystem, ProteinPlacement, ProteinSpec, ZPlacement, embed_membrane,
+    embed_membrane_recorded, embed_tubule, embed_tubule_recorded, embed_vesicle,
+    embed_vesicle_recorded,
+};
 use isolf::error::BuildError;
 use isolf::force_field::ForceField;
 use isolf::membrane::{
-    BuildOptions, DEFAULT_NAME, DEFAULT_PADDING, DEFAULT_TEMPERATURE, Membrane, Phase, RelaxFrame,
-    Sizing,
+    BuildOptions, DEFAULT_NAME, DEFAULT_PADDING, DEFAULT_TEMPERATURE, Phase, RelaxFrame, Sizing,
 };
-use isolf::tubule::{TubuleRadius, build_tubule, build_tubule_recorded};
-use isolf::vesicle::{VesicleRadius, build_vesicle, build_vesicle_recorded};
+use isolf::protein::Protein;
+use isolf::protein::aicg2p::{
+    AicgScale, ProteinModel, ProteinOptions, SafeDihedral, parse_charge_table, parse_selection,
+};
+use isolf::protein::params::render_aicg2p_itp;
+use isolf::tubule::TubuleRadius;
+use isolf::vesicle::VesicleRadius;
 use isolf::vmd::{Layout, VmdOptions, VmdSource};
 
 mod anim;
@@ -97,7 +110,84 @@ impl From<PhaseArg> for Phase {
     }
 }
 
-/// Build coarse-grained iSoLF lipid membranes, vesicles, and tubules for GENESIS.
+/// Where a standalone protein is centred (`isolf protein --center`).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ProteinCenterArg {
+    /// Keep the input PDB/mmCIF coordinates unchanged (default).
+    #[default]
+    Keep,
+    /// Translate centroid to the coordinate origin (0, 0, 0).
+    Origin,
+    /// Translate centroid to the centre of the periodic box [0, box].
+    Box,
+}
+
+/// Protein coarse-grained model (`--model`).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ProteinModelArg {
+    /// AICG2+ structure-based model with flexible local potentials (default).
+    #[default]
+    #[value(name = "aicg2+", alias = "aicg2p", alias = "aicg2")]
+    Aicg2Plus,
+    /// Clementi Gō-like Cα model.
+    #[value(name = "clementi", alias = "ccgo")]
+    ClementiGo,
+}
+
+impl From<ProteinModelArg> for ProteinModel {
+    fn from(m: ProteinModelArg) -> Self {
+        match m {
+            ProteinModelArg::Aicg2Plus => ProteinModel::Aicg2Plus,
+            ProteinModelArg::ClementiGo => ProteinModel::ClementiGo,
+        }
+    }
+}
+
+/// AICG2+ energy scaling scheme (`--scale`).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AicgScaleArg {
+    /// Universal AICG2+ scaling factors (1.11 / 0.87 / 0.32, default).
+    #[default]
+    General,
+    /// Normalize mean local and contact energies to reference averages (1.72 / 1.23 / 0.55).
+    Average,
+}
+
+impl From<AicgScaleArg> for AicgScale {
+    fn from(s: AicgScaleArg) -> Self {
+        match s {
+            AicgScaleArg::General => AicgScale::General,
+            AicgScaleArg::Average => AicgScale::Average,
+        }
+    }
+}
+
+/// Safe dihedral damping mode (`--safe-dihedral`).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SafeDihedralArg {
+    /// Unmodified dihedral potentials (0).
+    #[value(name = "0", alias = "none")]
+    None,
+    /// cos²(kθ)-damped safe dihedrals (1, default).
+    #[default]
+    #[value(name = "1", alias = "cos2")]
+    Cos2,
+    /// sin³(kθ)-damped safe dihedrals (3).
+    #[value(name = "3", alias = "sin3")]
+    Sin3,
+}
+
+impl From<SafeDihedralArg> for SafeDihedral {
+    fn from(s: SafeDihedralArg) -> Self {
+        match s {
+            SafeDihedralArg::None => SafeDihedral::None,
+            SafeDihedralArg::Cos2 => SafeDihedral::Cos2,
+            SafeDihedralArg::Sin3 => SafeDihedral::Sin3,
+        }
+    }
+}
+
+/// Build coarse-grained iSoLF membranes, vesicles, tubules, and AICG2+ proteins for GENESIS.
 #[derive(Parser, Debug)]
 #[command(
     name = "isolf",
@@ -119,6 +209,8 @@ enum Command {
     Vesicle(VesicleArgs),
     /// Build a cylindrical lipid tubule (periodic along z).
     Tubule(TubuleArgs),
+    /// Coarse-grain a protein PDB/mmCIF with AICG2+ or Clementi Gō for GENESIS.
+    Protein(ProteinArgs),
     /// List all supported iSoLF lipids.
     Lipids(LipidsArgs),
     /// Update isolf in place to the latest release.
@@ -411,6 +503,24 @@ struct CommonBuildArgs {
     #[arg(long, help_heading = "Lipid composition")]
     anti_register: bool,
 
+    // ---- Proteins ----
+    /// Embed a PDB/mmCIF protein (repeatable) as PATH[,KEY=VAL,...].
+    ///
+    /// Preserves input orientation by default (OPM midplane z = 0).
+    /// Keys: z=<nm|center>, x=<nm>, y=<nm>, tilt=<deg>, rot=<deg>, copies=<N>,
+    ///       clearance=<nm>, model=<aicg2+|clementi>, scale=<general|average>,
+    ///       safe-dihedral=<0|1|3>, idr=<ranges>, idr-local=<ranges>,
+    ///       idr-nonlocal=<ranges>, charges=<file>, name=<molname>
+    /// Example: -p channel.pdb,z=center,copies=2,clearance=0.2
+    #[arg(
+        short = 'p',
+        long = "protein",
+        value_name = "SPEC",
+        verbatim_doc_comment,
+        help_heading = "Proteins"
+    )]
+    proteins: Vec<String>,
+
     // ---- Output files ----
     /// Output directory.
     #[arg(
@@ -616,6 +726,244 @@ impl CommonBuildArgs {
     }
 }
 
+/// Arguments for `isolf protein`.
+#[derive(clap::Args, Debug)]
+#[command(
+    about = "Coarse-grain a protein PDB/mmCIF with AICG2+ or Clementi Gō for GENESIS",
+    long_about = "\
+Coarse-grain an all-atom protein PDB or mmCIF structure using the AICG2+
+(default) or Clementi Gō Cα model for GENESIS RESIDCG.
+
+Always writes <name>.gro, <name>.itp, aicg2p.itp, <name>.top, and <name>.log.
+Add --inp for GENESIS min/nvt/pro control files, --vmd for VMD visualization
+scripts (implies --psf), or --pdb / --psf / --crd / --cif as needed."
+)]
+struct ProteinArgs {
+    /// Input all-atom protein structure (.pdb or .cif/.mmcif).
+    #[arg(value_name = "INPUT")]
+    input: PathBuf,
+
+    // ---- Protein model ----
+    /// Coarse-grained protein force field: aicg2+ (default) or clementi.
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        default_value_t = ProteinModelArg::Aicg2Plus,
+        value_name = "MODEL",
+        help_heading = "Protein model"
+    )]
+    model: ProteinModelArg,
+
+    /// AICG2+ energy scaling scheme: general (default) or average.
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        default_value_t = AicgScaleArg::General,
+        value_name = "SCHEME",
+        help_heading = "Protein model"
+    )]
+    scale: AicgScaleArg,
+
+    /// Safe dihedral potential mode: 0 (none), 1 (cos2, default), or 3 (sin3).
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        default_value_t = SafeDihedralArg::Cos2,
+        value_name = "MODE",
+        help_heading = "Protein model"
+    )]
+    safe_dihedral: SafeDihedralArg,
+
+    /// Disordered residue ranges excluded from both local and nonlocal Gō terms (e.g. "1-25,80-95").
+    #[arg(long, value_name = "RANGES", help_heading = "Protein model")]
+    idr: Option<String>,
+
+    /// Disordered residue ranges excluded from AICG2+ local Gaussian 1-3 and 1-4 terms.
+    #[arg(long, value_name = "RANGES", help_heading = "Protein model")]
+    idr_local: Option<String>,
+
+    /// Disordered residue ranges excluded from native Gō contacts ([ pairs ]).
+    #[arg(long, value_name = "RANGES", help_heading = "Protein model")]
+    idr_nonlocal: Option<String>,
+
+    /// RESPAC / user charge override table file (<1-based index> <charge> per line).
+    #[arg(long, value_name = "FILE", help_heading = "Protein model")]
+    charges: Option<PathBuf>,
+
+    /// Native contact energy scale factor for the Clementi Gō model.
+    #[arg(
+        long,
+        value_name = "FACTOR",
+        default_value_t = 1.0,
+        help_heading = "Protein model"
+    )]
+    contact_scale: f64,
+
+    // ---- Geometry ----
+    /// Coordinate centering: keep (input coordinates, default), origin, or box.
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        default_value_t = ProteinCenterArg::Keep,
+        value_name = "WHERE",
+        help_heading = "Geometry"
+    )]
+    center: ProteinCenterArg,
+
+    /// Vacuum padding in nm added on each side of the periodic box.
+    #[arg(
+        long,
+        value_name = "NM",
+        default_value_t = DEFAULT_PADDING,
+        help_heading = "Geometry"
+    )]
+    padding: f64,
+
+    // ---- Output files ----
+    /// Output directory.
+    #[arg(
+        short = 'o',
+        long,
+        value_name = "DIR",
+        default_value = ".",
+        help_heading = "Output files"
+    )]
+    out: PathBuf,
+
+    /// Base / moleculetype name for output files [default: <stem>_cg].
+    #[arg(long, value_name = "NAME", help_heading = "Output files")]
+    name: Option<String>,
+
+    /// Write GENESIS .inp control files for min, nvt, and pro.
+    #[arg(long, help_heading = "Output files")]
+    inp: bool,
+
+    /// Write VMD .vmd visualization scripts (implies --psf).
+    #[arg(long, help_heading = "Output files")]
+    vmd: bool,
+
+    /// Write a .pdb coordinate file.
+    #[arg(long, help_heading = "Output files")]
+    pdb: bool,
+
+    /// Write a CHARMM .psf structure file.
+    #[arg(long, help_heading = "Output files")]
+    psf: bool,
+
+    /// Write a CHARMM .crd coordinate file.
+    #[arg(long, help_heading = "Output files")]
+    crd: bool,
+
+    /// Write an mmCIF .cif coordinate file.
+    #[arg(long, help_heading = "Output files")]
+    cif: bool,
+
+    // ---- GENESIS control files (--inp) ----
+    /// Simulation temperature in K for GENESIS .inp files [default: 323.15].
+    #[arg(
+        short = 't',
+        long,
+        value_name = "K",
+        help_heading = "GENESIS control files (--inp)"
+    )]
+    temperature: Option<f64>,
+
+    /// Minimization (min.inp) overrides as KEY=VAL or <steps> (implies --inp).
+    #[arg(
+        long,
+        value_name = "SPEC",
+        help_heading = "GENESIS control files (--inp)"
+    )]
+    min: Vec<String>,
+
+    /// Equilibration (nvt.inp) overrides as KEY=VAL or <steps> (implies --inp).
+    #[arg(
+        long,
+        value_name = "SPEC",
+        help_heading = "GENESIS control files (--inp)"
+    )]
+    equil: Vec<String>,
+
+    /// Production (pro.inp) overrides as KEY=VAL or <steps> (implies --inp).
+    #[arg(
+        long,
+        value_name = "SPEC",
+        help_heading = "GENESIS control files (--inp)"
+    )]
+    prod: Vec<String>,
+
+    // ---- VMD visualization (--vmd) ----
+    /// Use a smooth QuickSurf surface instead of a CA Tube (implies --vmd).
+    #[arg(long, help_heading = "VMD visualization (--vmd)")]
+    vmd_surface: bool,
+
+    /// Slice the system with a clipping plane (implies --vmd).
+    #[arg(long, help_heading = "VMD visualization (--vmd)")]
+    vmd_cutaway: bool,
+
+    /// Append a Tachyon ray-tracing render command to each script (implies --vmd).
+    #[arg(long, help_heading = "VMD visualization (--vmd)")]
+    vmd_render: bool,
+
+    /// VMD background colour name [default: white] (implies --vmd).
+    #[arg(long, value_name = "COLOR", help_heading = "VMD visualization (--vmd)")]
+    vmd_background: Option<String>,
+
+    /// VMD representation material [default: AOChalky] (implies --vmd).
+    #[arg(long, value_name = "NAME", help_heading = "VMD visualization (--vmd)")]
+    vmd_material: Option<String>,
+
+    /// Trajectory smoothing window in frames [default: 5] (implies --vmd).
+    #[arg(long, value_name = "N", help_heading = "VMD visualization (--vmd)")]
+    vmd_smooth: Option<usize>,
+
+    // ---- General ----
+    /// Seed value for the RNG (random if unset).
+    #[arg(long, value_name = "SEED", help_heading = "General")]
+    seed: Option<u64>,
+
+    /// Print only the final summary and any warnings.
+    #[arg(
+        short = 'q',
+        long,
+        conflicts_with = "verbose",
+        help_heading = "General"
+    )]
+    quiet: bool,
+
+    /// Print full file paths in the Write section.
+    #[arg(short = 'v', long, help_heading = "General")]
+    verbose: bool,
+
+    /// Disable coloured terminal output.
+    #[arg(long, help_heading = "General")]
+    no_color: bool,
+
+    /// Use ASCII status markers instead of Unicode glyphs.
+    #[arg(long, help_heading = "General")]
+    ascii: bool,
+}
+
+impl ProteinArgs {
+    fn want_inp(&self) -> bool {
+        self.inp || !self.min.is_empty() || !self.equil.is_empty() || !self.prod.is_empty()
+    }
+
+    fn want_vmd(&self) -> bool {
+        self.vmd
+            || self.vmd_surface
+            || self.vmd_cutaway
+            || self.vmd_render
+            || self.vmd_background.is_some()
+            || self.vmd_material.is_some()
+            || self.vmd_smooth.is_some()
+    }
+}
+
 /// Arguments for `isolf lipids`.
 #[derive(clap::Args, Debug)]
 struct LipidsArgs {
@@ -726,8 +1074,8 @@ impl DynSpec {
 const MAX_ISEED: u64 = 999_999;
 
 /// One optional structure-file format: whether it was requested, its extension,
-/// and how to render it from the membrane.
-type StructureFormat = (bool, &'static str, fn(&Membrane) -> String);
+/// and how to render it from the built system.
+type StructureFormat = (bool, &'static str, fn(&EmbeddedSystem) -> String);
 
 /// Colour scheme for the `--help` output.
 fn help_styles() -> Styles {
@@ -769,6 +1117,7 @@ fn main() {
             a.common.verbose,
             a.common.no_color,
         ),
+        Command::Protein(a) => (a.ascii, a.quiet, a.verbose, a.no_color),
         Command::Lipids(a) => (a.ascii, false, false, a.no_color),
         Command::Update | Command::Uninstall => (false, false, false, false),
     };
@@ -786,6 +1135,7 @@ fn dispatch(command: Command, color: bool, unicode: bool) -> Result<(), Box<dyn 
         Command::Membrane(args) => run_membrane(args),
         Command::Vesicle(args) => run_vesicle(args),
         Command::Tubule(args) => run_tubule(args),
+        Command::Protein(args) => run_protein(args),
         Command::Lipids(_) => {
             print_lipids(&ForceField::isolf(), color, unicode);
             Ok(())
@@ -905,6 +1255,150 @@ fn phase_notes(common: &CommonBuildArgs, first: &Composition, second: &Compositi
     notes
 }
 
+/// Parse a finite floating-point number (signed allowed), trimming whitespace.
+fn parse_f64(value: &str, what: &str) -> Result<f64, Box<dyn Error>> {
+    let value = value.trim();
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| format!("'{value}' is not a valid {what}").into())
+}
+
+/// Parse a non-negative finite floating-point number, trimming whitespace.
+fn parse_nonneg_f64(value: &str, what: &str) -> Result<f64, Box<dyn Error>> {
+    let value = value.trim();
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .ok_or_else(|| format!("'{value}' is not a non-negative {what}").into())
+}
+
+/// Parse repeatable `-p, --protein <PATH>[,KEY=VAL,...]` flags into [`ProteinSpec`]s.
+fn parse_protein_specs(specs: &[String]) -> Result<Vec<ProteinSpec>, Box<dyn Error>> {
+    let mut out = Vec::with_capacity(specs.len());
+    for raw in specs {
+        let mut tokens = raw.split(',').map(str::trim).filter(|t| !t.is_empty());
+        let path_str = tokens
+            .next()
+            .ok_or("--protein: missing input structure path")?;
+        if path_str.contains('=') {
+            return Err(format!(
+                "--protein: expected a PDB/mmCIF file path before options, got '{path_str}'"
+            )
+            .into());
+        }
+
+        let mut placement = ProteinPlacement::default();
+        let mut options = ProteinOptions::default();
+        let mut name_override: Option<String> = None;
+
+        for tok in tokens {
+            let (k, v) = tok
+                .split_once('=')
+                .ok_or_else(|| format!("--protein: expected KEY=VAL option, got '{tok}'"))?;
+            let key = k.trim().to_ascii_lowercase();
+            let val = v.trim();
+            match key.as_str() {
+                "z" => {
+                    if val.eq_ignore_ascii_case("center") || val.eq_ignore_ascii_case("mid") {
+                        placement.z_mode = ZPlacement::Center;
+                    } else if val.eq_ignore_ascii_case("keep") {
+                        placement.z_mode = ZPlacement::Keep;
+                    } else {
+                        placement.z_offset = parse_f64(val, "z offset in nm")?;
+                    }
+                }
+                "zoff" | "z_offset" | "dz" => {
+                    placement.z_offset = parse_f64(val, "z offset in nm")?;
+                }
+                "x" => placement.x = Some(parse_f64(val, "x coordinate in nm")?),
+                "y" => placement.y = Some(parse_f64(val, "y coordinate in nm")?),
+                "tilt" => placement.tilt_deg = parse_f64(val, "tilt angle in degrees")?,
+                "rot" | "rotate" => {
+                    placement.rot_deg = parse_f64(val, "rotation angle in degrees")?
+                }
+                "copies" | "n" => placement.copies = parse_pos_usize(val, "copy count")?,
+                "clearance" | "margin" => {
+                    placement.clearance = parse_nonneg_f64(val, "clearance in nm")?;
+                }
+                "model" | "ff" => {
+                    options.model = match val.to_ascii_lowercase().as_str() {
+                        "aicg2+" | "aicg2p" | "aicg2" => ProteinModel::Aicg2Plus,
+                        "clementi" | "ccgo" => ProteinModel::ClementiGo,
+                        other => {
+                            return Err(format!(
+                                "--protein: unknown model '{other}' (use aicg2+ or clementi)"
+                            )
+                            .into());
+                        }
+                    };
+                }
+                "scale" => {
+                    options.scale = match val.to_ascii_lowercase().as_str() {
+                        "general" | "1" => AicgScale::General,
+                        "average" | "0" => AicgScale::Average,
+                        other => {
+                            return Err(format!(
+                                "--protein: unknown scale '{other}' (use general or average)"
+                            )
+                            .into());
+                        }
+                    };
+                }
+                "safe-dihedral" | "safe_dihedral" | "safedih" => {
+                    options.safe_dihedral = match val.to_ascii_lowercase().as_str() {
+                        "0" | "none" => SafeDihedral::None,
+                        "1" | "cos2" => SafeDihedral::Cos2,
+                        "3" | "sin3" => SafeDihedral::Sin3,
+                        other => {
+                            return Err(format!(
+                                "--protein: unknown safe-dihedral '{other}' (use 0, 1, or 3)"
+                            )
+                            .into());
+                        }
+                    };
+                }
+                "idr" => {
+                    let norm = val.replace(['+', ';'], ",");
+                    let sel = parse_selection(&norm)?;
+                    options.idr_local = sel.clone();
+                    options.idr_nonlocal = sel;
+                }
+                "idr-local" | "idr_local" => {
+                    let norm = val.replace(['+', ';'], ",");
+                    options.idr_local = parse_selection(&norm)?;
+                }
+                "idr-nonlocal" | "idr_nonlocal" => {
+                    let norm = val.replace(['+', ';'], ",");
+                    options.idr_nonlocal = parse_selection(&norm)?;
+                }
+                "charges" | "respac" => {
+                    let content = fs::read_to_string(val).map_err(|e| {
+                        format!("--protein: failed to read charges file '{val}': {e}")
+                    })?;
+                    options.charges = parse_charge_table(&content)?;
+                }
+                "contact-scale" | "contact_scale" => {
+                    options.ccgo_contact_scale = parse_pos_f64(val, "contact scale")?;
+                }
+                "name" => name_override = Some(val.to_string()),
+                other => {
+                    return Err(format!(
+                        "--protein: unknown key '{other}' (use z, x, y, tilt, rot, copies, clearance, model, scale, safe-dihedral, idr, idr-local, idr-nonlocal, charges, name)"
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let protein = Protein::from_file(Path::new(path_str), name_override.as_deref(), &options)?;
+        out.push(ProteinSpec { protein, placement });
+    }
+    Ok(out)
+}
+
 fn run_membrane(args: MembraneArgs) -> Result<(), Box<dyn Error>> {
     let force_field = ForceField::isolf();
     validate_padding(args.padding)?;
@@ -926,6 +1420,7 @@ fn run_membrane(args: MembraneArgs) -> Result<(), Box<dyn Error>> {
         box_xy,
     )
     .map_err(|e| enrich_build_error(&force_field, e))?;
+    let protein_specs = parse_protein_specs(&args.common.proteins)?;
     let (controls, temp_note) = prepare_controls(&args.common, Geometry::Membrane)?;
 
     let seed = args.common.seed.unwrap_or_else(|| rand::rng().random());
@@ -940,29 +1435,31 @@ fn run_membrane(args: MembraneArgs) -> Result<(), Box<dyn Error>> {
     report::section("Build");
     let spin = report::spin("building membrane");
     let built = if args.common.want_gif() {
-        Membrane::build_recorded(
+        embed_membrane_recorded(
             &force_field,
             Geometry::Membrane.title(),
             &upper,
             &lower,
             sizing,
             &options,
+            &protein_specs,
             &mut rng,
         )
     } else {
-        Membrane::build(
+        embed_membrane(
             &force_field,
             Geometry::Membrane.title(),
             &upper,
             &lower,
             sizing,
             &options,
+            &protein_specs,
             &mut rng,
         )
-        .map(|m| (m, Vec::new()))
+        .map(|s| (s, Vec::new()))
     };
     spin.finish();
-    let (membrane, gif_frames) = built.map_err(|e| enrich_build_error(&force_field, e))?;
+    let (system, gif_frames) = built.map_err(|e| enrich_build_error(&force_field, e))?;
 
     let mut notes = phase_notes(&args.common, &upper, &lower);
     if let Some(n) = balance_note {
@@ -971,9 +1468,13 @@ fn run_membrane(args: MembraneArgs) -> Result<(), Box<dyn Error>> {
     if let Some(n) = temp_note {
         notes.push(n);
     }
-    let gif_bounds = [0.0, 0.0, membrane.box_size[0], membrane.box_size[1]];
+    for spec in &protein_specs {
+        notes.extend(spec.protein.warnings.iter().cloned());
+    }
+    notes.extend(system.warnings.iter().cloned());
+    let gif_bounds = [0.0, 0.0, system.box_size[0], system.box_size[1]];
     finish_build(
-        membrane,
+        system,
         gif_frames,
         gif_bounds,
         &force_field,
@@ -1001,6 +1502,7 @@ fn run_vesicle(args: VesicleArgs) -> Result<(), Box<dyn Error>> {
         .map_err(|e| enrich_build_error(&force_field, e))?;
     isolf::membrane::area_per_lipid(&force_field, &inner)
         .map_err(|e| enrich_build_error(&force_field, e))?;
+    let protein_specs = parse_protein_specs(&args.common.proteins)?;
     let (controls, temp_note) = prepare_controls(&args.common, Geometry::Vesicle)?;
 
     let seed = args.common.seed.unwrap_or_else(|| rand::rng().random());
@@ -1015,36 +1517,42 @@ fn run_vesicle(args: VesicleArgs) -> Result<(), Box<dyn Error>> {
     report::section("Build");
     let spin = report::spin("building vesicle");
     let built = if args.common.want_gif() {
-        build_vesicle_recorded(
+        embed_vesicle_recorded(
             &force_field,
             Geometry::Vesicle.title(),
             &outer,
             &inner,
             radius,
             &options,
+            &protein_specs,
             &mut rng,
         )
     } else {
-        build_vesicle(
+        embed_vesicle(
             &force_field,
             Geometry::Vesicle.title(),
             &outer,
             &inner,
             radius,
             &options,
+            &protein_specs,
             &mut rng,
         )
-        .map(|m| (m, Vec::new()))
+        .map(|s| (s, Vec::new()))
     };
     spin.finish();
-    let (membrane, gif_frames) = built.map_err(|e| enrich_build_error(&force_field, e))?;
+    let (system, gif_frames) = built.map_err(|e| enrich_build_error(&force_field, e))?;
 
     let mut notes = phase_notes(&args.common, &outer, &inner);
     if let Some(n) = temp_note {
         notes.push(n);
     }
+    for spec in &protein_specs {
+        notes.extend(spec.protein.warnings.iter().cloned());
+    }
+    notes.extend(system.warnings.iter().cloned());
     finish_build(
-        membrane,
+        system,
         gif_frames,
         [-2.0, -2.0, 2.0, 2.0],
         &force_field,
@@ -1082,6 +1590,7 @@ fn run_tubule(args: TubuleArgs) -> Result<(), Box<dyn Error>> {
         .map_err(|e| enrich_build_error(&force_field, e))?;
     isolf::membrane::area_per_lipid(&force_field, &inner)
         .map_err(|e| enrich_build_error(&force_field, e))?;
+    let protein_specs = parse_protein_specs(&args.common.proteins)?;
     let (controls, temp_note) = prepare_controls(&args.common, Geometry::Tubule)?;
 
     let seed = args.common.seed.unwrap_or_else(|| rand::rng().random());
@@ -1096,7 +1605,7 @@ fn run_tubule(args: TubuleArgs) -> Result<(), Box<dyn Error>> {
     report::section("Build");
     let spin = report::spin("building tubule");
     let built = if args.common.want_gif() {
-        build_tubule_recorded(
+        embed_tubule_recorded(
             &force_field,
             Geometry::Tubule.title(),
             &outer,
@@ -1104,10 +1613,11 @@ fn run_tubule(args: TubuleArgs) -> Result<(), Box<dyn Error>> {
             radius,
             args.length,
             &options,
+            &protein_specs,
             &mut rng,
         )
     } else {
-        build_tubule(
+        embed_tubule(
             &force_field,
             Geometry::Tubule.title(),
             &outer,
@@ -1115,21 +1625,26 @@ fn run_tubule(args: TubuleArgs) -> Result<(), Box<dyn Error>> {
             radius,
             args.length,
             &options,
+            &protein_specs,
             &mut rng,
         )
-        .map(|m| (m, Vec::new()))
+        .map(|s| (s, Vec::new()))
     };
     spin.finish();
-    let (membrane, gif_frames) = built.map_err(|e| enrich_build_error(&force_field, e))?;
+    let (system, gif_frames) = built.map_err(|e| enrich_build_error(&force_field, e))?;
 
     let mut notes = phase_notes(&args.common, &outer, &inner);
     if let Some(n) = temp_note {
         notes.push(n);
     }
-    let outer_radius = (0.5 * membrane.box_size[0] - args.padding).max(1e-6);
-    let gif_bounds = [0.0, 0.0, TAU * outer_radius, membrane.box_size[2]];
+    for spec in &protein_specs {
+        notes.extend(spec.protein.warnings.iter().cloned());
+    }
+    notes.extend(system.warnings.iter().cloned());
+    let outer_radius = (0.5 * system.box_size[0] - args.padding).max(1e-6);
+    let gif_bounds = [0.0, 0.0, TAU * outer_radius, system.box_size[2]];
     finish_build(
-        membrane,
+        system,
         gif_frames,
         gif_bounds,
         &force_field,
@@ -1143,9 +1658,297 @@ fn run_tubule(args: TubuleArgs) -> Result<(), Box<dyn Error>> {
     )
 }
 
+/// Standalone `isolf protein <INPUT>` coarse-graining workflow (AICG2+ / Clementi Gō).
+fn run_protein(args: ProteinArgs) -> Result<(), Box<dyn Error>> {
+    validate_padding(args.padding)?;
+    if !args.contact_scale.is_finite() || args.contact_scale <= 0.0 {
+        return Err(format!(
+            "--contact-scale: '{}' must be a positive number",
+            args.contact_scale
+        )
+        .into());
+    }
+    if let Some(t) = args.temperature
+        && (!t.is_finite() || t <= 0.0)
+    {
+        return Err(format!("--temperature: '{t}' is not a positive temperature in K").into());
+    }
+
+    let mut idr_local = match &args.idr {
+        Some(s) => parse_selection(s)?,
+        None => Vec::new(),
+    };
+    let mut idr_nonlocal = idr_local.clone();
+    if let Some(s) = &args.idr_local {
+        idr_local.extend(parse_selection(s)?);
+        idr_local.sort_unstable();
+        idr_local.dedup();
+    }
+    if let Some(s) = &args.idr_nonlocal {
+        idr_nonlocal.extend(parse_selection(s)?);
+        idr_nonlocal.sort_unstable();
+        idr_nonlocal.dedup();
+    }
+    let charges = match &args.charges {
+        Some(path) => {
+            let content = fs::read_to_string(path)
+                .map_err(|e| format!("--charges: failed to read {}: {e}", path.display()))?;
+            parse_charge_table(&content)?
+        }
+        None => Vec::new(),
+    };
+
+    let temperature = args.temperature.unwrap_or(DEFAULT_TEMPERATURE);
+    let min = parse_min_spec(&args.min)?;
+    let equil = parse_dyn_spec("--equil", &args.equil, DynSpec::default_equil())?;
+    let prod = parse_dyn_spec("--prod", &args.prod, DynSpec::default_prod())?;
+    let want_inp = args.want_inp();
+    let want_vmd = args.want_vmd();
+    if want_inp {
+        isolf::inp::minimization("x", &min.to_params([1.0; 3], temperature))
+            .map_err(|e| format!("--min: {e}"))?;
+        isolf::inp::nvt("x", "x", "x", &equil.to_params(temperature, 1))
+            .map_err(|e| format!("--equil: {e}"))?;
+        isolf::inp::nvt("x", "x", "x", &prod.to_params(temperature, 1))
+            .map_err(|e| format!("--prod: {e}"))?;
+    }
+
+    let prot_options = ProteinOptions {
+        model: args.model.into(),
+        scale: args.scale.into(),
+        safe_dihedral: args.safe_dihedral.into(),
+        idr_local,
+        idr_nonlocal,
+        charges,
+        ccgo_contact_scale: args.contact_scale,
+    };
+
+    let seed = args.seed.unwrap_or_else(|| rand::rng().random());
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    report::header();
+    report::section("Build");
+    let spin = report::spin("coarse-graining protein");
+    let mut protein = Protein::from_file(&args.input, args.name.as_deref(), &prot_options)?;
+    spin.finish();
+
+    let box_size = protein.box_with_padding(args.padding);
+    match args.center {
+        ProteinCenterArg::Keep => {}
+        ProteinCenterArg::Origin => {
+            let c = protein.centroid();
+            protein.translate([-c[0], -c[1], -c[2]]);
+        }
+        ProteinCenterArg::Box => {
+            let c = protein.centroid();
+            protein.translate([
+                0.5 * box_size[0] - c[0],
+                0.5 * box_size[1] - c[1],
+                0.5 * box_size[2] - c[2],
+            ]);
+        }
+    }
+
+    let model_tag = match protein.model {
+        ProteinModel::Aicg2Plus => "AICG2+",
+        ProteinModel::ClementiGo => "Clementi Gō",
+    };
+    let chain_word = if protein.chains.len() == 1 {
+        "chain"
+    } else {
+        "chains"
+    };
+    report::ok(
+        "protein",
+        &format!(
+            "{} ({}) {} {} {chain_word} {} {} beads {} {} contacts {} Q = {:+.1} e",
+            protein.name,
+            model_tag,
+            report::dot(),
+            protein.chains.len(),
+            report::dot(),
+            report::thousands(protein.beads.len()),
+            report::dot(),
+            report::thousands(protein.pairs.len()),
+            report::dot(),
+            protein.net_charge(),
+        ),
+    );
+    for w in &protein.warnings {
+        report::warn(w);
+    }
+    if args.temperature.is_some() && !want_inp {
+        report::warn("--temperature only affects GENESIS .inp files (pass --inp to write them)");
+    }
+
+    fs::create_dir_all(&args.out)?;
+    let base = protein.name.clone();
+    let named = |ext: &str| args.out.join(format!("{base}.{ext}"));
+
+    write(&named("gro"), &protein.to_gro(box_size))?;
+    write(&named("itp"), &protein.to_itp())?;
+    write(&args.out.join("aicg2p.itp"), &render_aicg2p_itp())?;
+    write(&named("top"), &protein.to_top())?;
+    if args.pdb {
+        write(&named("pdb"), &protein.to_pdb())?;
+    }
+    if args.psf || want_vmd {
+        write(&named("psf"), &protein.to_psf())?;
+    }
+    if args.crd {
+        write(&named("crd"), &protein.to_crd())?;
+    }
+    if args.cif {
+        write(&named("cif"), &protein.to_cif())?;
+    }
+
+    let controls = ControlSpecs {
+        temperature,
+        min,
+        equil,
+        prod,
+    };
+    if want_inp {
+        write_control_files(
+            &args.out,
+            &base,
+            Geometry::Vesicle,
+            box_size,
+            &controls,
+            &mut rng,
+        )?;
+    }
+    if want_vmd {
+        let ff = ForceField::isolf();
+        let particles = protein.to_particles(1, 1);
+        let background = args.vmd_background.as_deref().unwrap_or("white");
+        let material = args.vmd_material.as_deref().unwrap_or("AOChalky");
+        let vmd_opts = VmdOptions {
+            surface: args.vmd_surface,
+            cutaway: args.vmd_cutaway,
+            render: args.vmd_render,
+            background,
+            material,
+            smooth: args.vmd_smooth.unwrap_or(5),
+            lipid_coloring: isolf::vmd::LipidColoring::Head,
+            recenter_to_box: matches!(args.center, ProteinCenterArg::Origin),
+        };
+        let script = |source| {
+            isolf::vmd::vmd_script(&ff, &particles, &base, Layout::Protein, source, &vmd_opts)
+        };
+        write(
+            &args.out.join(format!("{base}.vmd")),
+            &script(VmdSource::Structure),
+        )?;
+        if want_inp {
+            for (stage, steps, crdout) in [
+                ("min", controls.min.num_steps, controls.min.crdout_period),
+                (
+                    "nvt",
+                    controls.equil.num_steps,
+                    controls.equil.crdout_period,
+                ),
+                ("pro", controls.prod.num_steps, controls.prod.crdout_period),
+            ] {
+                let frames = (crdout > 0).then(|| steps / crdout);
+                write(
+                    &args.out.join(format!("{stage}.vmd")),
+                    &script(VmdSource::Trajectory {
+                        name: stage,
+                        frames,
+                    }),
+                )?;
+            }
+        }
+    }
+
+    let log_path = named("log");
+    let log_content = render_protein_log(&protein, box_size, seed, args.seed.is_some());
+    write(&log_path, &log_content)?;
+
+    let out_dir = args.out.display().to_string();
+    report::write_section(&out_dir);
+    let next = want_inp.then(|| {
+        let cd = if out_dir == "." {
+            String::new()
+        } else {
+            format!("cd {out_dir} && ")
+        };
+        format!("run in GENESIS: {cd}atdyn min.inp (then nvt.inp, pro.inp)")
+    });
+    let prot_summary = [(protein.name.clone(), 1usize)];
+    report::summary(&report::Summary {
+        identity: "protein",
+        box_nm: box_size,
+        proteins: &prot_summary,
+        lipids: &[],
+        leaflets: None,
+        beads: protein.beads.len(),
+        next,
+    });
+    Ok(())
+}
+
+/// Format a detailed protein coarse-graining log (matching `genesis_cg_tool`'s
+/// chain table, Rg/Rc, net charge, contact count, and reproducible invocation).
+fn render_protein_log(
+    protein: &Protein,
+    box_size: [f64; 3],
+    seed: u64,
+    seed_given: bool,
+) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "command  {}", reproduce_command(seed, seed_given));
+    let _ = writeln!(
+        s,
+        "box      {:.4} x {:.4} x {:.4} nm",
+        box_size[0], box_size[1], box_size[2]
+    );
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Input structure (atomic):");
+    let _ = writeln!(s, "  atoms      : {}", protein.source_atoms);
+    let _ = writeln!(s, "  residues   : {}", protein.source_residues);
+    let _ = writeln!(s, "  chains     : {}", protein.chains.len());
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Chain info (CG):");
+    let _ = writeln!(
+        s,
+        "  | Chain | ID | # bead | start --   end |  Rg (nm) | net charge |"
+    );
+    let _ = writeln!(
+        s,
+        "  |-------+----+--------+----------------+----------+------------|"
+    );
+    for (ci, ch) in protein.chains.iter().enumerate() {
+        let cid = if ch.chain_id == ' ' { '-' } else { ch.chain_id };
+        let _ = writeln!(
+            s,
+            "  | {:>5} | {:>2} | {:>6} | {:>5} -- {:>5} | {:>8.3} | {:>+10.3} |",
+            ci + 1,
+            cid,
+            ch.range.len(),
+            ch.range.start + 1,
+            ch.range.end,
+            protein.chain_rg(ci),
+            protein.chain_charge(ci),
+        );
+    }
+    let _ = writeln!(s);
+    let _ = writeln!(s, "CG model summary:");
+    let _ = writeln!(s, "  beads      : {}", protein.beads.len());
+    let _ = writeln!(s, "  bonds      : {}", protein.bonds.len());
+    let _ = writeln!(s, "  angles     : {}", protein.angles.len());
+    let _ = writeln!(s, "  dihedrals  : {}", protein.dihedrals.len());
+    let _ = writeln!(s, "  contacts   : {}", protein.pairs.len());
+    let _ = writeln!(s, "  Rg         : {:.3} nm", protein.radius_of_gyration());
+    let _ = writeln!(s, "  Rc         : {:.3} nm", protein.circumsphere_radius());
+    let _ = writeln!(s, "  net charge : {:+.3} e", protein.net_charge());
+    s
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finish_build(
-    mut membrane: Membrane,
+    mut system: EmbeddedSystem,
     gif_frames: Vec<RelaxFrame>,
     gif_bounds: [f64; 4],
     force_field: &ForceField,
@@ -1158,15 +1961,35 @@ fn finish_build(
     rng: &mut StdRng,
 ) -> Result<(), Box<dyn Error>> {
     let identity = geometry.label();
-    report::ok(
-        identity,
-        &format!(
-            "{} lipids {} {} beads",
-            report::thousands(membrane.total_lipids()),
+    let total_removed = system.carved_lipids + system.pruned_lipids;
+    let detail = if system.has_proteins() {
+        let prot_word = if system.total_proteins() == 1 {
+            "protein"
+        } else {
+            "proteins"
+        };
+        let carved_str = if total_removed > 0 {
+            format!(" ({} carved)", report::thousands(total_removed))
+        } else {
+            String::new()
+        };
+        format!(
+            "{} lipids{carved_str} {} {} {prot_word} {} {} beads",
+            report::thousands(system.total_lipids()),
             report::dot(),
-            report::thousands(membrane.particles.len()),
-        ),
-    );
+            report::thousands(system.total_proteins()),
+            report::dot(),
+            report::thousands(system.particles.len()),
+        )
+    } else {
+        format!(
+            "{} lipids {} {} beads",
+            report::thousands(system.total_lipids()),
+            report::dot(),
+            report::thousands(system.particles.len()),
+        )
+    };
+    report::ok(identity, &detail);
     for note in notes {
         report::warn(note);
     }
@@ -1177,7 +2000,7 @@ fn finish_build(
         .unwrap_or_else(|| geometry.label().to_string());
 
     write_outputs(
-        &mut membrane,
+        &mut system,
         force_field,
         common,
         geometry,
@@ -1190,8 +2013,8 @@ fn finish_build(
     )?;
 
     let out_dir = common.out.display().to_string();
-    let box_size = membrane.box_size;
-    let beads = membrane.particles.len();
+    let box_size = system.box_size;
+    let beads = system.particles.len();
 
     let files: Vec<String> = report::recorded_files()
         .iter()
@@ -1226,11 +2049,12 @@ fn finish_build(
         };
         format!("run in GENESIS: {cd}atdyn min.inp (then {equil}, pro.inp)")
     });
-    let leaflets = leaflet_split(&membrane, geometry);
+    let leaflets = leaflet_split(&system, geometry);
     report::summary(&report::Summary {
         identity,
         box_nm: box_size,
-        lipids: membrane.lipid_counts.as_slice(),
+        proteins: system.protein_counts.as_slice(),
+        lipids: system.lipid_counts.as_slice(),
         leaflets: Some(&leaflets),
         beads,
         next,
@@ -1775,19 +2599,20 @@ fn balanced_counts(
 }
 
 /// Per-leaflet lipid composition. Each lipid molecule is classified into one of
-/// the two leaflets and counted per species (in the membrane's species order): a
-/// flat membrane splits by centroid z about the mean bead z (`upper`/`lower`), a
-/// vesicle by 3D centroid radius (`outer`/`inner`), and a tubule by 2D radial
-/// distance in the x/y plane (`outer`/`inner`).
-fn leaflet_split(m: &Membrane, geometry: Geometry) -> Vec<report::Leaflet> {
-    if m.particles.is_empty() {
+/// the two leaflets and counted per species (in the system's species order): a
+/// flat membrane splits by centroid z about the mean lipid bead z (`upper`/`lower`),
+/// a vesicle by 3D centroid radius (`outer`/`inner`), and a tubule by 2D radial
+/// distance in the x/y plane (`outer`/`inner`). Protein particles are excluded.
+fn leaflet_split(sys: &EmbeddedSystem, geometry: Geometry) -> Vec<report::Leaflet> {
+    let lipids = sys.lipid_particles();
+    if lipids.is_empty() {
         return Vec::new();
     }
     let radial = matches!(geometry, Geometry::Vesicle | Geometry::Tubule);
-    let n = m.particles.len() as f64;
+    let n = lipids.len() as f64;
     let center = if radial {
         let mut c = [0.0; 3];
-        for p in &m.particles {
+        for p in lipids {
             c[0] += p.position[0];
             c[1] += p.position[1];
             c[2] += p.position[2];
@@ -1807,15 +2632,15 @@ fn leaflet_split(m: &Membrane, geometry: Geometry) -> Vec<report::Leaflet> {
         Geometry::Tubule => (pos[0] - center[0]).hypot(pos[1] - center[1]),
     };
 
-    let threshold = m.particles.iter().map(|p| scalar(p.position)).sum::<f64>() / n;
-    let n_species = m.lipid_counts.len();
+    let threshold = lipids.iter().map(|p| scalar(p.position)).sum::<f64>() / n;
+    let n_species = sys.lipid_counts.len();
     let mut far = vec![0usize; n_species];
     let mut near = vec![0usize; n_species];
     let mut species_idx = 0usize;
-    for mol in m.particles.chunk_by(|a, b| a.molecule_id == b.molecule_id) {
+    for mol in lipids.chunk_by(|a, b| a.molecule_id == b.molecule_id) {
         let res = mol[0].residue.as_str();
-        if species_idx >= n_species || m.lipid_counts[species_idx].0 != res {
-            if let Some(idx) = m.lipid_counts.iter().position(|(s, _)| s == res) {
+        if species_idx >= n_species || sys.lipid_counts[species_idx].0 != res {
+            if let Some(idx) = sys.lipid_counts.iter().position(|(s, _)| s == res) {
                 species_idx = idx;
             } else {
                 continue;
@@ -1830,7 +2655,7 @@ fn leaflet_split(m: &Membrane, geometry: Geometry) -> Vec<report::Leaflet> {
     }
 
     let in_species_order = |counts: &[usize]| -> Vec<(String, usize)> {
-        m.lipid_counts
+        sys.lipid_counts
             .iter()
             .zip(counts)
             .filter(|&(_, &c)| c > 0)
@@ -1850,7 +2675,7 @@ fn leaflet_split(m: &Membrane, geometry: Geometry) -> Vec<report::Leaflet> {
 
 #[allow(clippy::too_many_arguments)]
 fn write_outputs(
-    membrane: &mut Membrane,
+    system: &mut EmbeddedSystem,
     force_field: &ForceField,
     common: &CommonBuildArgs,
     geometry: Geometry,
@@ -1864,33 +2689,42 @@ fn write_outputs(
     fs::create_dir_all(&common.out)?;
     let named = |extension: &str| common.out.join(format!("{base}.{extension}"));
 
-    membrane.center_in_box();
-    let box_size = membrane.box_size;
+    system.center_in_box();
+    let box_size = system.box_size;
     if matches!(center, CenterArg::Origin) {
-        membrane.translate([-box_size[0] / 2.0, -box_size[1] / 2.0, -box_size[2] / 2.0]);
+        system.translate([-box_size[0] / 2.0, -box_size[1] / 2.0, -box_size[2] / 2.0]);
     }
-    let membrane: &Membrane = membrane;
+    let system: &EmbeddedSystem = system;
 
     let want_inp = common.want_inp();
     let want_vmd = common.want_vmd();
     let want_gif = common.want_gif();
 
     let formats: [StructureFormat; 5] = [
-        (true, "gro", Membrane::to_gro),
-        (common.pdb, "pdb", Membrane::to_pdb),
-        (common.psf || want_vmd, "psf", Membrane::to_psf),
-        (common.crd, "crd", Membrane::to_crd),
-        (common.cif, "cif", Membrane::to_cif),
+        (true, "gro", EmbeddedSystem::to_gro),
+        (common.pdb, "pdb", EmbeddedSystem::to_pdb),
+        (common.psf || want_vmd, "psf", EmbeddedSystem::to_psf),
+        (common.crd, "crd", EmbeddedSystem::to_crd),
+        (common.cif, "cif", EmbeddedSystem::to_cif),
     ];
     for (enabled, ext, render) in formats {
         if enabled {
-            write(&named(ext), &render(membrane))?;
+            write(&named(ext), &render(system))?;
         }
     }
 
     if common.top || want_inp {
-        write(&named("top"), &membrane.to_top())?;
+        write(&named("top"), &system.to_top())?;
         write(&common.out.join("isolf.itp"), &force_field.to_itp())?;
+        if system.has_proteins() {
+            write(&common.out.join("aicg2p.itp"), &render_aicg2p_itp())?;
+            for tmpl in &system.protein_templates {
+                write(
+                    &common.out.join(format!("{}.itp", tmpl.name)),
+                    &tmpl.to_itp(),
+                )?;
+            }
+        }
     }
 
     if want_gif && !gif_frames.is_empty() {
@@ -1916,7 +2750,7 @@ fn write_outputs(
             base,
             geometry,
             center,
-            membrane,
+            system,
             force_field,
             common,
             controls,
@@ -1977,7 +2811,7 @@ fn write_vmd_scripts(
     base: &str,
     geometry: Geometry,
     center: CenterArg,
-    membrane: &Membrane,
+    system: &EmbeddedSystem,
     force_field: &ForceField,
     common: &CommonBuildArgs,
     controls: &ControlSpecs,
@@ -2002,7 +2836,7 @@ fn write_vmd_scripts(
     let script = |source| {
         isolf::vmd::vmd_script(
             force_field,
-            &membrane.particles,
+            &system.particles,
             base,
             layout,
             source,
@@ -2204,6 +3038,46 @@ mod tests {
         assert_eq!(tub.length, 25.0);
         assert_eq!(tub.common.phase, PhaseArg::Raft);
         assert!(tub.common.anti_register);
+
+        // Standalone protein subcommand with IDR, Clementi option, and auto-enabled --inp/--vmd.
+        let cli = Cli::try_parse_from([
+            "isolf",
+            "protein",
+            "channel.pdb",
+            "--model",
+            "clementi",
+            "--idr",
+            "1-20",
+            "--vmd-surface",
+            "--equil",
+            "steps=10000",
+        ])
+        .unwrap();
+        let Command::Protein(prot) = cli.command else {
+            panic!("expected protein subcommand");
+        };
+        assert_eq!(prot.model, ProteinModelArg::ClementiGo);
+        assert!(prot.want_vmd());
+        assert!(prot.want_inp());
+
+        // Membrane with repeatable -p protein specs.
+        let cli = Cli::try_parse_from([
+            "isolf",
+            "membrane",
+            "-L",
+            "POPC",
+            "-b",
+            "20",
+            "-p",
+            "a.pdb,z=center,copies=2",
+            "-p",
+            "b.cif,x=3,tilt=15",
+        ])
+        .unwrap();
+        let Command::Membrane(mem) = cli.command else {
+            panic!("expected membrane subcommand");
+        };
+        assert_eq!(mem.common.proteins.len(), 2);
 
         // Discovery subcommand.
         let cli = Cli::try_parse_from(["isolf", "lipids"]).unwrap();

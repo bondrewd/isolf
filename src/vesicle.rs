@@ -393,6 +393,167 @@ fn random_sphere_direction_in_band(rng: &mut impl Rng, z_lo: f64, z_hi: f64) -> 
     [r * cos_phi, r * sin_phi, z]
 }
 
+/// Build a spherical vesicle with embedded proteins (or delegate to
+/// [`build_vesicle`] when `proteins` is empty).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_with_proteins(
+    force_field: &ForceField,
+    name: &str,
+    outer: &Composition,
+    inner: &Composition,
+    radius: VesicleRadius,
+    options: &BuildOptions,
+    proteins: &[crate::embed::ProteinSpec],
+    rng: &mut impl Rng,
+    frames: Option<&mut Vec<RelaxFrame>>,
+) -> Result<crate::embed::EmbeddedSystem, BuildError> {
+    if proteins.is_empty() {
+        let m = build_vesicle_inner(
+            force_field,
+            name,
+            outer,
+            inner,
+            radius,
+            options,
+            rng,
+            frames,
+        )?;
+        return Ok(crate::embed::EmbeddedSystem::from_membrane(m));
+    }
+
+    let outer_spacing = leaflet_spacing(force_field, outer)?;
+    let inner_spacing = leaflet_spacing(force_field, inner)?;
+    let gap = clash_floor(force_field, outer)?.max(clash_floor(force_field, inner)?);
+    let thickness =
+        max_chain_length(force_field, outer)? + max_chain_length(force_field, inner)? + gap;
+
+    let (inner_radius, outer_radius) = match radius {
+        VesicleRadius::Inner(r) => (r, r + thickness),
+        VesicleRadius::Outer(r) => {
+            if r <= thickness {
+                return Err(BuildError::VesicleTooSmall {
+                    outer: r,
+                    thickness,
+                });
+            }
+            (r - thickness, r)
+        }
+        VesicleRadius::Both { inner, outer } => {
+            if outer - inner < thickness {
+                return Err(BuildError::VesicleTooThin {
+                    inner,
+                    outer,
+                    minimum: thickness,
+                });
+            }
+            (inner, outer)
+        }
+    };
+
+    let r_mid = 0.5 * (inner_radius + outer_radius);
+    let mut placed = crate::embed::place_proteins_vesicle(proteins, r_mid)?;
+
+    let outer_count = shell_count(outer_radius, outer_spacing);
+    let inner_count = shell_count(inner_radius, inner_spacing);
+
+    let mut molecule_id = 0;
+    let mut atom_id = 0;
+    let mut particles = Vec::new();
+    let mut radii = Vec::new();
+    let mut ranges = Vec::new();
+
+    place_shell(
+        force_field,
+        outer,
+        outer_radius,
+        outer_count,
+        Shell::Outer,
+        options,
+        rng,
+        &mut molecule_id,
+        &mut atom_id,
+        &mut particles,
+        &mut radii,
+        &mut ranges,
+    )?;
+    let mut outer_lipids = molecule_id;
+    place_shell(
+        force_field,
+        inner,
+        inner_radius,
+        inner_count,
+        Shell::Inner,
+        options,
+        rng,
+        &mut molecule_id,
+        &mut atom_id,
+        &mut particles,
+        &mut radii,
+        &mut ranges,
+    )?;
+
+    let carved = crate::embed::carve_lipids(
+        &mut particles,
+        &mut radii,
+        &mut ranges,
+        &mut outer_lipids,
+        &placed.obstacles,
+        0.0,
+        crate::embed::dist_sq_3d,
+    );
+
+    relax_vesicle_with_obstacles(
+        &mut particles,
+        &radii,
+        &ranges,
+        outer_lipids,
+        &placed.obstacles,
+        outer_radius,
+        inner_radius,
+        frames,
+    );
+
+    let pruned = crate::embed::prune_clashing_lipids(
+        &mut particles,
+        &mut radii,
+        &mut ranges,
+        &mut outer_lipids,
+        &placed.raw_obstacles,
+        crate::embed::dist_sq_3d,
+    );
+
+    let lipid_counts = crate::embed::count_remaining_lipids(&particles, outer, inner);
+    let mut particles = canonicalize(particles, &lipid_counts);
+
+    let mut max_r = outer_radius;
+    for prot in &placed.instances {
+        for b in &prot.beads {
+            let r = (b.position[0].powi(2) + b.position[1].powi(2) + b.position[2].powi(2)).sqrt();
+            max_r = max_r.max(r);
+        }
+    }
+    let box_side = 2.0 * max_r + 2.0 * options.padding;
+    let centre = 0.5 * box_side;
+    for particle in &mut particles {
+        for coordinate in &mut particle.position {
+            *coordinate += centre;
+        }
+    }
+    for prot in &mut placed.instances {
+        prot.translate([centre; 3]);
+    }
+
+    Ok(crate::embed::assemble_system(
+        name,
+        placed,
+        particles,
+        lipid_counts,
+        [box_side; 3],
+        carved,
+        pruned,
+    ))
+}
+
 /// Relax the randomly-placed shells to a uniform, clash-free configuration: an
 /// independent spherical centroidal-Voronoi (Lloyd) pass per shell plus a shared
 /// de-clash. `outer_lipids` is the number of lipids on the outer shell (placed
@@ -403,6 +564,29 @@ fn relax_vesicle(
     radii: &[f64],
     ranges: &[std::ops::Range<usize>],
     outer_lipids: usize,
+    outer_radius: f64,
+    inner_radius: f64,
+    frames: Option<&mut Vec<RelaxFrame>>,
+) {
+    relax_vesicle_with_obstacles(
+        particles,
+        radii,
+        ranges,
+        outer_lipids,
+        &[],
+        outer_radius,
+        inner_radius,
+        frames,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relax_vesicle_with_obstacles(
+    particles: &mut [Particle],
+    radii: &[f64],
+    ranges: &[std::ops::Range<usize>],
+    outer_lipids: usize,
+    obstacles: &[pack::Obstacle],
     outer_radius: f64,
     inner_radius: f64,
     frames: Option<&mut Vec<RelaxFrame>>,
@@ -442,10 +626,11 @@ fn relax_vesicle(
         None
     };
 
-    pack::equalize_on_sphere(
+    pack::equalize_on_sphere_with_obstacles(
         &mut positions,
         radii,
         &shells,
+        obstacles,
         [0.0, 0.0, 0.0],
         DEFAULT_PACK_ITERATIONS,
         DEFAULT_PACK_TOLERANCE,

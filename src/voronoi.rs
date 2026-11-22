@@ -219,9 +219,24 @@ impl PlaneCvtWorkspace {
     /// Advance 2D periodic sites `sites` (already in `[0, box_xy)`) by one exact
     /// Lloyd step in place. Returns the largest in-plane displacement (nm).
     pub(crate) fn step_sites(&mut self, sites: &mut [[f64; 2]], box_xy: [f64; 2]) -> f64 {
+        self.step_sites_pinned(sites, sites.len(), box_xy)
+    }
+
+    /// Like [`step_sites`](Self::step_sites), but only `sites[..n_movable]`
+    /// move; `sites[n_movable..]` stay fixed as obstacle boundary sites that
+    /// still clip movable Voronoi cells.
+    pub(crate) fn step_sites_pinned(
+        &mut self,
+        sites: &mut [[f64; 2]],
+        n_movable: usize,
+        box_xy: [f64; 2],
+    ) -> f64 {
         let n = sites.len();
+        let n_movable = n_movable.min(n);
         let (bx, by) = (box_xy[0], box_xy[1]);
-        if n < 2 || bx <= 0.0 || by <= 0.0 {
+        if n_movable == 0 || n < 2 || bx <= 0.0 || by <= 0.0 {
+            self.disps.resize(n_movable, [0.0; 2]);
+            self.disps.fill([0.0; 2]);
             return 0.0;
         }
 
@@ -290,7 +305,7 @@ impl PlaneCvtWorkspace {
         let offsets = &self.offsets;
         let sorted = &self.sorted;
 
-        self.disps.resize(n, [0.0; 2]);
+        self.disps.resize(n_movable, [0.0; 2]);
         self.disps
             .par_iter_mut()
             .enumerate()
@@ -428,7 +443,7 @@ impl PlaneCvtWorkspace {
             });
 
         let mut max_disp_sq = 0.0_f64;
-        for (site, &[dx, dy]) in sites.iter_mut().zip(&self.disps) {
+        for (site, &[dx, dy]) in sites[..n_movable].iter_mut().zip(&self.disps) {
             max_disp_sq = max_disp_sq.max(dx * dx + dy * dy);
             site[0] = wrap(site[0] + dx, bx);
             site[1] = wrap(site[1] + dy, by);
@@ -753,8 +768,21 @@ impl SphereCvtWorkspace {
     /// Advance unit shell directions `dirs` by one exact spherical Lloyd step in
     /// place. Returns the largest surface displacement `radius * max_angle` (nm).
     pub(crate) fn step_dirs(&mut self, dirs: &mut [[f64; 3]], radius: f64) -> f64 {
+        self.step_dirs_pinned(dirs, dirs.len(), radius)
+    }
+
+    /// Like [`step_dirs`](Self::step_dirs), but only `dirs[..n_movable]` move;
+    /// `dirs[n_movable..]` stay fixed as obstacle boundary directions that still
+    /// clip movable spherical Voronoi cells.
+    pub(crate) fn step_dirs_pinned(
+        &mut self,
+        dirs: &mut [[f64; 3]],
+        n_movable: usize,
+        radius: f64,
+    ) -> f64 {
         let n = dirs.len();
-        if n < 2 || radius <= 0.0 {
+        let n_movable = n_movable.min(n);
+        if n_movable == 0 || n < 2 || radius <= 0.0 {
             return 0.0;
         }
 
@@ -816,7 +844,7 @@ impl SphereCvtWorkspace {
         let offsets = &self.offsets;
         let sorted = &self.sorted;
 
-        self.targets.resize(n, [0.0; 3]);
+        self.targets.resize(n_movable, [0.0; 3]);
         self.targets
             .par_iter_mut()
             .enumerate()
@@ -902,7 +930,7 @@ impl SphereCvtWorkspace {
 
         // Compute the largest angular move with a single acos() per round.
         let mut min_cos = 1.0_f64;
-        for (from, &to) in dirs.iter_mut().zip(&self.targets) {
+        for (from, &to) in dirs[..n_movable].iter_mut().zip(&self.targets) {
             min_cos = min_cos.min(dot3(*from, to));
             *from = to;
         }
