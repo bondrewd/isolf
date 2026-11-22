@@ -58,6 +58,7 @@ pub mod protein;
 pub mod psf;
 pub mod top;
 pub mod tubule;
+pub mod umbrella;
 pub mod vesicle;
 pub mod vmd;
 pub mod voronoi;

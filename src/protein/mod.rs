@@ -175,6 +175,65 @@ impl Protein {
         Self::from_structure(&name, &structure, options)
     }
 
+    /// Build a single-bead coarse-grained amino acid molecule (for umbrella
+    /// sampling and lipid–protein interaction parameterization) without needing
+    /// an input PDB/mmCIF file.
+    ///
+    /// Accepts any standard 3-letter amino acid name (case-insensitive) or
+    /// protonation alias (e.g. `HID`/`HSE` → `HIS`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError::InvalidSelection`] if `aa` is not one of the 20
+    /// standard amino acids.
+    pub fn single_bead(aa: &str, charge_override: Option<f64>) -> Result<Self, BuildError> {
+        let canon = params::canonical_aa(aa)
+            .filter(|&c| c != "UNK")
+            .ok_or_else(|| {
+                BuildError::InvalidSelection(format!(
+                    "unknown amino acid '{aa}' (expected one of the 20 standard 3-letter amino acids, e.g. ALA, LEU, TRP, ARG)"
+                ))
+            })?;
+        let p = params::aa_params(canon)
+            .ok_or_else(|| BuildError::InvalidSelection(format!("unknown amino acid '{aa}'")))?;
+        let bead = ProteinBead {
+            residue: canon.to_string(),
+            atom: "CA".to_string(),
+            atom_type: canon.to_string(),
+            res_id: 1,
+            atom_id: 1,
+            chain_idx: 0,
+            chain_id: 'A',
+            seg_name: "PROA".to_string(),
+            position: [0.0, 0.0, 0.0],
+            charge: charge_override.unwrap_or(p.charge),
+            mass: p.mass,
+            radius: 0.5 * p.rmin,
+        };
+        Ok(Self {
+            name: canon.to_string(),
+            beads: vec![bead],
+            chains: vec![ProteinChain {
+                chain_id: 'A',
+                seg_name: "PROA".to_string(),
+                range: 0..1,
+            }],
+            bonds: Vec::new(),
+            angles: Vec::new(),
+            dihedrals: Vec::new(),
+            pairs: Vec::new(),
+            model: ProteinModel::Aicg2Plus,
+            source_atoms: 1,
+            source_residues: 1,
+            warnings: Vec::new(),
+        })
+    }
+
+    /// Canonical 3-letter names of all 20 standard amino acids.
+    pub fn all_amino_acid_names() -> [&'static str; 20] {
+        std::array::from_fn(|i| params::AMINO_ACIDS[i].name)
+    }
+
     /// Geometric centroid of all beads (nm).
     pub fn centroid(&self) -> [f64; 3] {
         if self.beads.is_empty() {

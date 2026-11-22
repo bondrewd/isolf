@@ -38,9 +38,10 @@ use isolf::embed::{
 };
 use isolf::error::BuildError;
 use isolf::force_field::ForceField;
+use isolf::inp::{Ensemble, MbarConfig, ReusConfig, ZRestraint};
 use isolf::membrane::{
-    BuildOptions, DEFAULT_NAME, DEFAULT_PADDING, DEFAULT_TEMPERATURE, Particle, Phase, RelaxFrame,
-    Sizing,
+    BuildOptions, DEFAULT_NAME, DEFAULT_PADDING, DEFAULT_TEMPERATURE, Membrane, Particle, Phase,
+    RelaxFrame, Sizing,
 };
 use isolf::protein::Protein;
 use isolf::protein::aicg2p::{
@@ -48,6 +49,10 @@ use isolf::protein::aicg2p::{
 };
 use isolf::protein::params::render_aicg2p_itp;
 use isolf::tubule::TubuleRadius;
+use isolf::umbrella::{
+    self, DEFAULT_UMBRELLA_BOX_Z, DEFAULT_UMBRELLA_K, LipidProteinParams, ProbeParamOverrides,
+    UmbrellaManifest,
+};
 use isolf::vesicle::VesicleRadius;
 use isolf::vmd::{Layout, VmdOptions, VmdSource};
 
@@ -202,6 +207,63 @@ struct Cli {
     command: Command,
 }
 
+/// Umbrella sampling execution mode (`isolf umbrella --mode`).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum UmbrellaModeArg {
+    /// Independent per-window directories (win_1/, win_2/, ...) (default).
+    #[default]
+    Windows,
+    /// Single multi-replica GENESIS REUS ([REMD] type1 = RESTRAINT) setup.
+    Reus,
+}
+
+/// Dynamics ensemble for umbrella sampling (`isolf umbrella --ensemble`).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum UmbrellaEnsembleArg {
+    /// Constant volume NVT (recommended for fixed-area bilayer PMFs, default).
+    #[default]
+    Nvt,
+    /// Constant pressure NPT (Z-FIXED-SEMI-ISO).
+    Npt,
+}
+
+impl UmbrellaEnsembleArg {
+    fn to_ensemble(self) -> Ensemble {
+        match self {
+            Self::Nvt => Ensemble::Nvt,
+            Self::Npt => Ensemble::Npt,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Nvt => "nvt",
+            Self::Npt => "npt",
+        }
+    }
+}
+
+/// GENESIS restraint function (`isolf umbrella --restraint-func`).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RestraintFuncArg {
+    /// Center-of-mass distance (`DISTMASS`, default).
+    #[default]
+    #[value(name = "distmass")]
+    DistMass,
+    /// Geometric-center distance (`DIST`).
+    #[value(name = "dist")]
+    Dist,
+}
+
+impl RestraintFuncArg {
+    fn as_genesis_str(self) -> &'static str {
+        match self {
+            Self::DistMass => "DISTMASS",
+            Self::Dist => "DIST",
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Build a flat lipid bilayer.
@@ -212,6 +274,8 @@ enum Command {
     Tubule(TubuleArgs),
     /// Coarse-grain a protein PDB/mmCIF with AICG2+ or Clementi Gō for GENESIS.
     Protein(ProteinArgs),
+    /// Set up amino-acid bilayer umbrella sampling (US / REUS) and MBAR inputs for GENESIS.
+    Umbrella(UmbrellaArgs),
     /// List all supported iSoLF lipids.
     Lipids(LipidsArgs),
     /// Update isolf in place to the latest release.
@@ -712,10 +776,10 @@ impl ControlArgs {
 
         if want_inp {
             // Validate step/period divisibility up front (placeholder seed & box).
-            isolf::inp::minimization("x", &min.to_params([1.0; 3], temperature))
+            isolf::inp::minimization("x", &min.to_params([20.0; 3], temperature))
                 .map_err(|e| format!("--min: {e}"))?;
             let check_dyn = |flag: &str, spec: DynSpec| -> Result<(), Box<dyn Error>> {
-                let p = spec.to_params(temperature, 1);
+                let p = spec.to_params(temperature, 1, [20.0; 3]);
                 let res = if is_npt {
                     isolf::inp::npt("x", "x", "x", &p)
                 } else {
@@ -953,6 +1017,233 @@ impl ProteinArgs {
     }
 }
 
+/// Arguments for `isolf umbrella`.
+#[derive(clap::Args, Debug)]
+#[command(
+    about = "Set up amino-acid bilayer umbrella sampling (US / REUS) and MBAR files for GENESIS",
+    long_about = "\
+Build umbrella-sampling windows placing a single coarse-grained amino-acid bead
+at specified z positions across a lipid bilayer centered at z = 0, together with
+decoupled lipid_protein.itp ([ cg_ISOLF_parameters ] + head WCA/LJ), GENESIS
+atdyn control files (DISTMASS + direction1 = Z2), mbar_analysis (mbar.inp), and
+a machine-readable manifest.json for Bayesian-optimization workflows.
+
+BO iteration helpers:
+  --update-params  Rewrite only lipid_protein.itp in -o <DIR> (< 1 ms).
+  --extract-cv     Parse RESTR_CVS1 from completed atdyn logs into cv/{}.dat."
+)]
+struct UmbrellaArgs {
+    // ---- Probe & lipid-protein parameters ----
+    /// Amino acid probe(s): 3-letter code(s) separated by commas, or 'all' for all 20 AAs.
+    #[arg(long, value_name = "AA[,...]|all", help_heading = "Probe & parameters")]
+    probe: Option<String>,
+
+    /// Optional charge override (e) for the single-bead amino acid probe.
+    #[arg(long, value_name = "Q", help_heading = "Probe & parameters")]
+    charge: Option<f64>,
+
+    /// Lipid–protein parameter file ([cg_ISOLF_parameters], optional [cg_WCA_parameters] / [cg_LJ_parameters]).
+    #[arg(long, value_name = "FILE", help_heading = "Probe & parameters")]
+    params: Option<PathBuf>,
+
+    /// Override probe [ cg_ISOLF_parameters ] epsilon in kJ/mol [default: 1.5].
+    #[arg(long, value_name = "KJ/MOL", help_heading = "Probe & parameters")]
+    eps: Option<f64>,
+
+    /// Override probe [ cg_ISOLF_parameters ] sigma in nm [default: rmin / 2^(1/6)].
+    #[arg(long, value_name = "NM", help_heading = "Probe & parameters")]
+    sigma: Option<f64>,
+
+    /// Override probe [ cg_ISOLF_parameters ] omega in nm [default: 1.0].
+    #[arg(long, value_name = "NM", help_heading = "Probe & parameters")]
+    omega: Option<f64>,
+
+    /// Do not auto-generate Lorentz–Berthelot WCA repulsion between the probe and lipid head beads.
+    #[arg(long, help_heading = "Probe & parameters")]
+    no_auto_wca: bool,
+
+    // ---- Bilayer ----
+    /// Reuse a pre-equilibrated iSoLF bilayer .gro file instead of building a new bilayer.
+    #[arg(
+        long,
+        value_name = "GRO",
+        conflicts_with_all = ["lipids", "upper", "lower", "count", "box_size"],
+        help_heading = "Bilayer"
+    )]
+    bilayer: Option<PathBuf>,
+
+    /// Lipid composition for both leaflets (symmetric bilayer) as NAME=WEIGHT pairs.
+    #[arg(
+        short = 'L',
+        long,
+        value_name = "SPEC",
+        conflicts_with_all = ["upper", "lower"],
+        help_heading = "Bilayer"
+    )]
+    lipids: Vec<String>,
+
+    /// Upper leaflet composition as NAME=WEIGHT pairs.
+    #[arg(short = 'u', long, value_name = "SPEC", help_heading = "Bilayer")]
+    upper: Vec<String>,
+
+    /// Lower leaflet composition as NAME=WEIGHT pairs.
+    #[arg(short = 'l', long, value_name = "SPEC", help_heading = "Bilayer")]
+    lower: Vec<String>,
+
+    /// Lipids per leaflet: <N> for both, or "up=<N>,lo=<N>" [default: 64].
+    #[arg(short = 'n', long, value_name = "SPEC", help_heading = "Bilayer")]
+    count: Vec<String>,
+
+    /// In-plane box size in nm: <L> for square, or "x=<L>,y=<L>".
+    #[arg(
+        short = 'b',
+        long = "box",
+        value_name = "SPEC",
+        help_heading = "Bilayer"
+    )]
+    box_size: Vec<String>,
+
+    /// Box length along z in nm (expanded automatically if windows require more clearance).
+    #[arg(
+        long,
+        value_name = "NM",
+        default_value_t = DEFAULT_UMBRELLA_BOX_Z,
+        help_heading = "Bilayer"
+    )]
+    box_z: f64,
+
+    // ---- Umbrella sampling ----
+    /// Window z centers in nm: start..end:step, start..end/count, or comma list.
+    #[arg(
+        long,
+        value_name = "SPEC",
+        default_value = "0.0..4.0:0.1",
+        help_heading = "Umbrella sampling"
+    )]
+    z: String,
+
+    /// Harmonic force constant k in kcal/mol/A^2 (GENESIS convention: U = k * (dz - z0)^2).
+    #[arg(
+        short = 'k',
+        long,
+        value_name = "K",
+        default_value_t = DEFAULT_UMBRELLA_K,
+        help_heading = "Umbrella sampling"
+    )]
+    k: f64,
+
+    /// Execution mode: independent windows (default) or REUS ([REMD] type1 = RESTRAINT).
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        default_value_t = UmbrellaModeArg::Windows,
+        value_name = "MODE",
+        help_heading = "Umbrella sampling"
+    )]
+    mode: UmbrellaModeArg,
+
+    /// Dynamics ensemble for equilibration and production: nvt (default) or npt.
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        default_value_t = UmbrellaEnsembleArg::Nvt,
+        value_name = "ENSEMBLE",
+        help_heading = "Umbrella sampling"
+    )]
+    ensemble: UmbrellaEnsembleArg,
+
+    /// Replica-exchange attempt interval in MD steps (only used with --mode reus).
+    #[arg(
+        long,
+        value_name = "STEPS",
+        default_value_t = 1000,
+        help_heading = "Umbrella sampling"
+    )]
+    exchange_period: usize,
+
+    /// Restraint distance definition: distmass (COM, default) or dist (geometric center).
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        default_value_t = RestraintFuncArg::DistMass,
+        value_name = "FUNC",
+        help_heading = "Umbrella sampling"
+    )]
+    restraint_func: RestraintFuncArg,
+
+    /// Number of blocks for MBAR error estimation.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 5,
+        help_heading = "Umbrella sampling"
+    )]
+    mbar_blocks: usize,
+
+    /// PMF histogram grid spacing in Angstrom for mbar.inp.
+    #[arg(
+        long,
+        value_name = "A",
+        default_value_t = 0.5,
+        help_heading = "Umbrella sampling"
+    )]
+    mbar_grid_step: f64,
+
+    // ---- Workflow actions (BO loop helpers) ----
+    /// Rewrite only lipid_protein.itp in --out <DIR> from --params / --eps / --sigma / --omega.
+    #[arg(
+        long,
+        conflicts_with = "extract_cv",
+        help_heading = "BO workflow actions"
+    )]
+    update_params: bool,
+
+    /// Extract RESTR_CVS1 from GENESIS atdyn logs in --out <DIR> into cv/{}.dat for mbar_analysis.
+    #[arg(
+        long,
+        conflicts_with = "update_params",
+        help_heading = "BO workflow actions"
+    )]
+    extract_cv: bool,
+
+    /// Equilibration steps to discard when running --extract-cv.
+    #[arg(
+        long,
+        value_name = "STEPS",
+        default_value_t = 0,
+        help_heading = "BO workflow actions"
+    )]
+    discard: usize,
+
+    // ---- Output files ----
+    /// Output (or existing campaign) directory.
+    #[arg(
+        short = 'o',
+        long,
+        value_name = "DIR",
+        default_value = ".",
+        help_heading = "Output files"
+    )]
+    out: PathBuf,
+
+    /// Also write per-window .pdb files.
+    #[arg(long, help_heading = "Output files")]
+    pdb: bool,
+
+    /// Also write a shared system.psf structure file.
+    #[arg(long, help_heading = "Output files")]
+    psf: bool,
+
+    #[command(flatten)]
+    controls: ControlArgs,
+
+    #[command(flatten)]
+    general: GeneralArgs,
+}
+
 /// Arguments for `isolf lipids`.
 #[derive(clap::Args, Debug)]
 struct LipidsArgs {
@@ -997,6 +1288,7 @@ impl MinSpec {
             crdout_period: self.crdout_period,
             rstout_period: self.rstout_period,
             nbupdate_period: self.nbupdate_period,
+            cg_ele_cutoff: isolf::inp::ele_cutoff_for_box(box_size),
         }
     }
 }
@@ -1044,7 +1336,12 @@ impl DynSpec {
         }
     }
 
-    fn to_params(self, default_temperature: f64, seed: u64) -> isolf::inp::Dynamics {
+    fn to_params(
+        self,
+        default_temperature: f64,
+        seed: u64,
+        box_size: [f64; 3],
+    ) -> isolf::inp::Dynamics {
         isolf::inp::Dynamics {
             temperature: self.temperature.unwrap_or(default_temperature),
             num_steps: self.num_steps,
@@ -1055,6 +1352,7 @@ impl DynSpec {
             stoptr_period: self.stoptr_period,
             nbupdate_period: self.nbupdate_period,
             seed: self.seed.unwrap_or(seed),
+            cg_ele_cutoff: isolf::inp::ele_cutoff_for_box(box_size),
         }
     }
 }
@@ -1112,6 +1410,12 @@ fn main() {
             a.general.verbose,
             a.general.no_color,
         ),
+        Command::Umbrella(a) => (
+            a.general.ascii,
+            a.general.quiet,
+            a.general.verbose,
+            a.general.no_color,
+        ),
         Command::Lipids(a) => (a.ascii, false, false, a.no_color),
         Command::Update | Command::Uninstall => (false, false, false, false),
     };
@@ -1130,6 +1434,7 @@ fn dispatch(command: Command, color: bool, unicode: bool) -> Result<(), Box<dyn 
         Command::Vesicle(args) => run_vesicle(args),
         Command::Tubule(args) => run_tubule(args),
         Command::Protein(args) => run_protein(args),
+        Command::Umbrella(args) => run_umbrella(args),
         Command::Lipids(_) => {
             print_lipids(&ForceField::isolf(), color, unicode);
             Ok(())
@@ -1239,6 +1544,7 @@ fn parse_protein_specs(specs: &[String]) -> Result<Vec<ProteinSpec>, Box<dyn Err
         let mut placement = ProteinPlacement::default();
         let mut options = ProteinOptions::default();
         let mut name_override: Option<String> = None;
+        let mut single_charge: Option<f64> = None;
 
         for tok in tokens {
             let (k, v) = tok
@@ -1269,6 +1575,7 @@ fn parse_protein_specs(specs: &[String]) -> Result<Vec<ProteinSpec>, Box<dyn Err
                 "clearance" | "margin" => {
                     placement.clearance = parse_nonneg_f64(val, "clearance in nm")?;
                 }
+                "charge" | "q" => single_charge = Some(parse_f64(val, "charge in e")?),
                 "model" | "ff" => {
                     options.model = match val.to_ascii_lowercase().as_str() {
                         "aicg2+" | "aicg2p" | "aicg2" => ProteinModel::Aicg2Plus,
@@ -1332,14 +1639,25 @@ fn parse_protein_specs(specs: &[String]) -> Result<Vec<ProteinSpec>, Box<dyn Err
                 "name" => name_override = Some(val.to_string()),
                 other => {
                     return Err(format!(
-                        "--protein: unknown key '{other}' (use z, x, y, tilt, rot, copies, clearance, model, scale, safe-dihedral, idr, idr-local, idr-nonlocal, charges, name)"
+                        "--protein: unknown key '{other}' (use z, x, y, tilt, rot, copies, clearance, charge, model, scale, safe-dihedral, idr, idr-local, idr-nonlocal, charges, name)"
                     )
                     .into());
                 }
             }
         }
 
-        let protein = Protein::from_file(Path::new(path_str), name_override.as_deref(), &options)?;
+        let protein = if let Some(aa) = path_str
+            .strip_prefix("aa:")
+            .or_else(|| path_str.strip_prefix("AA:"))
+        {
+            let mut p = Protein::single_bead(aa, single_charge)?;
+            if let Some(n) = name_override {
+                p.name = isolf::protein::sanitize_mol_name(&n);
+            }
+            p
+        } else {
+            Protein::from_file(Path::new(path_str), name_override.as_deref(), &options)?
+        };
         out.push(ProteinSpec { protein, placement });
     }
     Ok(out)
@@ -1855,6 +2173,577 @@ fn render_protein_log(
     let _ = writeln!(s, "  Rc         : {:.3} nm", protein.circumsphere_radius());
     let _ = writeln!(s, "  net charge : {:+.3} e", protein.net_charge());
     s
+}
+
+/// Parse `--probe` into canonical 3-letter amino acid names (`all` -> all 20 AAs).
+fn parse_probe_list(spec: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let trimmed = spec.trim();
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok(Protein::all_amino_acid_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect());
+    }
+    let mut out = Vec::new();
+    for tok in trimmed.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let p = Protein::single_bead(tok, None)?;
+        if !out.contains(&p.name) {
+            out.push(p.name);
+        }
+    }
+    if out.is_empty() {
+        return Err("--probe: expected an amino acid code (e.g. TRP) or 'all'".into());
+    }
+    Ok(out)
+}
+
+/// Collect campaign directories (either `root` itself if it has `manifest.json`,
+/// or immediate subdirectories containing `manifest.json`).
+fn discover_umbrella_dirs(root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    if root.join("manifest.json").is_file() {
+        return Ok(vec![root.to_path_buf()]);
+    }
+    let mut dirs = Vec::new();
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() && p.join("manifest.json").is_file() {
+                dirs.push(p);
+            }
+        }
+    }
+    dirs.sort();
+    if dirs.is_empty() {
+        return Err(format!(
+            "no manifest.json found in {} (or its immediate subdirectories)",
+            root.display()
+        )
+        .into());
+    }
+    Ok(dirs)
+}
+
+fn run_umbrella(args: UmbrellaArgs) -> Result<(), Box<dyn Error>> {
+    let force_field = ForceField::isolf();
+
+    let base_params = match &args.params {
+        Some(path) => {
+            let content = fs::read_to_string(path)
+                .map_err(|e| format!("--params: failed to read {}: {e}", path.display()))?;
+            Some(LipidProteinParams::parse(&content)?)
+        }
+        None => None,
+    };
+    let overrides = ProbeParamOverrides {
+        epsilon: args.eps,
+        sigma: args.sigma,
+        omega: args.omega,
+        auto_head_wca: !args.no_auto_wca,
+    };
+
+    // ---- Fast BO action 1: update only lipid_protein.itp ----
+    if args.update_params {
+        let dirs = discover_umbrella_dirs(&args.out)?;
+        report::header();
+        report::section("Update");
+        for dir in &dirs {
+            let manifest_raw = fs::read_to_string(dir.join("manifest.json"))?;
+            let manifest = umbrella::parse_manifest(&manifest_raw)?;
+            let probe_name = manifest.probe.as_str();
+            let resolved = LipidProteinParams::resolve(
+                &force_field,
+                &[probe_name],
+                base_params.as_ref(),
+                overrides,
+            )?;
+            write(&dir.join("lipid_protein.itp"), &resolved.render_itp())?;
+            report::ok(
+                probe_name,
+                &format!(
+                    "updated {} ({} ISOLF, {} WCA, {} LJ)",
+                    dir.join("lipid_protein.itp").display(),
+                    resolved.isolf.len(),
+                    resolved.wca.len(),
+                    resolved.lj.len()
+                ),
+            );
+        }
+        return Ok(());
+    }
+
+    // ---- Fast BO action 2: extract RESTR_CVS1 -> cv/{}.dat ----
+    if args.extract_cv {
+        let dirs = discover_umbrella_dirs(&args.out)?;
+        report::header();
+        report::section("Extract CV");
+        for dir in &dirs {
+            let manifest_raw = fs::read_to_string(dir.join("manifest.json"))?;
+            let manifest = umbrella::parse_manifest(&manifest_raw)?;
+            let cv_dir = dir.join("cv");
+            fs::create_dir_all(&cv_dir)?;
+
+            let mut total_samples = 0usize;
+            if manifest.mode == "reus" {
+                let mut logs = Vec::with_capacity(manifest.n_windows);
+                let mut rems = Vec::with_capacity(manifest.n_windows);
+                for i in 1..=manifest.n_windows {
+                    let log_p = dir.join(format!("prod_reus_{i}.log"));
+                    let rem_p = dir.join(format!("prod_reus_{i}.rem"));
+                    logs.push(fs::read_to_string(&log_p).map_err(|e| {
+                        format!("--extract-cv: failed to read {}: {e}", log_p.display())
+                    })?);
+                    rems.push(fs::read_to_string(&rem_p).map_err(|e| {
+                        format!("--extract-cv: failed to read {}: {e}", rem_p.display())
+                    })?);
+                }
+                let pairs: Vec<(&str, &str)> = logs
+                    .iter()
+                    .zip(&rems)
+                    .map(|(l, r)| (l.as_str(), r.as_str()))
+                    .collect();
+                let demuxed = umbrella::demux_reus_cv(&pairs, args.discard)?;
+                for (idx, rows) in demuxed.iter().enumerate() {
+                    total_samples += rows.len();
+                    write(
+                        &cv_dir.join(format!("{}.dat", idx + 1)),
+                        &umbrella::render_cv_dat(rows),
+                    )?;
+                }
+            } else {
+                for i in 1..=manifest.n_windows {
+                    let log_p = dir.join(format!("win_{i}")).join("prod.log");
+                    let log_txt = fs::read_to_string(&log_p).map_err(|e| {
+                        format!("--extract-cv: failed to read {}: {e}", log_p.display())
+                    })?;
+                    let rows = umbrella::extract_cv_from_log(&log_txt, args.discard)?;
+                    total_samples += rows.len();
+                    write(
+                        &cv_dir.join(format!("{i}.dat")),
+                        &umbrella::render_cv_dat(&rows),
+                    )?;
+                }
+            }
+            report::ok(
+                &manifest.probe,
+                &format!(
+                    "{} windows {} {} samples -> {}",
+                    manifest.n_windows,
+                    report::dot(),
+                    report::thousands(total_samples),
+                    cv_dir.display()
+                ),
+            );
+        }
+        return Ok(());
+    }
+
+    // ---- Campaign build ----
+    let probe_spec = args
+        .probe
+        .as_deref()
+        .ok_or("missing probe amino acid: pass --probe <AA> (e.g. --probe TRP or --probe all)")?;
+    let probe_names = parse_probe_list(probe_spec)?;
+    if !args.k.is_finite() || args.k <= 0.0 {
+        return Err(format!("--k: '{}' must be a positive force constant", args.k).into());
+    }
+    if !args.box_z.is_finite() || args.box_z <= 0.0 {
+        return Err(format!("--box-z: '{}' must be a positive number of nm", args.box_z).into());
+    }
+    if args.mbar_blocks == 0 {
+        return Err("--mbar-blocks must be at least 1".into());
+    }
+    if !args.mbar_grid_step.is_finite() || args.mbar_grid_step <= 0.0 {
+        return Err(format!(
+            "--mbar-grid-step: '{}' must be positive",
+            args.mbar_grid_step
+        )
+        .into());
+    }
+    let z_windows = umbrella::parse_z_windows(&args.z)?;
+    if args.mode == UmbrellaModeArg::Reus && z_windows.len() < 2 {
+        return Err("--mode reus requires at least 2 umbrella windows".into());
+    }
+    if args.mode == UmbrellaModeArg::Reus && args.exchange_period == 0 {
+        return Err("--exchange-period must be positive for --mode reus".into());
+    }
+
+    let is_npt = matches!(args.ensemble, UmbrellaEnsembleArg::Npt);
+    let (controls, _) = args.controls.prepare(true, is_npt)?;
+    if args.mode == UmbrellaModeArg::Reus {
+        if !controls
+            .equil
+            .num_steps
+            .is_multiple_of(args.exchange_period)
+        {
+            return Err(format!(
+                "--equil steps ({}) must be a multiple of --exchange-period ({})",
+                controls.equil.num_steps, args.exchange_period
+            )
+            .into());
+        }
+        if !controls.prod.num_steps.is_multiple_of(args.exchange_period) {
+            return Err(format!(
+                "--prod steps ({}) must be a multiple of --exchange-period ({})",
+                controls.prod.num_steps, args.exchange_period
+            )
+            .into());
+        }
+    }
+
+    // Validate parameters up front before building the bilayer.
+    let mut resolved_params = Vec::with_capacity(probe_names.len());
+    for name in &probe_names {
+        resolved_params.push(LipidProteinParams::resolve(
+            &force_field,
+            &[name.as_str()],
+            base_params.as_ref(),
+            overrides,
+        )?);
+    }
+
+    let seed = args.general.seed.unwrap_or_else(|| rand::rng().random());
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let max_abs_z = z_windows.iter().map(|z| z.abs()).fold(0.0_f64, f64::max);
+    let min_box_z = args.box_z.max(2.0 * (max_abs_z + 5.0));
+
+    // Either load a pre-equilibrated bilayer .gro or build one freshly.
+    let mut bilayer = if let Some(gro_path) = &args.bilayer {
+        let content = fs::read_to_string(gro_path)
+            .map_err(|e| format!("--bilayer: failed to read {}: {e}", gro_path.display()))?;
+        isolf::gro::parse_bilayer(&content, &force_field)?
+    } else {
+        let (upper, lower) =
+            resolve_compositions(&args.lipids, &args.upper, &args.lower, "--upper", "--lower")?;
+        let counts = parse_count_spec(&args.count)?;
+        let box_xy = parse_box_spec(&args.box_size)?;
+        let counts = if counts.is_none() && box_xy.is_none() {
+            Some((64, 64))
+        } else {
+            counts
+        };
+        let (sizing, _) =
+            resolve_membrane_sizing(false, &force_field, &upper, &lower, counts, box_xy)
+                .map_err(|e| enrich_build_error(&force_field, e))?;
+        let build_opts = BuildOptions {
+            padding: 0.5 * (min_box_z - 4.0).max(4.0),
+            ..BuildOptions::default()
+        };
+        report::header();
+        report::section("Build");
+        let spin = report::spin("building reference bilayer");
+        let built = Membrane::build(
+            &force_field,
+            DEFAULT_NAME,
+            &upper,
+            &lower,
+            sizing,
+            &build_opts,
+            &mut rng,
+        )
+        .map_err(|e| enrich_build_error(&force_field, e))?;
+        spin.finish();
+        built
+    };
+
+    if args.bilayer.is_some() {
+        report::header();
+        report::section("Build");
+    }
+    umbrella::center_bilayer_at_origin(&mut bilayer, min_box_z);
+
+    let group2 = umbrella::bilayer_selection(&bilayer.lipid_counts);
+    let func_str = args.restraint_func.as_genesis_str();
+    let ensemble = args.ensemble.to_ensemble();
+    let mode_label = match args.mode {
+        UmbrellaModeArg::Windows => "windows",
+        UmbrellaModeArg::Reus => "reus",
+    };
+    let z_angstrom: Vec<f64> = z_windows.iter().map(|&z| z * 10.0).collect();
+    let k_vec = vec![args.k; z_windows.len()];
+
+    let z_min_a = z_angstrom.iter().copied().fold(f64::INFINITY, f64::min);
+    let z_max_a = z_angstrom.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let pad_a = args.mbar_grid_step;
+    let grid_min_a = z_min_a - pad_a;
+    let grid_max_a = z_max_a + pad_a;
+    let grid_points =
+        (((grid_max_a - grid_min_a) / args.mbar_grid_step).round() as usize + 1).max(3);
+
+    // Pre-render force-field includes shared across all probes.
+    let isolf_itp = force_field.to_itp();
+    let aicg2p_itp = render_aicg2p_itp();
+
+    let multi_probe = probe_names.len() > 1;
+    for (probe_name, lp_params) in probe_names.iter().zip(&resolved_params) {
+        let probe = Protein::single_bead(probe_name, args.charge)?;
+        let campaign_dir = if multi_probe {
+            args.out.join(probe_name)
+        } else {
+            args.out.clone()
+        };
+        fs::create_dir_all(&campaign_dir)?;
+
+        // Shared topology files.
+        write(&campaign_dir.join("aicg2p.itp"), &aicg2p_itp)?;
+        write(&campaign_dir.join("isolf.itp"), &isolf_itp)?;
+        write(
+            &campaign_dir.join("lipid_protein.itp"),
+            &lp_params.render_itp(),
+        )?;
+        write(
+            &campaign_dir.join(format!("{probe_name}.itp")),
+            &probe.to_itp(),
+        )?;
+        write(
+            &campaign_dir.join("system.top"),
+            &umbrella::render_umbrella_top(&probe, &bilayer.lipid_counts, "./"),
+        )?;
+
+        if args.psf {
+            let sample_parts =
+                umbrella::build_window_particles(&bilayer, &probe, z_windows[0], &force_field);
+            write(
+                &campaign_dir.join("system.psf"),
+                &umbrella::render_umbrella_psf(&sample_parts, probe_name),
+            )?;
+        }
+
+        let group1 = format!("rnam:{probe_name}");
+        let min_params = controls
+            .min
+            .to_params(bilayer.box_size, controls.temperature);
+        match args.mode {
+            UmbrellaModeArg::Windows => {
+                for (idx, (&z_nm, &z_a)) in z_windows.iter().zip(&z_angstrom).enumerate() {
+                    let id = idx + 1;
+                    let win_dir = campaign_dir.join(format!("win_{id}"));
+                    fs::create_dir_all(&win_dir)?;
+                    let parts =
+                        umbrella::build_window_particles(&bilayer, &probe, z_nm, &force_field);
+                    let title = format!("{probe_name} window {id} z={z_nm:.3}nm");
+                    write(
+                        &win_dir.join("system.gro"),
+                        &isolf::gro::render(&parts, &title, bilayer.box_size),
+                    )?;
+                    if args.pdb {
+                        write(
+                            &win_dir.join("system.pdb"),
+                            &isolf::pdb::render(&parts, &title),
+                        )?;
+                    }
+                    let restraint = ZRestraint {
+                        group1: &group1,
+                        group2: &group2,
+                        function: func_str,
+                        direction: "Z2",
+                        constant: args.k,
+                        reference_angstrom: z_a,
+                    };
+                    write(
+                        &win_dir.join("min.inp"),
+                        &isolf::inp::minimization_with_restraint(
+                            "../system.top",
+                            "./system.gro",
+                            "min",
+                            &min_params,
+                            Some(&restraint),
+                        )?,
+                    )?;
+                    let eq_seed = rng.random_range(1..=MAX_ISEED);
+                    let pr_seed = rng.random_range(1..=MAX_ISEED);
+                    write(
+                        &win_dir.join("equil.inp"),
+                        &isolf::inp::dynamics_with_restraint(
+                            ensemble,
+                            "../system.top",
+                            "./system.gro",
+                            "./min.rst",
+                            "equil",
+                            &controls.equil.to_params(
+                                controls.temperature,
+                                eq_seed,
+                                bilayer.box_size,
+                            ),
+                            Some(&restraint),
+                        )?,
+                    )?;
+                    write(
+                        &win_dir.join("prod.inp"),
+                        &isolf::inp::dynamics_with_restraint(
+                            ensemble,
+                            "../system.top",
+                            "./system.gro",
+                            "./equil.rst",
+                            "prod",
+                            &controls.prod.to_params(
+                                controls.temperature,
+                                pr_seed,
+                                bilayer.box_size,
+                            ),
+                            Some(&restraint),
+                        )?,
+                    )?;
+                }
+            }
+            UmbrellaModeArg::Reus => {
+                for (idx, (&z_nm, &z_a)) in z_windows.iter().zip(&z_angstrom).enumerate() {
+                    let id = idx + 1;
+                    let parts =
+                        umbrella::build_window_particles(&bilayer, &probe, z_nm, &force_field);
+                    let title = format!("{probe_name} replica {id} z={z_nm:.3}nm");
+                    let gro_name = format!("win_{id}.gro");
+                    write(
+                        &campaign_dir.join(&gro_name),
+                        &isolf::gro::render(&parts, &title, bilayer.box_size),
+                    )?;
+                    if args.pdb {
+                        write(
+                            &campaign_dir.join(format!("win_{id}.pdb")),
+                            &isolf::pdb::render(&parts, &title),
+                        )?;
+                    }
+                    let restraint = ZRestraint {
+                        group1: &group1,
+                        group2: &group2,
+                        function: func_str,
+                        direction: "Z2",
+                        constant: args.k,
+                        reference_angstrom: z_a,
+                    };
+                    write(
+                        &campaign_dir.join(format!("min_{id}.inp")),
+                        &isolf::inp::minimization_with_restraint(
+                            "./system.top",
+                            &format!("./{gro_name}"),
+                            &format!("min_{id}"),
+                            &min_params,
+                            Some(&restraint),
+                        )?,
+                    )?;
+                }
+                let eq_seed = rng.random_range(1..=MAX_ISEED);
+                let eq_remd_seed = rng.random_range(1..=MAX_ISEED);
+                let pr_seed = rng.random_range(1..=MAX_ISEED);
+                let pr_remd_seed = rng.random_range(1..=MAX_ISEED);
+                let eq_reus = ReusConfig {
+                    exchange_period: args.exchange_period,
+                    iseed: eq_remd_seed,
+                    group1: &group1,
+                    group2: &group2,
+                    function: func_str,
+                    direction: "Z2",
+                    constants: &k_vec,
+                    references_angstrom: &z_angstrom,
+                };
+                let pr_reus = ReusConfig {
+                    iseed: pr_remd_seed,
+                    ..eq_reus
+                };
+                write(
+                    &campaign_dir.join("equil_reus.inp"),
+                    &isolf::inp::reus(
+                        ensemble,
+                        "./system.top",
+                        "./win_{}.gro",
+                        "./min_{}.rst",
+                        "equil_reus",
+                        &controls
+                            .equil
+                            .to_params(controls.temperature, eq_seed, bilayer.box_size),
+                        &eq_reus,
+                    )?,
+                )?;
+                write(
+                    &campaign_dir.join("prod_reus.inp"),
+                    &isolf::inp::reus(
+                        ensemble,
+                        "./system.top",
+                        "./win_{}.gro",
+                        "./equil_reus_{}.rst",
+                        "prod_reus",
+                        &controls
+                            .prod
+                            .to_params(controls.temperature, pr_seed, bilayer.box_size),
+                        &pr_reus,
+                    )?,
+                )?;
+            }
+        }
+
+        // GENESIS mbar_analysis input file.
+        let mbar_cfg = MbarConfig {
+            cvfile: "./cv/{}.dat",
+            fenefile: "./mbar.fene",
+            pmffile: "./mbar.pmf",
+            weightfile: Some("./weight_{}.dat"),
+            temperature: controls.temperature,
+            nblocks: args.mbar_blocks,
+            grid_min_angstrom: grid_min_a,
+            grid_max_angstrom: grid_max_a,
+            grid_points,
+            constants: &k_vec,
+            references_angstrom: &z_angstrom,
+        };
+        write(&campaign_dir.join("mbar.inp"), &isolf::inp::mbar(&mbar_cfg))?;
+
+        // Machine-readable BO manifest.
+        let manifest = UmbrellaManifest {
+            probe: probe_name,
+            mode: mode_label,
+            ensemble: args.ensemble.label(),
+            temperature_k: controls.temperature,
+            k_kcal_mol_a2: args.k,
+            restraint_function: func_str,
+            restraint_direction: "Z2",
+            box_nm: bilayer.box_size,
+            lipid_counts: &bilayer.lipid_counts,
+            z_windows_nm: &z_windows,
+        };
+        write(&campaign_dir.join("manifest.json"), &manifest.to_json())?;
+
+        report::ok(
+            probe_name,
+            &format!(
+                "{} windows (z = {:.2}..{:.2} nm, k = {} kcal/mol/A^2, {mode_label}) {} {} lipids",
+                z_windows.len(),
+                z_windows.first().copied().unwrap_or(0.0),
+                z_windows.last().copied().unwrap_or(0.0),
+                args.k,
+                report::dot(),
+                report::thousands(bilayer.total_lipids()),
+            ),
+        );
+    }
+
+    let out_dir = args.out.display().to_string();
+    let cd = if out_dir == "." {
+        String::new()
+    } else {
+        format!("cd {out_dir} && ")
+    };
+    let next = match args.mode {
+        UmbrellaModeArg::Windows => format!(
+            "run windows with atdyn (win_*/min.inp -> equil.inp -> prod.inp > prod.log), \
+             then: isolf umbrella --extract-cv -o {out_dir} && {cd}mbar_analysis mbar.inp"
+        ),
+        UmbrellaModeArg::Reus => format!(
+            "minimize min_*.inp, run mpirun -np {} atdyn equil_reus.inp -> prod_reus.inp, \
+             then: isolf umbrella --extract-cv -o {out_dir} && {cd}mbar_analysis mbar.inp",
+            z_windows.len()
+        ),
+    };
+    let prot_summary: Vec<(String, usize)> = probe_names.iter().map(|n| (n.clone(), 1)).collect();
+    report::summary(&report::Summary {
+        identity: "umbrella",
+        box_nm: bilayer.box_size,
+        proteins: &prot_summary,
+        lipids: &bilayer.lipid_counts,
+        leaflets: None,
+        beads: bilayer.particles.len() + 1,
+        next: Some(next),
+    });
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2703,8 +3592,12 @@ fn write_control_files(
 
     let prod_seed = rng.random_range(1..=MAX_ISEED);
     let equil_seed = rng.random_range(1..=MAX_ISEED);
-    let production = controls.prod.to_params(controls.temperature, prod_seed);
-    let equilibration = controls.equil.to_params(controls.temperature, equil_seed);
+    let production = controls
+        .prod
+        .to_params(controls.temperature, prod_seed, box_size);
+    let equilibration = controls
+        .equil
+        .to_params(controls.temperature, equil_seed, box_size);
 
     if is_npt {
         write(
@@ -2997,6 +3890,31 @@ mod tests {
             panic!("expected membrane subcommand");
         };
         assert_eq!(mem.common.proteins.len(), 2);
+
+        // Umbrella subcommand parsing.
+        let cli = Cli::try_parse_from([
+            "isolf",
+            "umbrella",
+            "--probe",
+            "TRP",
+            "-L",
+            "POPC",
+            "-n",
+            "64",
+            "--z",
+            "0.0..4.0:0.1",
+            "-k",
+            "0.5",
+            "--mode",
+            "reus",
+        ])
+        .unwrap();
+        let Command::Umbrella(umb) = cli.command else {
+            panic!("expected umbrella subcommand");
+        };
+        assert_eq!(umb.probe.as_deref(), Some("TRP"));
+        assert_eq!(umb.mode, UmbrellaModeArg::Reus);
+        assert_eq!(umb.k, 0.5);
 
         // Discovery subcommand.
         let cli = Cli::try_parse_from(["isolf", "lipids"]).unwrap();

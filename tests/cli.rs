@@ -532,3 +532,216 @@ fn embeds_proteins_in_membrane_vesicle_and_tubule_via_cli() {
 
     let _ = fs::remove_dir_all(&out);
 }
+
+#[test]
+fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
+    let out = temp_out("umbrella_campaign");
+
+    // 1. Build a reference bilayer to test --bilayer reuse.
+    let ref_dir = out.join("ref_bilayer");
+    let ref_run = isolf_bin()
+        .args([
+            "membrane",
+            "-L",
+            "POPC=3,POPS=1",
+            "-n",
+            "32",
+            "--seed",
+            "5",
+            "--no-color",
+            "--ascii",
+            "-o",
+        ])
+        .arg(&ref_dir)
+        .output()
+        .expect("run isolf membrane for ref bilayer");
+    assert!(
+        ref_run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ref_run.stderr)
+    );
+    let ref_gro = ref_dir.join("membrane.gro");
+
+    // 2. Independent windows mode using --bilayer + --psf + --pdb.
+    let win_dir = out.join("win_trp");
+    let win_run = isolf_bin()
+        .args([
+            "umbrella",
+            "--probe",
+            "TRP",
+            "--bilayer",
+            ref_gro.to_str().unwrap(),
+            "--z",
+            "0.0..1.5:0.5",
+            "-k",
+            "0.5",
+            "--psf",
+            "--pdb",
+            "--seed",
+            "9",
+            "--no-color",
+            "--ascii",
+            "-o",
+        ])
+        .arg(&win_dir)
+        .output()
+        .expect("run isolf umbrella windows");
+    assert!(
+        win_run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&win_run.stderr)
+    );
+    for file in [
+        "aicg2p.itp",
+        "isolf.itp",
+        "lipid_protein.itp",
+        "TRP.itp",
+        "system.top",
+        "system.psf",
+        "mbar.inp",
+        "manifest.json",
+    ] {
+        assert!(win_dir.join(file).exists(), "missing umbrella file {file}");
+    }
+    let min1 = fs::read_to_string(win_dir.join("win_1/min.inp")).unwrap();
+    assert!(min1.contains("group1                = rnam:TRP"));
+    assert!(min1.contains("group2                = rnam:POPC or rnam:POPS"));
+    assert!(min1.contains("function1             = DISTMASS"));
+    assert!(min1.contains("direction1            = Z2"));
+    assert!(min1.contains("cg_cutoffdist_ele"));
+    assert!(win_dir.join("win_4/system.pdb").exists());
+
+    // 3. Fast BO parameter update via --update-params.
+    let param_file = out.join("trial.txt");
+    fs::write(
+        &param_file,
+        "[cg_ISOLF_parameters]\nTRP 2.345 0.540 1.250\n[cg_LJ_parameters]\nTRP PHO 1.750 0.560\n",
+    )
+    .unwrap();
+    let upd = isolf_bin()
+        .args([
+            "umbrella",
+            "--update-params",
+            "--params",
+            param_file.to_str().unwrap(),
+            "--no-color",
+            "--ascii",
+            "-o",
+        ])
+        .arg(&win_dir)
+        .output()
+        .expect("run isolf umbrella --update-params");
+    assert!(
+        upd.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&upd.stderr)
+    );
+    let lp_itp = fs::read_to_string(win_dir.join("lipid_protein.itp")).unwrap();
+    assert!(lp_itp.contains("   TRP    2.345    0.540    1.250"));
+    assert!(lp_itp.contains("   TRP   PHO    1.750    0.560    1.400"));
+    assert!(!lp_itp.contains("   TRP   PHO    1.5"));
+
+    // 4. Mock GENESIS logs -> --extract-cv.
+    for i in 1..=4 {
+        let z0 = (i - 1) as f64 * 5.0;
+        let log = format!(
+            "INFO: STEP TIME RESTRAINT001 RESTR_CVS001\n\
+             INFO: 100 1.0 0.01 {:.4}\n\
+             INFO: 200 2.0 0.02 {:.4}\n",
+            z0 + 0.1,
+            z0 - 0.1
+        );
+        fs::write(win_dir.join(format!("win_{i}/prod.log")), log).unwrap();
+    }
+    let ext = isolf_bin()
+        .args([
+            "umbrella",
+            "--extract-cv",
+            "--discard",
+            "150",
+            "--no-color",
+            "--ascii",
+            "-o",
+        ])
+        .arg(&win_dir)
+        .output()
+        .expect("run isolf umbrella --extract-cv");
+    assert!(
+        ext.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ext.stderr)
+    );
+    let cv4 = fs::read_to_string(win_dir.join("cv/4.dat")).unwrap();
+    assert!(!cv4.contains("100 "));
+    assert!(cv4.contains("200      14.900000"));
+
+    // 5. REUS mode + multi-probe (`--probe TRP,ARG`) + single-bead `-p aa:TRP`.
+    let reus_dir = out.join("reus_multi");
+    let reus_run = isolf_bin()
+        .args([
+            "umbrella",
+            "--probe",
+            "TRP,ARG",
+            "-L",
+            "POPC",
+            "-n",
+            "32",
+            "--z",
+            "0.0..1.0:0.5",
+            "--mode",
+            "reus",
+            "--exchange-period",
+            "500",
+            "--equil",
+            "steps=1000,eneout=100,crdout=1000,rstout=1000",
+            "--prod",
+            "steps=1000,eneout=100,crdout=1000,rstout=1000",
+            "--seed",
+            "12",
+            "--no-color",
+            "--ascii",
+            "-o",
+        ])
+        .arg(&reus_dir)
+        .output()
+        .expect("run isolf umbrella reus multi");
+    assert!(
+        reus_run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&reus_run.stderr)
+    );
+    for aa in ["TRP", "ARG"] {
+        assert!(reus_dir.join(aa).join("equil_reus.inp").exists());
+        assert!(reus_dir.join(aa).join("prod_reus.inp").exists());
+        assert!(reus_dir.join(aa).join("mbar.inp").exists());
+    }
+    let aa_mem_dir = out.join("aa_mem");
+    let aa_mem = isolf_bin()
+        .args([
+            "membrane",
+            "-L",
+            "POPC",
+            "-n",
+            "32",
+            "-p",
+            "aa:TRP,z=1.5",
+            "--top",
+            "--seed",
+            "3",
+            "--no-color",
+            "--ascii",
+            "-o",
+        ])
+        .arg(&aa_mem_dir)
+        .output()
+        .expect("run isolf membrane -p aa:TRP");
+    assert!(
+        aa_mem.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&aa_mem.stderr)
+    );
+    assert!(aa_mem_dir.join("TRP.itp").exists());
+    assert!(aa_mem_dir.join("aicg2p.itp").exists());
+
+    let _ = fs::remove_dir_all(&out);
+}

@@ -8,6 +8,7 @@ Common builds and the flags behind them. Run `isolf membrane --help`, `isolf ves
 - [Tubules](#tubules)
 - [Phase-separated domains](#phase-separated-domains)
 - [Proteins (standalone and embedded)](#proteins-standalone-and-embedded)
+- [Umbrella sampling (amino-acid solvation PMFs)](#umbrella-sampling-amino-acid-solvation-pmfs)
 - [Leaflet balancing](#leaflet-balancing)
 - [Centering and padding](#centering-and-padding)
 - [GENESIS control files and temperature](#genesis-control-files-and-temperature)
@@ -152,7 +153,44 @@ isolf vesicle -L POPC -r 18 -p channel_opm.pdb,copies=6 --inp --vmd -o prot_vesi
 isolf tubule  -L POPC -r 10 -l 30 -p channel_opm.pdb,copies=4 --inp --vmd -o prot_tubule
 ```
 
-Supported `-p` keys: `z=<nm|center|keep>`, `x=<nm>`, `y=<nm>`, `tilt=<deg>`, `rot=<deg>`, `copies=<N>`, `clearance=<nm>` (default `0.15`), `model=<aicg2+|clementi>`, `scale=<general|average>`, `safe-dihedral=<0|1|3>`, `idr=<ranges>`, `idr-local=<ranges>`, `idr-nonlocal=<ranges>` (separate multiple ranges with `+` or `;`), `charges=<file>`, `name=<molname>`.
+Supported `-p` keys: `z=<nm|center|keep>`, `x=<nm>`, `y=<nm>`, `tilt=<deg>`, `rot=<deg>`, `copies=<N>`, `clearance=<nm>` (default `0.15`), `model=<aicg2+|clementi>`, `scale=<general|average>`, `safe-dihedral=<0|1|3>`, `idr=<ranges>`, `idr-local=<ranges>`, `idr-nonlocal=<ranges>` (separate multiple ranges with `+` or `;`), `charges=<file>`, `name=<molname>`. You can also place a single amino-acid bead directly with `-p aa:TRP,z=1.5[,x=...,y=...,charge=...]`.
+
+## Umbrella sampling (amino-acid solvation PMFs)
+
+Set up 1D umbrella sampling along the bilayer normal (`z`) for a single amino-acid bead to compute solvation PMFs and optimize iSoLFv2 lipid–protein parameters (e.g. via Bayesian optimization). Each window keeps the exact same lipid bilayer centered at `z = 0` (no lipids carved), places the single probe bead at maximum lateral clearance in the `z` slab, writes a decoupled `lipid_protein.itp` (`[ cg_ISOLF_parameters ]` plus Lorentz–Berthelot probe–head `[ cg_WCA_parameters ]` and optional `[ cg_LJ_parameters ]`), generates GENESIS `DISTMASS` + `direction1 = Z2` control files (`U = k * (dz - z0)^2`), a `mbar.inp` for `mbar_analysis`, and a machine-readable `manifest.json`:
+
+```bash
+# 41 independent windows from z = 0 to 4.0 nm (step 0.1 nm) for TRP in a 128-lipid POPC bilayer
+isolf umbrella --probe TRP -L POPC -n 64 --z 0.0..4.0:0.1 -k 0.5 -o us_trp
+
+# Reuse a pre-equilibrated bilayer .gro and run Replica-Exchange Umbrella Sampling (REUS)
+isolf umbrella --probe TRP --bilayer popc_eq.gro --z 0.0..4.0:0.1 --mode reus \
+      --exchange-period 1000 --params trial.txt -o reus_trp
+
+# Build campaigns for all 20 canonical amino acids at once (one subfolder per AA)
+isolf umbrella --probe all --bilayer popc_eq.gro --z 0.0..4.0:0.1 -o campaign_all
+
+# Fast Bayesian optimization iteration loop:
+# 1) Rewrite only lipid_protein.itp with the next candidate parameters (< 1 ms)
+isolf umbrella --update-params --params trial_02.txt -o us_trp
+# 2) Run atdyn across windows (or mpirun -np N atdyn equil_reus.inp / prod_reus.inp)
+# 3) Extract RESTR_CVS001 from atdyn logs (and demux REUS .rem files) into cv/{}.dat
+isolf umbrella --extract-cv --discard 50000 -o us_trp
+# 4) Compute PMF with GENESIS mbar_analysis
+(cd us_trp && mbar_analysis mbar.inp)
+```
+
+Example `--params` file:
+
+```ini
+[cg_ISOLF_parameters]
+; name  epsilon(kJ/mol)  sigma(nm)  omega(nm)
+TRP     2.200            0.540      1.150
+
+[cg_LJ_parameters]
+; optional explicit attraction to lipid head beads (overrides auto WCA for that pair)
+TRP PHO 1.800            0.550
+```
 
 ## Leaflet balancing
 
