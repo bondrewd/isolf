@@ -16,6 +16,8 @@
 //! box mode. The lighter leaflet sits at lower density until NPT compresses the
 //! shared box.
 
+use std::f64::consts::TAU;
+
 use rand::Rng;
 use rayon::prelude::*;
 
@@ -23,6 +25,7 @@ use crate::composition::Composition;
 use crate::error::BuildError;
 use crate::force_field::{ForceField, POTENTIAL_MINIMUM_FACTOR};
 use crate::pack;
+use crate::voronoi::wrap;
 
 /// Default system name written into the output files.
 pub const DEFAULT_NAME: &str = "CG membrane model";
@@ -38,7 +41,7 @@ pub const DEFAULT_PADDING: f64 = 10.0;
 /// Area expansion over close packing for the default energy-minimizing layout:
 /// lipids sit just past the bead potential minimum, so the start is low-energy
 /// and clash-free (the small extra area is what an NPT run then compresses out).
-const ENERGY_PACKING_AREA_FACTOR: f64 = 1.08;
+pub(crate) const ENERGY_PACKING_AREA_FACTOR: f64 = 1.08;
 
 /// Default relaxation budget for packing lipids: iterate until the largest bead
 /// overlap drops below the tolerance (nm) or the iteration cap is hit.
@@ -86,18 +89,39 @@ pub enum Sizing {
     },
 }
 
+/// Lateral lipid organization within each leaflet or shell.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Phase {
+    /// Uniform random mixing across the entire leaflet/shell (default).
+    #[default]
+    Random,
+    /// Contiguous stripes (flat membrane), latitude bands (vesicle), or axial
+    /// rings (tubule), sized to each domain's area fraction.
+    Stripe,
+    /// Circular raft (flat membrane / tubule) or polar cap (vesicle) formed by
+    /// the first domain, surrounded by the remaining lipids.
+    Raft,
+}
+
 /// Knobs that tune the build independently of the sizing mode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BuildOptions {
     /// Vacuum padding (nm) added on each side: along z for a flat membrane, on
-    /// every side for a vesicle.
+    /// every side for a vesicle, and along x/y for a periodic tubule.
     pub padding: f64,
+    /// Lateral domain layout within each leaflet/shell.
+    pub phase: Phase,
+    /// Offset phase domains between the two leaflets/shells (half-box shift on
+    /// membranes, opposite pole on vesicles, half-length + π shift on tubules).
+    pub anti_register: bool,
 }
 
 impl Default for BuildOptions {
     fn default() -> Self {
         Self {
             padding: DEFAULT_PADDING,
+            phase: Phase::Random,
+            anti_register: false,
         }
     }
 }
@@ -237,6 +261,7 @@ impl Membrane {
             plan.upper,
             upper_spacing,
             Leaflet::Upper,
+            options,
             rng,
             &mut molecule_id,
             &mut atom_id,
@@ -254,6 +279,7 @@ impl Membrane {
             plan.lower,
             lower_spacing,
             Leaflet::Lower,
+            options,
             rng,
             &mut molecule_id,
             &mut atom_id,
@@ -492,6 +518,219 @@ fn pack_grid_into_box(
     Ok(grid)
 }
 
+/// Area share of each phase domain (`0..composition.domain_count()`) weighted
+/// by each species' packing area (`(2^(1/6) · σ_max)²`), so every domain starts
+/// at the same local areal density and shared Lloyd CVT preserves domain walls.
+pub(crate) fn domain_area_fractions(
+    composition: &Composition,
+    counts: &[usize],
+    force_field: &ForceField,
+) -> Vec<f64> {
+    let mut areas = vec![0.0_f64; composition.domain_count()];
+    for (idx, (component, &count)) in composition.components().iter().zip(counts).enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let max_sigma = force_field
+            .lipid(&component.name)
+            .map(|l| {
+                l.beads
+                    .iter()
+                    .filter_map(|b| force_field.bead_type(b))
+                    .map(|bt| bt.interaction.sigma())
+                    .fold(0.0_f64, f64::max)
+            })
+            .unwrap_or(1.0);
+        let d = POTENTIAL_MINIMUM_FACTOR * max_sigma;
+        areas[composition.domain_of(idx)] += count as f64 * d * d;
+    }
+    let total: f64 = areas.iter().sum();
+    if total > 0.0 {
+        for area in &mut areas {
+            *area /= total;
+        }
+    }
+    areas
+}
+
+/// Exact area of the disk `{x² + y² ≤ r²}` clipped to `[-a, a] × [-b, b]`.
+fn disk_in_rect_area(r: f64, a: f64, b: f64) -> f64 {
+    if r <= 0.0 || a <= 0.0 || b <= 0.0 {
+        return 0.0;
+    }
+    let r2 = r * r;
+    if r2 >= a * a + b * b {
+        return 4.0 * a * b;
+    }
+    let x_hi = a.min(r);
+    let x_flat = if b < r {
+        (r2 - b * b).sqrt().min(x_hi)
+    } else {
+        0.0
+    };
+    let antideriv = |x: f64| {
+        let y = (r2 - x * x).max(0.0).sqrt();
+        0.5 * (x * y + r2 * (x / r).clamp(-1.0, 1.0).asin())
+    };
+    let quarter = b * x_flat + (antideriv(x_hi) - antideriv(x_flat));
+    4.0 * quarter
+}
+
+/// Solve for the radius `r` such that a disk clipped to `[0, bx) × [0, by)`
+/// covers exact area fraction `fraction ∈ [0, 1]`.
+fn solve_raft_radius(bx: f64, by: f64, fraction: f64) -> f64 {
+    let a = 0.5 * bx;
+    let b = 0.5 * by;
+    let target = fraction.clamp(0.0, 1.0) * bx * by;
+    let mut lo = 0.0_f64;
+    let mut hi = a.hypot(b);
+    for _ in 0..48 {
+        let mid = 0.5 * (lo + hi);
+        if disk_in_rect_area(mid, a, b) < target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
+enum PlaneDomainMode {
+    Random,
+    Stripe {
+        axis: usize,
+        shift: f64,
+        bounds: Vec<(f64, f64)>,
+    },
+    Raft {
+        center: [f64; 2],
+        radius: f64,
+    },
+}
+
+/// Phase-domain sampler on a periodic 2D rectangle `[0, box_xy[0]) × [0, box_xy[1])`.
+/// Shared by flat bilayers (`stripe_axis = 0`) and unrolled cylindrical tubules
+/// (`stripe_axis = 1`).
+pub(crate) struct PlaneDomainLayout {
+    box_xy: [f64; 2],
+    mode: PlaneDomainMode,
+}
+
+impl PlaneDomainLayout {
+    pub(crate) fn new(
+        phase: Phase,
+        domain_fracs: &[f64],
+        box_xy: [f64; 2],
+        stripe_axis: usize,
+        raft_center: [f64; 2],
+        anti_register: bool,
+    ) -> Self {
+        let active = domain_fracs.iter().filter(|&&f| f > 0.0).count();
+        let mode = if active <= 1 || phase == Phase::Random {
+            PlaneDomainMode::Random
+        } else {
+            match phase {
+                Phase::Random => PlaneDomainMode::Random,
+                Phase::Stripe => {
+                    let len = box_xy[stripe_axis];
+                    let mut bounds = Vec::with_capacity(domain_fracs.len());
+                    let mut cursor = 0.0_f64;
+                    for &f in domain_fracs {
+                        let next = (cursor + f * len).min(len);
+                        bounds.push((cursor, next));
+                        cursor = next;
+                    }
+                    let shift = if anti_register { 0.5 * len } else { 0.0 };
+                    PlaneDomainMode::Stripe {
+                        axis: stripe_axis,
+                        shift,
+                        bounds,
+                    }
+                }
+                Phase::Raft => {
+                    let f0 = domain_fracs.first().copied().unwrap_or(1.0);
+                    let radius = solve_raft_radius(box_xy[0], box_xy[1], f0);
+                    let center = if anti_register {
+                        [
+                            wrap(raft_center[0] + 0.5 * box_xy[0], box_xy[0]),
+                            wrap(raft_center[1] + 0.5 * box_xy[1], box_xy[1]),
+                        ]
+                    } else {
+                        raft_center
+                    };
+                    PlaneDomainMode::Raft { center, radius }
+                }
+            }
+        };
+        Self { box_xy, mode }
+    }
+
+    pub(crate) fn sample(&self, domain: usize, rng: &mut impl Rng) -> [f64; 2] {
+        let [bx, by] = self.box_xy;
+        match &self.mode {
+            PlaneDomainMode::Random => [rng.random_range(0.0..bx), rng.random_range(0.0..by)],
+            PlaneDomainMode::Stripe {
+                axis,
+                shift,
+                bounds,
+            } => {
+                let len = self.box_xy[*axis];
+                let (lo, hi) = bounds.get(domain).copied().unwrap_or((0.0, len));
+                let primary = if hi > lo {
+                    rng.random_range(lo..hi)
+                } else {
+                    lo
+                };
+                let primary = wrap(primary + *shift, len);
+                let secondary = rng.random_range(0.0..self.box_xy[1 - *axis]);
+                if *axis == 0 {
+                    [primary, secondary]
+                } else {
+                    [secondary, primary]
+                }
+            }
+            PlaneDomainMode::Raft { center, radius } => {
+                let half_x = 0.5 * bx;
+                let half_y = 0.5 * by;
+                let r2 = radius * radius;
+                let (dx, dy) = if domain == 0 {
+                    if *radius <= half_x.min(half_y) {
+                        let r = radius * rng.random::<f64>().sqrt();
+                        let theta = rng.random_range(0.0..TAU);
+                        let (sin_t, cos_t) = theta.sin_cos();
+                        (r * cos_t, r * sin_t)
+                    } else {
+                        let lx = radius.min(half_x);
+                        let ly = radius.min(half_y);
+                        let mut picked = (0.0, 0.0);
+                        for _ in 0..10_000 {
+                            let dx = rng.random_range(-lx..lx);
+                            let dy = rng.random_range(-ly..ly);
+                            if dx * dx + dy * dy <= r2 {
+                                picked = (dx, dy);
+                                break;
+                            }
+                        }
+                        picked
+                    }
+                } else {
+                    let mut picked = (half_x, half_y);
+                    for _ in 0..100_000 {
+                        let dx = rng.random_range(-half_x..half_x);
+                        let dy = rng.random_range(-half_y..half_y);
+                        if dx * dx + dy * dy > r2 {
+                            picked = (dx, dy);
+                            break;
+                        }
+                    }
+                    picked
+                };
+                [wrap(center[0] + dx, bx), wrap(center[1] + dy, by)]
+            }
+        }
+    }
+}
+
 /// Pre-resolved lipid template: all force-field lookups done once per species
 /// rather than once per placed bead.
 struct BeadTemplate<'a> {
@@ -502,9 +741,10 @@ struct BeadTemplate<'a> {
     z: f64,
 }
 
-/// Place `grid.count` lipids of `composition` at uniform-random positions in the
-/// `box_x` by `box_y` box, append them to `particles` (along with their packing
-/// radii and molecule bead ranges), and return the per-component molecule counts.
+/// Place `grid.count` lipids of `composition` in the `box_x` by `box_y` box
+/// (uniformly or phase-separated per `options.phase`), append them to
+/// `particles` (along with their packing radii and molecule bead ranges), and
+/// return the per-component molecule counts.
 #[allow(clippy::too_many_arguments)]
 fn place_leaflet(
     force_field: &ForceField,
@@ -514,6 +754,7 @@ fn place_leaflet(
     grid: LeafletGrid,
     spacing: f64,
     leaflet: Leaflet,
+    options: &BuildOptions,
     rng: &mut impl Rng,
     molecule_id: &mut usize,
     atom_id: &mut usize,
@@ -526,10 +767,21 @@ fn place_leaflet(
         return Ok(counts);
     }
 
+    let domain_fracs = domain_area_fractions(composition, &counts, force_field);
+    let layout = PlaneDomainLayout::new(
+        options.phase,
+        &domain_fracs,
+        [box_x, box_y],
+        0,
+        [0.5 * box_x, 0.5 * box_y],
+        options.anti_register && leaflet == Leaflet::Lower,
+    );
+
     // Resolve each species once: bead properties, packing radii, and chain z offsets.
-    let mut templates: Vec<(&str, Vec<BeadTemplate<'_>>, usize)> = Vec::with_capacity(counts.len());
+    let mut templates: Vec<(&str, Vec<BeadTemplate<'_>>, usize, usize)> =
+        Vec::with_capacity(counts.len());
     let mut extra_beads = 0usize;
-    for (component, &count) in composition.components().iter().zip(&counts) {
+    for (idx, (component, &count)) in composition.components().iter().zip(&counts).enumerate() {
         if count == 0 {
             continue;
         }
@@ -558,7 +810,12 @@ fn place_leaflet(
             }
         }
         extra_beads += beads.len() * count;
-        templates.push((lipid.name.as_str(), beads, count));
+        templates.push((
+            lipid.name.as_str(),
+            beads,
+            count,
+            composition.domain_of(idx),
+        ));
     }
 
     particles.reserve(extra_beads);
@@ -566,13 +823,13 @@ fn place_leaflet(
     ranges.reserve(grid.count);
 
     let start = particles.len();
-    for (lipid_name, beads, count) in &templates {
+    for (lipid_name, beads, count, domain) in &templates {
         for _ in 0..*count {
             *molecule_id += 1;
             let mol_start = particles.len();
-            // Uniform-random lateral placement; Lloyd's relaxation makes it uniform.
-            let x = rng.random_range(0.0..box_x);
-            let y = rng.random_range(0.0..box_y);
+            // Initial lateral placement (uniform or phase-separated); Lloyd's
+            // relaxation equalises the density while preserving domain boundaries.
+            let [x, y] = layout.sample(*domain, rng);
             for b in beads {
                 *atom_id += 1;
                 particles.push(Particle {
@@ -1190,5 +1447,128 @@ mod tests {
         assert_eq!(counts["DOPC"], 100);
         assert_eq!(counts["DOPS"], 100);
         assert_eq!(membrane.total_lipids(), 200);
+    }
+
+    #[test]
+    fn phase_raft_and_stripe_keep_domains_spatially_separated() {
+        let ff = force_field();
+        let comp = Composition::parse("DPPC=1,DOPC=3").unwrap();
+
+        // Circular raft: DPPC should sit much closer to the centre (0, 0) than DOPC.
+        let mut rng = StdRng::seed_from_u64(11);
+        let raft = Membrane::build(
+            &ff,
+            DEFAULT_NAME,
+            &comp,
+            &comp,
+            Sizing::Count {
+                upper: 200,
+                lower: 200,
+            },
+            &BuildOptions {
+                phase: Phase::Raft,
+                ..BuildOptions::default()
+            },
+            &mut rng,
+        )
+        .unwrap();
+        let mean_r = |res: &str| {
+            let (mut s, mut n) = (0.0, 0usize);
+            for mol in raft
+                .particles
+                .chunk_by(|a, b| a.molecule_id == b.molecule_id)
+            {
+                if mol[0].residue == res {
+                    s += mol[0].position[0].hypot(mol[0].position[1]);
+                    n += 1;
+                }
+            }
+            s / n as f64
+        };
+        assert!(
+            mean_r("DPPC") < mean_r("DOPC") * 0.65,
+            "DPPC raft did not stay central: DPPC r={:.2}, DOPC r={:.2}",
+            mean_r("DPPC"),
+            mean_r("DOPC")
+        );
+
+        // Stripe: contiguous x bands (DPPC in the lower x slab, DOPC in the upper x slab).
+        let mut rng = StdRng::seed_from_u64(12);
+        let stripe = Membrane::build(
+            &ff,
+            DEFAULT_NAME,
+            &comp,
+            &comp,
+            Sizing::Count {
+                upper: 200,
+                lower: 200,
+            },
+            &BuildOptions {
+                phase: Phase::Stripe,
+                ..BuildOptions::default()
+            },
+            &mut rng,
+        )
+        .unwrap();
+        let mean_x = |res: &str| {
+            let (mut s, mut n) = (0.0, 0usize);
+            for mol in stripe
+                .particles
+                .chunk_by(|a, b| a.molecule_id == b.molecule_id)
+            {
+                if mol[0].residue == res {
+                    s += mol[0].position[0];
+                    n += 1;
+                }
+            }
+            s / n as f64
+        };
+        assert!(
+            mean_x("DOPC") - mean_x("DPPC") > stripe.box_size[0] * 0.35,
+            "DPPC/DOPC stripes did not separate: DPPC x={:.2}, DOPC x={:.2}",
+            mean_x("DPPC"),
+            mean_x("DOPC")
+        );
+
+        // Anti-registered raft: upper DPPC near origin, lower DPPC far from origin.
+        let mut rng = StdRng::seed_from_u64(13);
+        let anti = Membrane::build(
+            &ff,
+            DEFAULT_NAME,
+            &comp,
+            &comp,
+            Sizing::Count {
+                upper: 200,
+                lower: 200,
+            },
+            &BuildOptions {
+                phase: Phase::Raft,
+                anti_register: true,
+                ..BuildOptions::default()
+            },
+            &mut rng,
+        )
+        .unwrap();
+        let (mut up_r, mut up_n, mut lo_r, mut lo_n) = (0.0, 0usize, 0.0, 0usize);
+        for mol in anti
+            .particles
+            .chunk_by(|a, b| a.molecule_id == b.molecule_id)
+        {
+            if mol[0].residue != "DPPC" {
+                continue;
+            }
+            let r = mol[0].position[0].hypot(mol[0].position[1]);
+            if mol[0].position[2] > 0.0 {
+                up_r += r;
+                up_n += 1;
+            } else {
+                lo_r += r;
+                lo_n += 1;
+            }
+        }
+        assert!(
+            (up_r / up_n as f64) < (lo_r / lo_n as f64) * 0.6,
+            "anti-registered raft did not offset leaflets"
+        );
     }
 }

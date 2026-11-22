@@ -11,14 +11,18 @@
 //!   de-clash, in a periodic box.
 //! - [`equalize_on_sphere`] for a vesicle: a per-shell spherical Lloyd pass then a
 //!   de-clash.
+//! - [`equalize_on_cylinder`] for a tubule: a per-shell cylindrical Lloyd pass
+//!   (isometrically unrolled to a periodic plane) then a cylindrical de-clash.
 //!
 //! Beads are treated as soft spheres: an overlapping pair pushes apart by a fraction
 //! of the overlap each step (a damped Jacobi relaxation), capped for stability, over
 //! a flat CSR cell list parallelised per lipid. A whole lipid moves rigidly
-//! (laterally in the plane, with z fixed so it stays in its leaflet, or tangentially
-//! over the sphere at fixed radius), so the relaxation never distorts a lipid or
-//! moves it out of its layer.
+//! (laterally in the plane, with z fixed so it stays in its leaflet, tangentially
+//! over the sphere at fixed radius, or tangentially + axially on the cylinder at
+//! fixed radius), so the relaxation never distorts a lipid or moves it out of its
+//! layer.
 
+use std::f64::consts::TAU;
 use std::ops::Range;
 
 use rayon::prelude::*;
@@ -646,6 +650,310 @@ fn relax_on_sphere(
     max_overlap
 }
 
+// ============================ Cylindrical ============================
+
+/// Extract per-lipid unwrapped cylindrical coordinates `(R·θ, z) ∈ [0, 2πR) × [0, length)`.
+fn extract_cylinder_sites(
+    positions: &[[f64; 3]],
+    shell: &[Range<usize>],
+    radius: f64,
+    length: f64,
+) -> Vec<[f64; 2]> {
+    let circumference = TAU * radius;
+    shell
+        .iter()
+        .map(|range| {
+            let n = range.len() as f64;
+            let (mut cx, mut cy) = (0.0, 0.0);
+            for k in range.clone() {
+                cx += positions[k][0];
+                cy += positions[k][1];
+            }
+            let theta = (cy / n).atan2(cx / n).rem_euclid(TAU);
+            let s = wrap(theta * radius, circumference);
+            let z = wrap(positions[range.start][2], length);
+            [s, z]
+        })
+        .collect()
+}
+
+/// Rotate every bead of `range` around the `z`-axis by `d_theta` and shift `z`
+/// by `dz` modulo `length`, preserving every bead's exact cylindrical radius.
+#[inline]
+fn move_lipid_on_cylinder(
+    positions: &mut [[f64; 3]],
+    range: Range<usize>,
+    d_theta: f64,
+    dz: f64,
+    length: f64,
+) {
+    let (sin_a, cos_a) = d_theta.sin_cos();
+    for k in range {
+        let [x, y, z] = positions[k];
+        positions[k] = [
+            x * cos_a - y * sin_a,
+            x * sin_a + y * cos_a,
+            wrap(z + dz, length),
+        ];
+    }
+}
+
+/// Centroidal-Voronoi relax a cylindrical tubule to a uniform areal density, then
+/// de-clash.
+///
+/// The tubule axis is `z` through `(0, 0)` and periodic in `[0, length)`.
+/// `shells` pairs each shell's lipid ranges with its head radius `r` (nm); each
+/// shell is relaxed as an independent periodic planar CVT on the isometric
+/// unrolling `[0, 2πr) × [0, length)`. `positions` holds every lipid bead
+/// (mutated in place); `radii` is the de-clash radius per bead. Returns the
+/// largest remaining bead overlap (nm).
+pub fn equalize_on_cylinder(
+    positions: &mut [[f64; 3]],
+    radii: &[f64],
+    shells: &[(&[Range<usize>], f64)],
+    length: f64,
+    iterations: usize,
+    tolerance: f64,
+    mut observer: Option<StepObserver>,
+) -> f64 {
+    let all: Vec<Range<usize>> = shells.iter().flat_map(|(s, _)| s.iter().cloned()).collect();
+    if all.is_empty() || length <= 0.0 {
+        return 0.0;
+    }
+    let converged = shells
+        .iter()
+        .filter(|(s, r)| !s.is_empty() && *r > 0.0)
+        .map(|(s, r)| CVT_CONVERGED_FRACTION * (TAU * r * length / s.len() as f64).sqrt())
+        .fold(f64::MAX, f64::min);
+    let mut cvt = PlaneCvtWorkspace::new();
+
+    let init_sites: Vec<Vec<[f64; 2]>> = shells
+        .iter()
+        .map(|(s, r)| extract_cylinder_sites(positions, s, *r, length))
+        .collect();
+    let mut cur_sites = init_sites.clone();
+    let record_each = observer.is_some();
+
+    for _ in 0..CVT_ROUNDS {
+        let mut moved = 0.0_f64;
+        for ((shell, radius), sites) in shells.iter().zip(&mut cur_sites) {
+            if shell.is_empty() || *radius <= 0.0 {
+                continue;
+            }
+            let box_sz = [TAU * *radius, length];
+            moved = moved.max(cvt.step_sites(sites, box_sz));
+            if record_each {
+                let inv_r = 1.0 / *radius;
+                for (range, &[ds, dz]) in shell.iter().zip(cvt.last_displacements()) {
+                    move_lipid_on_cylinder(positions, range.clone(), ds * inv_r, dz, length);
+                }
+            }
+        }
+        if let Some(observe) = observer.as_deref_mut() {
+            observe(positions);
+        }
+        if moved < converged {
+            break;
+        }
+    }
+    if !record_each {
+        for ((shell, radius), (init, cur)) in shells.iter().zip(init_sites.iter().zip(&cur_sites)) {
+            if shell.is_empty() || *radius <= 0.0 {
+                continue;
+            }
+            let inv_r = 1.0 / *radius;
+            for (range, (&s0, &s1)) in shell.iter().zip(init.iter().zip(cur)) {
+                let d_theta = (s1[0] - s0[0]) * inv_r;
+                let dz = s1[1] - s0[1];
+                move_lipid_on_cylinder(positions, range.clone(), d_theta, dz, length);
+            }
+        }
+    }
+    relax_on_cylinder(
+        positions, radii, &all, length, iterations, tolerance, observer,
+    )
+}
+
+/// De-clash `lipids` on concentric cylindrical shells about the `z`-axis,
+/// periodic in `z ∈ [0, length)`. Each lipid slides rigidly in `(θ, z)` while
+/// preserving every bead's exact radial distance from the axis.
+fn relax_on_cylinder(
+    positions: &mut [[f64; 3]],
+    radii: &[f64],
+    lipids: &[Range<usize>],
+    length: f64,
+    iterations: usize,
+    tolerance: f64,
+    mut observer: Option<StepObserver>,
+) -> f64 {
+    let max_radius = radii.iter().copied().fold(0.0_f64, f64::max);
+    if max_radius <= 0.0 || lipids.is_empty() || length <= 0.0 {
+        return 0.0;
+    }
+    let n_beads = positions.len();
+    let owner = bead_owners(n_beads, lipids);
+    let cell = 2.0 * max_radius;
+    let inv_cell = 1.0 / cell;
+    let max_step = MAX_STEP_FRACTION * max_radius;
+
+    // Non-periodic padded xy square spanning the full cylinder cross-section so
+    // rotating lipids never leave the cell grid, combined with periodic z.
+    let max_r = positions
+        .iter()
+        .map(|p| p[0].hypot(p[1]))
+        .fold(0.0_f64, f64::max);
+    let pad = 2.0 * cell;
+    let lo_xy = -(max_r + pad);
+    let span_xy = 2.0 * (max_r + pad);
+    let nxy = ((span_xy * inv_cell).ceil() as usize).max(1);
+    let nz = ((length / cell).floor() as usize).max(1);
+    let inv_wz = nz as f64 / length;
+    let half_z = 0.5 * length;
+    let dzs: &[isize] = match nz {
+        1 => &[0],
+        2 => &[0, 1],
+        _ => &[-1, 0, 1],
+    };
+    let ncells = nxy * nxy * nz;
+
+    let mut wrapped = vec![[0.0_f64; 3]; n_beads];
+    let mut bead_cell = vec![[0u32; 3]; n_beads];
+    let mut counts = vec![0u32; ncells];
+    let mut offsets = vec![0u32; ncells + 1];
+    let mut sorted = vec![PackBead::default(); n_beads];
+    let mut force = vec![[0.0_f64; 3]; lipids.len()];
+
+    let mut max_overlap = 0.0_f64;
+    let mut tracker = StallTracker::new();
+    for _ in 0..iterations {
+        counts.fill(0);
+        for (i, &p) in positions.iter().enumerate() {
+            let wz = wrap(p[2], length);
+            let ix = (((p[0] - lo_xy) * inv_cell) as isize).clamp(0, nxy as isize - 1) as usize;
+            let iy = (((p[1] - lo_xy) * inv_cell) as isize).clamp(0, nxy as isize - 1) as usize;
+            let iz = ((wz * inv_wz) as usize).min(nz - 1);
+            wrapped[i] = [p[0], p[1], wz];
+            bead_cell[i] = [ix as u32, iy as u32, iz as u32];
+            counts[(iz * nxy + iy) * nxy + ix] += 1;
+        }
+        prefix_sum(&mut counts, &mut offsets);
+        for i in 0..n_beads {
+            let [ix, iy, iz] = bead_cell[i];
+            let c = (iz as usize * nxy + iy as usize) * nxy + ix as usize;
+            let slot = counts[c] as usize;
+            counts[c] += 1;
+            sorted[slot] = PackBead {
+                pos: wrapped[i],
+                r: radii[i],
+                lipid: owner[i],
+            };
+        }
+
+        let wrapped_ref = &wrapped;
+        let bead_cell_ref = &bead_cell;
+        let offsets_ref = &offsets;
+        let sorted_ref = &sorted;
+
+        max_overlap = lipids
+            .par_iter()
+            .enumerate()
+            .zip(force.par_iter_mut())
+            .with_min_len(PAR_MIN_LEN)
+            .map(|((li, range), f_out)| {
+                let li_u32 = li as u32;
+                let mut fx = 0.0_f64;
+                let mut fy = 0.0_f64;
+                let mut fz = 0.0_f64;
+                let mut local_max = 0.0_f64;
+                for i in range.clone() {
+                    let pi = wrapped_ref[i];
+                    let ri = radii[i];
+                    let [cx, cy, cz] = bead_cell_ref[i];
+                    let x0 = (cx as usize).saturating_sub(1);
+                    let x1 = (cx as usize + 1).min(nxy - 1);
+                    let y0 = (cy as usize).saturating_sub(1);
+                    let y1 = (cy as usize + 1).min(nxy - 1);
+
+                    for &dzc in dzs {
+                        let z_base = wrap_cell(cz, dzc, nz) * nxy;
+                        for y in y0..=y1 {
+                            let row = (z_base + y) * nxy;
+                            let start = offsets_ref[row + x0] as usize;
+                            let end = offsets_ref[row + x1 + 1] as usize;
+                            for bj in &sorted_ref[start..end] {
+                                if bj.lipid == li_u32 {
+                                    continue;
+                                }
+                                let dx = pi[0] - bj.pos[0];
+                                let dy = pi[1] - bj.pos[1];
+                                let mut dz = pi[2] - bj.pos[2];
+                                if dz > half_z {
+                                    dz -= length;
+                                } else if dz < -half_z {
+                                    dz += length;
+                                }
+                                let d2 = dx * dx + dy * dy + dz * dz;
+                                let sigma = ri + bj.r;
+                                if d2 < sigma * sigma && d2 > 1e-12 {
+                                    let dist = d2.sqrt();
+                                    let overlap = sigma - dist;
+                                    local_max = local_max.max(overlap);
+                                    let scale = overlap / dist;
+                                    fx += dx * scale;
+                                    fy += dy * scale;
+                                    fz += dz * scale;
+                                }
+                            }
+                        }
+                    }
+                }
+                *f_out = [fx, fy, fz];
+                local_max
+            })
+            .reduce(|| 0.0_f64, f64::max);
+
+        if tracker.should_stop(max_overlap, tolerance) {
+            break;
+        }
+
+        // Slide each overlapping lipid tangentially in θ and axially in z,
+        // preserving every bead's exact radial distance from the cylinder axis.
+        for (range, &[fx, fy, fz]) in lipids.iter().zip(&force) {
+            if fx == 0.0 && fy == 0.0 && fz == 0.0 {
+                continue;
+            }
+            let n = range.len() as f64;
+            let (mut cx, mut cy) = (0.0, 0.0);
+            for i in range.clone() {
+                cx += positions[i][0];
+                cy += positions[i][1];
+            }
+            cx /= n;
+            cy /= n;
+            let r_c = cx.hypot(cy);
+            if r_c < 1e-9 {
+                continue;
+            }
+            let inv_r = 1.0 / r_c;
+            let tx = -cy * inv_r;
+            let ty = cx * inv_r;
+            let f_theta = fx * tx + fy * ty;
+            let f_mag = f_theta.hypot(fz);
+            if f_mag < 1e-12 {
+                continue;
+            }
+            let step = (STEP_FRACTION * f_mag).min(max_step);
+            let ds = step * (f_theta / f_mag);
+            let dz = step * (fz / f_mag);
+            move_lipid_on_cylinder(positions, range.clone(), ds * inv_r, dz, length);
+        }
+        if let Some(observe) = observer.as_deref_mut() {
+            observe(positions);
+        }
+    }
+    max_overlap
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +1047,52 @@ mod tests {
                 "bead left the shell: r = {radius}"
             );
         }
+    }
+
+    #[test]
+    fn equalize_on_cylinder_is_clash_free_and_preserves_radius() {
+        // Single-bead lipids clustered on one patch of a cylinder of radius 8,
+        // length 20; cylindrical CVT must spread them around θ and z while
+        // de-clash removes overlaps and preserves every bead's exact radius.
+        let r = 8.0;
+        let length = 20.0;
+        let mut positions = Vec::new();
+        let mut lipids = Vec::new();
+        for i in 0..12 {
+            for j in 0..12 {
+                let theta = i as f64 * 0.04;
+                let z = 1.0 + j as f64 * 0.3;
+                let k = positions.len();
+                positions.push([r * theta.cos(), r * theta.sin(), z]);
+                lipids.push(k..k + 1);
+            }
+        }
+        let radii = vec![0.5; positions.len()];
+        let shell: Vec<_> = lipids.clone();
+        let overlap = equalize_on_cylinder(
+            &mut positions,
+            &radii,
+            &[(&shell, r)],
+            length,
+            1000,
+            0.01,
+            None,
+        );
+        assert!(overlap < 0.05, "not clash-free: max overlap {overlap}");
+        let mut z_lo = f64::MAX;
+        let mut z_hi = f64::MIN;
+        let mut x_min = f64::MAX;
+        for p in &positions {
+            let radius = p[0].hypot(p[1]);
+            assert!(
+                (radius - r).abs() < 1e-6,
+                "bead left cylinder shell: r = {radius}"
+            );
+            z_lo = z_lo.min(p[2]);
+            z_hi = z_hi.max(p[2]);
+            x_min = x_min.min(p[0]);
+        }
+        assert!(z_hi - z_lo > 14.0, "lipids did not spread axially");
+        assert!(x_min < -4.0, "lipids did not spread circumferentially");
     }
 }

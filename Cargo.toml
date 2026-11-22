@@ -2,7 +2,7 @@
 name = "isolf"
 version = "0.1.0"
 edition = "2024"
-description = "Build coarse-grained iSoLF lipid membranes and vesicles for GENESIS"
+description = "Build coarse-grained iSoLF lipid membranes, vesicles, and tubules for GENESIS"
 license = "MIT OR Apache-2.0"
 # README art / demo recording — not needed in a published crate.
 exclude = ["/assets"]

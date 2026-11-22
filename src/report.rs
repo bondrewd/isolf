@@ -278,7 +278,10 @@ pub fn header() {
             let suffix = match i {
                 2 => format!("   {}", paint(version, "2", s.color)),
                 4 => format!("   {}", paint("coarse-grained", "2", s.color)),
-                5 => format!("   {}", paint("membranes · vesicles", "2", s.color)),
+                5 => format!(
+                    "   {}",
+                    paint("membranes · vesicles · tubules", "2", s.color)
+                ),
                 _ => String::new(),
             };
             println!("  {}{suffix}", gradient_line(line, width, s.depth));

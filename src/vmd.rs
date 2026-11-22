@@ -24,6 +24,8 @@ pub enum Layout {
     Membrane,
     /// Vesicle: a perspective view centred on the sphere.
     Vesicle,
+    /// Cylindrical tubule (periodic along z): a perspective side view.
+    Tubule,
 }
 
 /// How lipid beads are coloured in the VMD script (the `--vmd-color-by` scope).
@@ -172,6 +174,7 @@ pub fn vmd_script(
     let shape = match layout {
         Layout::Membrane => "membrane",
         Layout::Vesicle => "vesicle",
+        Layout::Tubule => "tubule",
     };
     let _ = writeln!(s, "# isolf visualization — {label} ({shape})");
     let _ = writeln!(s, "mol new ./{base}.psf type psf waitfor all");
@@ -287,10 +290,10 @@ pub fn vmd_script(
     // Camera.
     let projection = match layout {
         Layout::Membrane => "orthographic",
-        Layout::Vesicle => "perspective",
+        Layout::Vesicle | Layout::Tubule => "perspective",
     };
     let _ = writeln!(s, "\n# Camera.");
-    if layout == Layout::Membrane {
+    if matches!(layout, Layout::Membrane | Layout::Tubule) {
         let _ = writeln!(s, "rotate x by -90");
     }
     let _ = writeln!(s, "scale by 1.2");

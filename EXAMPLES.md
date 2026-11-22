@@ -1,10 +1,12 @@
 # iSoLF examples
 
-Common builds and the flags behind them. Run `isolf membrane --help` or `isolf vesicle --help` for every option and default. Each command writes its files into `-o`/`--out`. Add `--top` for the topology, or `--inp` for a full GENESIS setup (which implies `--top`).
+Common builds and the flags behind them. Run `isolf membrane --help`, `isolf vesicle --help`, or `isolf tubule --help` for every option and default. Each command writes its files into `-o`/`--out`. Add `--top` for the topology, or `--inp` for a full GENESIS setup (which implies `--top`).
 
 - [Lipids and compositions](#lipids-and-compositions)
 - [Membranes](#membranes)
 - [Vesicles](#vesicles)
+- [Tubules](#tubules)
+- [Phase-separated domains](#phase-separated-domains)
 - [Leaflet balancing](#leaflet-balancing)
 - [Centering and padding](#centering-and-padding)
 - [GENESIS control files and temperature](#genesis-control-files-and-temperature)
@@ -78,6 +80,41 @@ isolf vesicle --outer POPC --inner "POPC=3,POPS=1" --radius 20 -o asym_vesicle
 
 If you fix both radii and the gap is thinner than the bilayer, `isolf` stops and prints the minimum width it needs.
 
+## Tubules
+
+A cylindrical bilayer periodic along `z` built with `isolf tubule`. Give the composition, `-r`/`--radius` in nm (same `ro=` / `ri=` syntax as `vesicle`), and the periodic axial length `-l`/`--length` in nm:
+
+```bash
+isolf tubule --lipids POPC --radius 10 --length 25 -o tubule           # outer radius 10 nm, length 25 nm
+isolf tubule --lipids POPC --radius "ri=6" --length 30 -o tubule_ri    # inner lumen radius 6 nm
+isolf tubule --outer POPC --inner "POPC=3,POPS=1" --radius "ri=6,ro=10.5" --length 25 -o asym_tubule
+```
+
+Like vesicles, tubules generate `nvt.inp` / `pro.inp` under `--inp` so vacuum padding in `x` and `y` is preserved while `z` stays periodic.
+
+## Phase-separated domains
+
+By default lipids are uniformly mixed (`--phase random`). Pass `--phase stripe` or `--phase raft` on `membrane`, `vesicle`, or `tubule` to start with spatially segregated domains at matched local areal density:
+
+- `--phase stripe`: parallel bands along `x` on a flat membrane, latitude bands on a vesicle, or axial rings along `z` on a tubule.
+- `--phase raft`: a circular domain (or polar cap on a vesicle) for the first domain surrounded by a mixed matrix of the remaining domains.
+
+With comma-separated species (`"DPPC=1,DOPC=3"`), each species is its own domain. To group multiple lipids into one mixed phase domain, separate domains with `;`:
+
+```bash
+# Circular DPPC raft in a DOPC matrix (registered across both leaflets)
+isolf membrane -L "DPPC=1,DOPC=3" -n 400 --phase raft --vmd-color-by whole -o raft
+
+# Multi-lipid Lo raft (DPPC+DSPC) in a mixed Ld matrix (POPC+POPS), anti-registered
+isolf membrane -L "DPPC=1,DSPC=1;POPC=2,POPS=1" -n 512 --phase raft --anti-register -o antireg_raft
+
+# Latitude-banded vesicle and axially-striped tubule
+isolf vesicle -L "DPPC=1,POPC=1" -r 15 --phase stripe --vmd-color-by whole -o banded_vesicle
+isolf tubule  -L "DPPC=1,POPC=3" -r 10 -l 25 --phase raft --anti-register --gif -o raft_tubule
+```
+
+`--anti-register` offsets the domains on the opposite leaflet/shell (half-period shift for stripes/rings, opposite corner/pole/side for rafts).
+
 ## Leaflet balancing
 
 In count mode (`--count` without `--box`), if the two leaflets cover different areas, the lighter leaflet is grown to match the denser one so the shared box holds both at matched lateral density. Turn this off with `--no-balance` to keep the exact counts given:
@@ -90,7 +127,7 @@ isolf membrane --upper DOPC --lower DPPC --count "up=256,lo=256" --no-balance -o
 
 By default the finished system sits on the coordinate origin `(0, 0, 0)` (`--center origin`); VMD scripts shift it back into the periodic box for display, so the rendered view is unaffected. Pass `--center box` to centre it in `[0, box]` instead.
 
-`--padding` sets the empty space in nm added on each side (along z for a membrane, on every side for a vesicle; 10 nm by default):
+`--padding` sets the empty space in nm added on each side (along z for a membrane, along x and y for a tubule, and on every side for a vesicle; 10 nm by default):
 
 ```bash
 isolf membrane --lipids POPC --count 256 --center box --padding 15 -o padded
@@ -156,7 +193,7 @@ isolf vesicle  --lipids POPC --radius 30 --gif-mode density -o vesicle
 
 ## Output files
 
-Files go in `-o`/`--out`. The base name defaults to the subcommand (`membrane` or `vesicle`); change it with `--name`.
+Files go in `-o`/`--out`. The base name defaults to the subcommand (`membrane`, `vesicle`, or `tubule`); change it with `--name`.
 
 | File | When | What it is |
 | --- | --- | --- |

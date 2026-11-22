@@ -5,10 +5,11 @@
 //!
 //! - **Lipids.** [`force_field`] is the typed iSoLF force field; [`itp`] renders
 //!   it to a GENESIS/GROMACS `.itp`. [`membrane`] lays out a flat bilayer from
-//!   per-leaflet [`composition`]s, and [`vesicle`] wraps one into a sphere.
+//!   per-leaflet [`composition`]s, [`vesicle`] wraps one into a sphere, and
+//!   [`tubule`] wraps one into a periodic cylinder.
 //! - **Packing.** [`pack`] is a Lloyd density-equalization / de-clash relaxation
 //!   engine for lipid coordinates (lateral for a bilayer, over a shell for a
-//!   vesicle).
+//!   vesicle or tubule).
 //! - **Output.** Coordinates and topology in `.gro` ([`gro`]), `.top` ([`top`]),
 //!   `.pdb` ([`pdb`]), `.psf` ([`psf`]), `.crd` ([`crd`]), and `.cif` ([`cif`]);
 //!   GENESIS run-control files ([`inp`]); VMD visualization scripts ([`vmd`]).
@@ -49,6 +50,7 @@ pub mod pack;
 pub mod pdb;
 pub mod psf;
 pub mod top;
+pub mod tubule;
 pub mod vesicle;
 pub mod vmd;
 pub mod voronoi;

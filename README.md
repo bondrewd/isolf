@@ -2,7 +2,7 @@
 
 <img src="assets/banner.svg" alt="iSoLF" width="660">
 
-**Coarse-grained starting structures for [GENESIS](https://mdgenesis.org/) molecular dynamics: lipid membranes and vesicles.**
+**Coarse-grained starting structures for [GENESIS](https://mdgenesis.org/) molecular dynamics: lipid membranes, vesicles, and tubules.**
 
 [![release](https://img.shields.io/github/v/release/bondrewd/isolf?sort=semver&color=2dd4bf&label=release)](https://github.com/bondrewd/isolf/releases)
 [![ci](https://img.shields.io/github/actions/workflow/status/bondrewd/isolf/ci.yml?branch=main&color=3b82f6&label=ci)](https://github.com/bondrewd/isolf/actions)
@@ -68,13 +68,14 @@ This writes `my_first_membrane/` with the structure (`membrane.gro`), the topolo
 | --- | --- |
 | **`membrane`** | `isolf membrane -L "POPC=3,POPS=1" -n 256 -o m` |
 | **`vesicle`** | `isolf vesicle -L POPC -r 20 -o v` |
+| **`tubule`** | `isolf tubule -L POPC -r 10 -l 25 -o t` |
 | **`lipids`** | `isolf lipids` (lists all 35 supported lipids) |
 
-Lipids are `NAME=WEIGHT` recipes like `"POPC=3,POPS=1"` (repeat or comma-separate to combine). Use `-L`/`--lipids` for symmetric bilayers/vesicles, `--upper`/`--lower` for asymmetric membranes, and `--outer`/`--inner` for asymmetric vesicles. Size a membrane by lipid count (`-n`/`--count`), box size (`-b`/`--box`, e.g. `x=10,y=20`), or both; size a vesicle by `-r`/`--radius` (`20`, `ro=20`, `ri=15`, or `ri=14,ro=20`).
+Lipids are `NAME=WEIGHT` recipes like `"POPC=3,POPS=1"` (repeat or comma-separate to combine). Use `-L`/`--lipids` for symmetric systems, `--upper`/`--lower` for asymmetric membranes, and `--outer`/`--inner` for asymmetric vesicles and tubules. Add `--phase stripe` or `--phase raft` (with `;`-separated multi-lipid domains and optional `--anti-register`) to build phase-separated domains on any geometry. Size a membrane by lipid count (`-n`/`--count`), box size (`-b`/`--box`, e.g. `x=10,y=20`), or both; size a vesicle by `-r`/`--radius` (`20`, `ro=20`, `ri=15`, or `ri=14,ro=20`); size a tubule by `-r`/`--radius` and periodic `-l`/`--length`.
 
 While it runs, `isolf` prints each phase and a closing summary: the composition, the box, the particle count, the time, and the command to run next. Use `-q` for the summary alone, `-v` for full file paths, `--ascii` for plain glyphs.
 
-> 🧪 More recipes are in **[EXAMPLES.md](EXAMPLES.md)**: asymmetric leaflets, rectangular and box-sized membranes, vesicles, MD stage overrides, and output formats.
+> 🧪 More recipes are in **[EXAMPLES.md](EXAMPLES.md)**: asymmetric leaflets, rectangular membranes, vesicles, tubules, phase-separated domains, MD stage overrides, and output formats.
 
 ## 📦 Output
 
@@ -96,11 +97,11 @@ Run the control files in order. Each one continues from the previous step's rest
 
 ```bash
 atdyn min.inp     # 1. minimization
-atdyn npt.inp     # 2. equilibration  (nvt.inp for a vesicle)
+atdyn npt.inp     # 2. equilibration  (nvt.inp for a vesicle or tubule)
 atdyn pro.inp     # 3. production
 ```
 
-Run `isolf membrane --help` or `isolf vesicle --help` to see every option and its default.
+Run `isolf membrane --help`, `isolf vesicle --help`, or `isolf tubule --help` to see every option and its default.
 
 ## 🙏 Acknowledgements
 

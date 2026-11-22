@@ -17,9 +17,17 @@ pub struct Component {
 
 /// A leaflet composition: lipid species with proportions summing to one,
 /// kept in the order they were supplied.
+///
+/// Semicolons in [`Composition::parse`] optionally group species into explicit
+/// phase domains (e.g. `"DPPC=1,DPPS=1;DOPC=3,DOPS=1"` puts `DPPC`+`DPPS` in
+/// domain 0 and `DOPC`+`DOPS` in domain 1). Without semicolons, each species
+/// forms its own implicit domain when a phase-separated layout is requested.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Composition {
     components: Vec<Component>,
+    /// Explicit domain index per component when `;` separators were used;
+    /// empty otherwise (meaning each component is its own implicit domain).
+    explicit_domains: Vec<usize>,
 }
 
 /// Parse a single composition weight.
@@ -83,13 +91,20 @@ impl Composition {
                 proportion: weight / total,
             })
             .collect();
-        Ok(Self { components })
+        Ok(Self {
+            components,
+            explicit_domains: Vec::new(),
+        })
     }
 
     /// Parse a composition from a `NAME=WEIGHT,NAME=WEIGHT` specification, as
     /// supplied on the command line. A bare `NAME` (no `=WEIGHT`) defaults to a
     /// weight of 1. Lipid names are upper-cased and weights are parsed with
     /// [`parse_proportion`]; the result is normalized.
+    ///
+    /// Semicolons optionally partition species into explicit phase domains
+    /// (e.g. `"DPPC=2,DPPS=1;DOPC=5,DOPS=1"`). Weights still normalize across
+    /// the whole leaflet.
     ///
     /// # Errors
     ///
@@ -106,24 +121,52 @@ impl Composition {
     /// assert_eq!(Composition::parse("DOPC"), Composition::parse("DOPC=1"));
     /// ```
     pub fn parse(spec: &str) -> Result<Self, BuildError> {
+        let has_semicolon = spec.contains(';');
         let mut weights = Vec::new();
-        for component in spec.split(',') {
-            // `NAME=WEIGHT` sets an explicit weight; a bare `NAME` defaults to 1.
-            let (name, weight) = match component.split_once('=') {
-                Some((name, weight)) => (name.trim(), parse_proportion(weight)?),
-                None => (component.trim(), 1.0),
-            };
-            if name.is_empty() {
-                return Err(BuildError::MalformedComponent(component.to_string()));
+        let mut explicit_domains = Vec::new();
+        for (domain_idx, group) in spec.split(';').enumerate() {
+            for component in group.split(',') {
+                // `NAME=WEIGHT` sets an explicit weight; a bare `NAME` defaults to 1.
+                let (name, weight) = match component.split_once('=') {
+                    Some((name, weight)) => (name.trim(), parse_proportion(weight)?),
+                    None => (component.trim(), 1.0),
+                };
+                if name.is_empty() {
+                    return Err(BuildError::MalformedComponent(component.to_string()));
+                }
+                weights.push((name.to_uppercase(), weight));
+                if has_semicolon {
+                    explicit_domains.push(domain_idx);
+                }
             }
-            weights.push((name.to_uppercase(), weight));
         }
-        Self::from_weights(weights)
+        let mut comp = Self::from_weights(weights)?;
+        comp.explicit_domains = explicit_domains;
+        Ok(comp)
     }
 
     /// The lipid species and their proportions.
     pub fn components(&self) -> &[Component] {
         &self.components
+    }
+
+    /// Number of phase domains in this composition: the number of semicolon-separated
+    /// groups when explicit `;` grouping was used, otherwise the number of species.
+    pub fn domain_count(&self) -> usize {
+        if self.explicit_domains.is_empty() {
+            self.components.len()
+        } else {
+            self.explicit_domains
+                .iter()
+                .copied()
+                .max()
+                .map_or(0, |m| m + 1)
+        }
+    }
+
+    /// Phase-domain index (`0..domain_count()`) for component `index`.
+    pub fn domain_of(&self, index: usize) -> usize {
+        self.explicit_domains.get(index).copied().unwrap_or(index)
     }
 
     /// Apportion `total` lipids across the species, returning a count per
@@ -256,5 +299,24 @@ mod tests {
     fn partition_of_pure_composition_is_all_one_species() {
         let composition = Composition::from_weights([("POPC".into(), 1.0)]).unwrap();
         assert_eq!(composition.partition(1024), [1024]);
+    }
+
+    #[test]
+    fn parses_semicolon_phase_domains() {
+        let implicit = Composition::parse("DPPC=1,DOPC=3").unwrap();
+        assert_eq!(implicit.domain_count(), 2);
+        assert_eq!(implicit.domain_of(0), 0);
+        assert_eq!(implicit.domain_of(1), 1);
+
+        let grouped = Composition::parse("DPPC=2,DPPS=1;DOPC=5,DOPS=2").unwrap();
+        assert_eq!(grouped.components().len(), 4);
+        assert_eq!(grouped.domain_count(), 2);
+        assert_eq!(
+            (0..4).map(|i| grouped.domain_of(i)).collect::<Vec<_>>(),
+            [0, 0, 1, 1]
+        );
+        // Global normalization across domains: 2+1+5+2 = 10.
+        assert!((grouped.components()[0].proportion - 0.2).abs() < 1e-12);
+        assert!((grouped.components()[2].proportion - 0.5).abs() < 1e-12);
     }
 }

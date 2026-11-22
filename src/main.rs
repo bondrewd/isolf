@@ -1,8 +1,9 @@
-//! Command-line builder for coarse-grained iSoLF membranes and vesicles.
+//! Command-line builder for coarse-grained iSoLF membranes, vesicles, and tubules.
 //!
 //! ```sh
 //! isolf membrane --lipids "POPC=3,POPS=1" --count 512 --inp --vmd -o ./sim
 //! isolf vesicle  --lipids POPC --radius 20 --top -o ./ves
+//! isolf tubule   --lipids "DPPC=1,POPC=3" --phase raft --radius 10 --length 25 -o ./tube
 //! isolf lipids
 //! ```
 //!
@@ -14,6 +15,7 @@
 //! `.cif` are added on request.
 
 use std::error::Error;
+use std::f64::consts::TAU;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -28,8 +30,10 @@ use isolf::composition::Composition;
 use isolf::error::BuildError;
 use isolf::force_field::ForceField;
 use isolf::membrane::{
-    BuildOptions, DEFAULT_NAME, DEFAULT_PADDING, DEFAULT_TEMPERATURE, Membrane, RelaxFrame, Sizing,
+    BuildOptions, DEFAULT_NAME, DEFAULT_PADDING, DEFAULT_TEMPERATURE, Membrane, Phase, RelaxFrame,
+    Sizing,
 };
+use isolf::tubule::{TubuleRadius, build_tubule, build_tubule_recorded};
 use isolf::vesicle::{VesicleRadius, build_vesicle, build_vesicle_recorded};
 use isolf::vmd::{Layout, VmdOptions, VmdSource};
 
@@ -71,7 +75,29 @@ enum GifModeArg {
     Density,
 }
 
-/// Build coarse-grained iSoLF lipid membranes and vesicles for GENESIS.
+/// Initial lateral lipid distribution (`--phase`). Maps to [`Phase`].
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PhaseArg {
+    /// Uniformly mixed lipids (default).
+    #[default]
+    Random,
+    /// Parallel stripes (membrane), latitude bands (vesicle), or axial rings (tubule).
+    Stripe,
+    /// Circular raft / polar cap for the first domain in a mixed matrix.
+    Raft,
+}
+
+impl From<PhaseArg> for Phase {
+    fn from(phase: PhaseArg) -> Self {
+        match phase {
+            PhaseArg::Random => Phase::Random,
+            PhaseArg::Stripe => Phase::Stripe,
+            PhaseArg::Raft => Phase::Raft,
+        }
+    }
+}
+
+/// Build coarse-grained iSoLF lipid membranes, vesicles, and tubules for GENESIS.
 #[derive(Parser, Debug)]
 #[command(
     name = "isolf",
@@ -91,6 +117,8 @@ enum Command {
     Membrane(MembraneArgs),
     /// Build a spherical lipid vesicle.
     Vesicle(VesicleArgs),
+    /// Build a cylindrical lipid tubule (periodic along z).
+    Tubule(TubuleArgs),
     /// List all supported iSoLF lipids.
     Lipids(LipidsArgs),
     /// Update isolf in place to the latest release.
@@ -277,9 +305,112 @@ struct VesicleArgs {
     common: CommonBuildArgs,
 }
 
-/// Options shared between `membrane` and `vesicle`.
+/// Arguments for `isolf tubule`.
+#[derive(clap::Args, Debug)]
+#[command(
+    about = "Build a cylindrical lipid tubule (periodic along z)",
+    long_about = "\
+Build a cylindrical coarse-grained lipid tubule periodic along z for GENESIS.
+
+Set the cross-section with --radius (a bare number or ro=<R> fixes the outer
+radius, ri=<R> fixes the inner lumen radius, ri=<R>,ro=<R> fixes both) and the
+periodic axial length with --length. Use --lipids for a symmetric tubule, or
+--outer / --inner for asymmetric shells."
+)]
+struct TubuleArgs {
+    // ---- Lipid composition ----
+    /// Lipid composition for both shells (symmetric tubule) as NAME=WEIGHT pairs.
+    #[arg(
+        short = 'L',
+        long,
+        value_name = "SPEC",
+        conflicts_with_all = ["outer", "inner"],
+        help_heading = "Lipid composition"
+    )]
+    lipids: Vec<String>,
+
+    /// Outer shell composition as NAME=WEIGHT pairs (copied to inner if --inner is omitted).
+    #[arg(long, value_name = "SPEC", help_heading = "Lipid composition")]
+    outer: Vec<String>,
+
+    /// Inner (lumen) shell composition as NAME=WEIGHT pairs (copied to outer if --outer is omitted).
+    #[arg(long, value_name = "SPEC", help_heading = "Lipid composition")]
+    inner: Vec<String>,
+
+    // ---- Geometry ----
+    /// Tubule radius in nm: <R> or "ro=<R>" (outer), "ri=<R>" (inner), or both.
+    ///
+    /// Examples:
+    ///   -r 10                  # outer radius 10 nm, inner derived automatically
+    ///   -r "ri=6"              # inner radius 6 nm, outer derived automatically
+    ///   -r "ri=6,ro=10.5"      # both radii fixed
+    #[arg(
+        short = 'r',
+        long,
+        required = true,
+        value_name = "SPEC",
+        verbatim_doc_comment,
+        help_heading = "Geometry"
+    )]
+    radius: Vec<String>,
+
+    /// Periodic axial length of the tubule along z in nm.
+    #[arg(
+        short = 'l',
+        long,
+        required = true,
+        value_name = "NM",
+        help_heading = "Geometry"
+    )]
+    length: f64,
+
+    /// System centre: origin (0,0,0) or box (Lx/2,Ly/2,Lz/2).
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        default_value_t = CenterArg::Origin,
+        value_name = "WHERE",
+        help_heading = "Geometry"
+    )]
+    center: CenterArg,
+
+    /// Vacuum padding in nm added on each side along x and y.
+    #[arg(
+        long,
+        value_name = "NM",
+        default_value_t = DEFAULT_PADDING,
+        help_heading = "Geometry"
+    )]
+    padding: f64,
+
+    #[command(flatten)]
+    common: CommonBuildArgs,
+}
+
+/// Options shared between `membrane`, `vesicle`, and `tubule`.
 #[derive(clap::Args, Debug)]
 struct CommonBuildArgs {
+    // ---- Lipid composition (phase separation) ----
+    /// Lateral domain layout: random (mixed), stripe (bands/rings), or raft (circular domain).
+    ///
+    /// Separate explicit multi-lipid domains with ';', e.g.
+    /// -L "DPPC=1,DSPC=1;POPC=2,POPS=1" --phase raft
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        default_value_t = PhaseArg::Random,
+        value_name = "MODE",
+        verbatim_doc_comment,
+        help_heading = "Lipid composition"
+    )]
+    phase: PhaseArg,
+
+    /// Offset phase domains on opposite leaflets/shells (anti-registered domains).
+    #[arg(long, help_heading = "Lipid composition")]
+    anti_register: bool,
+
     // ---- Output files ----
     /// Output directory.
     #[arg(
@@ -291,7 +422,7 @@ struct CommonBuildArgs {
     )]
     out: PathBuf,
 
-    /// Base name for output files [default: membrane / vesicle].
+    /// Base name for output files [default: membrane / vesicle / tubule].
     #[arg(long, value_name = "NAME", help_heading = "Output files")]
     name: Option<String>,
 
@@ -632,6 +763,12 @@ fn main() {
             a.common.verbose,
             a.common.no_color,
         ),
+        Command::Tubule(a) => (
+            a.common.ascii,
+            a.common.quiet,
+            a.common.verbose,
+            a.common.no_color,
+        ),
         Command::Lipids(a) => (a.ascii, false, false, a.no_color),
         Command::Update | Command::Uninstall => (false, false, false, false),
     };
@@ -648,6 +785,7 @@ fn dispatch(command: Command, color: bool, unicode: bool) -> Result<(), Box<dyn 
     match command {
         Command::Membrane(args) => run_membrane(args),
         Command::Vesicle(args) => run_vesicle(args),
+        Command::Tubule(args) => run_tubule(args),
         Command::Lipids(_) => {
             print_lipids(&ForceField::isolf(), color, unicode);
             Ok(())
@@ -748,6 +886,25 @@ fn resolve_compositions(
     ))
 }
 
+fn phase_notes(common: &CommonBuildArgs, first: &Composition, second: &Composition) -> Vec<String> {
+    let mut notes = Vec::new();
+    if common.anti_register && common.phase == PhaseArg::Random {
+        notes.push(
+            "--anti-register has no effect with --phase random (pass --phase stripe or --phase raft)"
+                .to_string(),
+        );
+    } else if common.phase != PhaseArg::Random
+        && first.domain_count() <= 1
+        && second.domain_count() <= 1
+    {
+        notes.push(
+            "--phase has no effect with a single lipid domain (specify multiple lipids or ';'-separated domains)"
+                .to_string(),
+        );
+    }
+    notes
+}
+
 fn run_membrane(args: MembraneArgs) -> Result<(), Box<dyn Error>> {
     let force_field = ForceField::isolf();
     validate_padding(args.padding)?;
@@ -775,6 +932,8 @@ fn run_membrane(args: MembraneArgs) -> Result<(), Box<dyn Error>> {
     let mut rng = StdRng::seed_from_u64(seed);
     let options = BuildOptions {
         padding: args.padding,
+        phase: args.common.phase.into(),
+        anti_register: args.common.anti_register,
     };
 
     report::header();
@@ -805,16 +964,18 @@ fn run_membrane(args: MembraneArgs) -> Result<(), Box<dyn Error>> {
     spin.finish();
     let (membrane, gif_frames) = built.map_err(|e| enrich_build_error(&force_field, e))?;
 
-    let mut notes = Vec::new();
+    let mut notes = phase_notes(&args.common, &upper, &lower);
     if let Some(n) = balance_note {
         notes.push(n);
     }
     if let Some(n) = temp_note {
         notes.push(n);
     }
+    let gif_bounds = [0.0, 0.0, membrane.box_size[0], membrane.box_size[1]];
     finish_build(
         membrane,
         gif_frames,
+        gif_bounds,
         &force_field,
         &args.common,
         Geometry::Membrane,
@@ -846,6 +1007,8 @@ fn run_vesicle(args: VesicleArgs) -> Result<(), Box<dyn Error>> {
     let mut rng = StdRng::seed_from_u64(seed);
     let options = BuildOptions {
         padding: args.padding,
+        phase: args.common.phase.into(),
+        anti_register: args.common.anti_register,
     };
 
     report::header();
@@ -876,13 +1039,102 @@ fn run_vesicle(args: VesicleArgs) -> Result<(), Box<dyn Error>> {
     spin.finish();
     let (membrane, gif_frames) = built.map_err(|e| enrich_build_error(&force_field, e))?;
 
-    let notes: Vec<String> = temp_note.into_iter().collect();
+    let mut notes = phase_notes(&args.common, &outer, &inner);
+    if let Some(n) = temp_note {
+        notes.push(n);
+    }
     finish_build(
         membrane,
         gif_frames,
+        [-2.0, -2.0, 2.0, 2.0],
         &force_field,
         &args.common,
         Geometry::Vesicle,
+        args.center,
+        &controls,
+        &notes,
+        seed,
+        &mut rng,
+    )
+}
+
+fn run_tubule(args: TubuleArgs) -> Result<(), Box<dyn Error>> {
+    let force_field = ForceField::isolf();
+    validate_padding(args.padding)?;
+    if !args.length.is_finite() || args.length <= 0.0 {
+        return Err(format!(
+            "--length: '{}' must be a positive number of nm",
+            args.length
+        )
+        .into());
+    }
+
+    let (outer, inner) =
+        resolve_compositions(&args.lipids, &args.outer, &args.inner, "--outer", "--inner")?;
+    let radius = match parse_radius_spec(&args.radius)?
+        .ok_or("missing tubule radius: pass --radius <R> (e.g. 10, ri=6, or ri=6,ro=10.5)")?
+    {
+        VesicleRadius::Inner(r) => TubuleRadius::Inner(r),
+        VesicleRadius::Outer(r) => TubuleRadius::Outer(r),
+        VesicleRadius::Both { inner, outer } => TubuleRadius::Both { inner, outer },
+    };
+    isolf::membrane::area_per_lipid(&force_field, &outer)
+        .map_err(|e| enrich_build_error(&force_field, e))?;
+    isolf::membrane::area_per_lipid(&force_field, &inner)
+        .map_err(|e| enrich_build_error(&force_field, e))?;
+    let (controls, temp_note) = prepare_controls(&args.common, Geometry::Tubule)?;
+
+    let seed = args.common.seed.unwrap_or_else(|| rand::rng().random());
+    let mut rng = StdRng::seed_from_u64(seed);
+    let options = BuildOptions {
+        padding: args.padding,
+        phase: args.common.phase.into(),
+        anti_register: args.common.anti_register,
+    };
+
+    report::header();
+    report::section("Build");
+    let spin = report::spin("building tubule");
+    let built = if args.common.want_gif() {
+        build_tubule_recorded(
+            &force_field,
+            Geometry::Tubule.title(),
+            &outer,
+            &inner,
+            radius,
+            args.length,
+            &options,
+            &mut rng,
+        )
+    } else {
+        build_tubule(
+            &force_field,
+            Geometry::Tubule.title(),
+            &outer,
+            &inner,
+            radius,
+            args.length,
+            &options,
+            &mut rng,
+        )
+        .map(|m| (m, Vec::new()))
+    };
+    spin.finish();
+    let (membrane, gif_frames) = built.map_err(|e| enrich_build_error(&force_field, e))?;
+
+    let mut notes = phase_notes(&args.common, &outer, &inner);
+    if let Some(n) = temp_note {
+        notes.push(n);
+    }
+    let outer_radius = (0.5 * membrane.box_size[0] - args.padding).max(1e-6);
+    let gif_bounds = [0.0, 0.0, TAU * outer_radius, membrane.box_size[2]];
+    finish_build(
+        membrane,
+        gif_frames,
+        gif_bounds,
+        &force_field,
+        &args.common,
+        Geometry::Tubule,
         args.center,
         &controls,
         &notes,
@@ -895,6 +1147,7 @@ fn run_vesicle(args: VesicleArgs) -> Result<(), Box<dyn Error>> {
 fn finish_build(
     mut membrane: Membrane,
     gif_frames: Vec<RelaxFrame>,
+    gif_bounds: [f64; 4],
     force_field: &ForceField,
     common: &CommonBuildArgs,
     geometry: Geometry,
@@ -932,6 +1185,7 @@ fn finish_build(
         controls,
         &base,
         &gif_frames,
+        gif_bounds,
         rng,
     )?;
 
@@ -1160,15 +1414,17 @@ fn shell_quote(arg: &str) -> String {
 enum Geometry {
     Membrane,
     Vesicle,
+    Tubule,
 }
 
 impl Geometry {
-    /// Short mode label (`"membrane"` or `"vesicle"`), also used as the default
-    /// output base name when `--name` is not given.
+    /// Short mode label (`"membrane"`, `"vesicle"`, or `"tubule"`), also used as
+    /// the default output base name when `--name` is not given.
     fn label(self) -> &'static str {
         match self {
             Geometry::Membrane => "membrane",
             Geometry::Vesicle => "vesicle",
+            Geometry::Tubule => "tubule",
         }
     }
 
@@ -1177,19 +1433,21 @@ impl Geometry {
         match self {
             Geometry::Membrane => DEFAULT_NAME,
             Geometry::Vesicle => "CG vesicle model",
+            Geometry::Tubule => "CG tubule model",
         }
     }
 
-    /// VMD camera layout (a vesicle gets the perspective view).
+    /// VMD camera layout (curved geometries get perspective views).
     fn layout(self) -> Layout {
         match self {
             Geometry::Membrane => Layout::Membrane,
             Geometry::Vesicle => Layout::Vesicle,
+            Geometry::Tubule => Layout::Tubule,
         }
     }
 
     /// Whether the production/equilibration ensemble is NPT (a flat membrane) as
-    /// opposed to NVT (a vesicle, at fixed volume).
+    /// opposed to NVT (a vesicle or tubule, at fixed volume).
     fn is_npt(self) -> bool {
         self == Geometry::Membrane
     }
@@ -1519,14 +1777,15 @@ fn balanced_counts(
 /// Per-leaflet lipid composition. Each lipid molecule is classified into one of
 /// the two leaflets and counted per species (in the membrane's species order): a
 /// flat membrane splits by centroid z about the mean bead z (`upper`/`lower`), a
-/// vesicle by centroid radius about the mean bead radius (`outer`/`inner`).
+/// vesicle by 3D centroid radius (`outer`/`inner`), and a tubule by 2D radial
+/// distance in the x/y plane (`outer`/`inner`).
 fn leaflet_split(m: &Membrane, geometry: Geometry) -> Vec<report::Leaflet> {
     if m.particles.is_empty() {
         return Vec::new();
     }
-    let vesicle = matches!(geometry, Geometry::Vesicle);
+    let radial = matches!(geometry, Geometry::Vesicle | Geometry::Tubule);
     let n = m.particles.len() as f64;
-    let center = if vesicle {
+    let center = if radial {
         let mut c = [0.0; 3];
         for p in &m.particles {
             c[0] += p.position[0];
@@ -1537,15 +1796,15 @@ fn leaflet_split(m: &Membrane, geometry: Geometry) -> Vec<report::Leaflet> {
     } else {
         [0.0; 3]
     };
-    let scalar = |pos: [f64; 3]| {
-        if vesicle {
+    let scalar = |pos: [f64; 3]| match geometry {
+        Geometry::Membrane => pos[2],
+        Geometry::Vesicle => {
             let dx = pos[0] - center[0];
             let dy = pos[1] - center[1];
             let dz = pos[2] - center[2];
             (dx * dx + dy * dy + dz * dz).sqrt()
-        } else {
-            pos[2]
         }
+        Geometry::Tubule => (pos[0] - center[0]).hypot(pos[1] - center[1]),
     };
 
     let threshold = m.particles.iter().map(|p| scalar(p.position)).sum::<f64>() / n;
@@ -1578,7 +1837,7 @@ fn leaflet_split(m: &Membrane, geometry: Geometry) -> Vec<report::Leaflet> {
             .map(|((species, _), &c)| (species.clone(), c))
             .collect()
     };
-    let (far_label, near_label) = if vesicle {
+    let (far_label, near_label) = if radial {
         ("outer", "inner")
     } else {
         ("upper", "lower")
@@ -1599,6 +1858,7 @@ fn write_outputs(
     controls: &ControlSpecs,
     base: &str,
     gif_frames: &[RelaxFrame],
+    gif_bounds: [f64; 4],
     rng: &mut StdRng,
 ) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&common.out)?;
@@ -1634,10 +1894,6 @@ fn write_outputs(
     }
 
     if want_gif && !gif_frames.is_empty() {
-        let bounds = match geometry {
-            Geometry::Membrane => [0.0, 0.0, box_size[0], box_size[1]],
-            Geometry::Vesicle => [-2.0, -2.0, 2.0, 2.0],
-        };
         let opts = anim::GifOptions {
             mode: match common.gif_mode.unwrap_or(GifModeArg::Point) {
                 GifModeArg::Point => anim::GifMode::Point,
@@ -1647,7 +1903,7 @@ fn write_outputs(
             fps: common.gif_fps.unwrap_or(14),
         };
         let path = named("gif");
-        anim::write_gif(&path, gif_frames, bounds, &opts)?;
+        anim::write_gif(&path, gif_frames, gif_bounds, &opts)?;
         report::record(&path);
     }
 
@@ -1926,6 +2182,28 @@ mod tests {
         ])
         .unwrap();
         assert!(matches!(cli.command, Command::Vesicle(_)));
+
+        // Tubule with phase-separated raft and anti-registration.
+        let cli = Cli::try_parse_from([
+            "isolf",
+            "tubule",
+            "-L",
+            "DPPC=1,DSPC=1;POPC=2,POPS=1",
+            "-r",
+            "10",
+            "-l",
+            "25",
+            "--phase",
+            "raft",
+            "--anti-register",
+        ])
+        .unwrap();
+        let Command::Tubule(tub) = cli.command else {
+            panic!("expected tubule subcommand");
+        };
+        assert_eq!(tub.length, 25.0);
+        assert_eq!(tub.common.phase, PhaseArg::Raft);
+        assert!(tub.common.anti_register);
 
         // Discovery subcommand.
         let cli = Cli::try_parse_from(["isolf", "lipids"]).unwrap();

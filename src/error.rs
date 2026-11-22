@@ -44,6 +44,19 @@ pub enum BuildError {
         outer: f64,
         minimum: f64,
     },
+
+    /// The tubule outer radius is too small to contain the bilayer's thickness.
+    TubuleTooSmall { outer: f64, thickness: f64 },
+
+    /// Both tubule radii were given, but the gap between them can't hold the bilayer.
+    TubuleTooThin {
+        inner: f64,
+        outer: f64,
+        minimum: f64,
+    },
+
+    /// A tubule length was not positive and finite.
+    InvalidLength(f64),
 }
 
 impl fmt::Display for BuildError {
@@ -78,11 +91,21 @@ impl fmt::Display for BuildError {
                 inner,
                 outer,
                 minimum,
+            }
+            | Self::TubuleTooThin {
+                inner,
+                outer,
+                minimum,
             } => write!(
                 f,
                 "the gap between the inner ({inner:.2} nm) and outer ({outer:.2} nm) radii is too thin \
                  for these lipids; the bilayer needs at least {minimum:.2} nm"
             ),
+            Self::TubuleTooSmall { outer, thickness } => write!(
+                f,
+                "outer radius {outer:.2} nm is smaller than the bilayer thickness {thickness:.2} nm"
+            ),
+            Self::InvalidLength(len) => write!(f, "tubule length {len} nm must be positive"),
         }
     }
 }

@@ -21,8 +21,9 @@ use crate::composition::Composition;
 use crate::error::BuildError;
 use crate::force_field::{ForceField, POTENTIAL_MINIMUM_FACTOR};
 use crate::membrane::{
-    BuildOptions, DEFAULT_PACK_ITERATIONS, DEFAULT_PACK_TOLERANCE, Membrane, Particle, RelaxFrame,
-    aggregate_counts, canonicalize, clash_floor, leaflet_spacing,
+    BuildOptions, DEFAULT_PACK_ITERATIONS, DEFAULT_PACK_TOLERANCE, Membrane, Particle, Phase,
+    RelaxFrame, aggregate_counts, canonicalize, clash_floor, domain_area_fractions,
+    leaflet_spacing,
 };
 use crate::pack;
 
@@ -151,6 +152,7 @@ fn build_vesicle_inner(
         outer_radius,
         outer_count,
         Shell::Outer,
+        options,
         rng,
         &mut molecule_id,
         &mut atom_id,
@@ -166,6 +168,7 @@ fn build_vesicle_inner(
         inner_radius,
         inner_count,
         Shell::Inner,
+        options,
         rng,
         &mut molecule_id,
         &mut atom_id,
@@ -221,7 +224,7 @@ fn shell_count(radius: f64, spacing: f64) -> usize {
 }
 
 /// The longest lipid chain (sum of bond lengths, nm) in a composition.
-fn max_chain_length(
+pub(crate) fn max_chain_length(
     force_field: &ForceField,
     composition: &Composition,
 ) -> Result<f64, BuildError> {
@@ -244,9 +247,10 @@ struct ShellBeadTemplate<'a> {
     radius: f64,
 }
 
-/// Place `count` lipids of `composition` over a shell, appending them to
-/// `particles` (along with packing radii and molecule bead ranges) and returning
-/// the per-component molecule counts.
+/// Place `count` lipids of `composition` over a shell (uniformly or
+/// phase-separated per `options.phase`), appending them to `particles` along
+/// with packing radii and molecule bead ranges, and returning the per-component
+/// molecule counts.
 #[allow(clippy::too_many_arguments)]
 fn place_shell(
     force_field: &ForceField,
@@ -254,6 +258,7 @@ fn place_shell(
     radius: f64,
     count: usize,
     shell: Shell,
+    options: &BuildOptions,
     rng: &mut impl Rng,
     molecule_id: &mut usize,
     atom_id: &mut usize,
@@ -266,11 +271,15 @@ fn place_shell(
         return Ok(counts);
     }
 
+    let domain_fracs = domain_area_fractions(composition, &counts, force_field);
+    let z_ranges = sphere_domain_z_ranges(options.phase, &domain_fracs);
+    let flip_z = options.anti_register && shell == Shell::Inner;
+
     // Resolve each species once: bead properties, packing radii, and shell radii.
-    let mut templates: Vec<(&str, Vec<ShellBeadTemplate<'_>>, usize)> =
+    let mut templates: Vec<(&str, Vec<ShellBeadTemplate<'_>>, usize, usize)> =
         Vec::with_capacity(counts.len());
     let mut extra_beads = 0usize;
-    for (component, &n) in composition.components().iter().zip(&counts) {
+    for (idx, (component, &n)) in composition.components().iter().zip(&counts).enumerate() {
         if n == 0 {
             continue;
         }
@@ -299,18 +308,22 @@ fn place_shell(
             }
         }
         extra_beads += beads.len() * n;
-        templates.push((lipid.name.as_str(), beads, n));
+        templates.push((lipid.name.as_str(), beads, n, composition.domain_of(idx)));
     }
 
     particles.reserve(extra_beads);
     radii.reserve(extra_beads);
     ranges.reserve(count);
 
-    for (lipid_name, beads, n) in &templates {
+    for (lipid_name, beads, n, domain) in &templates {
+        let (z_lo, z_hi) = z_ranges.get(*domain).copied().unwrap_or((-1.0, 1.0));
         for _ in 0..*n {
             *molecule_id += 1;
             let mol_start = particles.len();
-            let direction = random_sphere_direction(rng);
+            let mut direction = random_sphere_direction_in_band(rng, z_lo, z_hi);
+            if flip_z {
+                direction[2] = -direction[2];
+            }
             for b in beads {
                 *atom_id += 1;
                 particles.push(Particle {
@@ -335,12 +348,47 @@ fn place_shell(
     Ok(counts)
 }
 
-/// A uniform-random unit direction on the sphere (Archimedes' method: `z` uniform
-/// in [−1, 1], azimuth uniform), seeded for reproducibility.
-fn random_sphere_direction(rng: &mut impl Rng) -> [f64; 3] {
-    let z: f64 = rng.random_range(-1.0..1.0);
+/// Map each phase domain to an equal-area `z = cos θ` interval in `[-1, 1]`.
+/// Because `dA = 2π R² dz`, an interval of height `2 f` covers exact area share `f`.
+fn sphere_domain_z_ranges(phase: Phase, domain_fracs: &[f64]) -> Vec<(f64, f64)> {
+    let active = domain_fracs.iter().filter(|&&f| f > 0.0).count();
+    if active <= 1 || phase == Phase::Random {
+        return vec![(-1.0, 1.0); domain_fracs.len()];
+    }
+    match phase {
+        Phase::Random => vec![(-1.0, 1.0); domain_fracs.len()],
+        Phase::Raft => {
+            let f0 = domain_fracs.first().copied().unwrap_or(1.0);
+            let cut = (1.0 - 2.0 * f0).clamp(-1.0, 1.0);
+            domain_fracs
+                .iter()
+                .enumerate()
+                .map(|(i, _)| if i == 0 { (cut, 1.0) } else { (-1.0, cut) })
+                .collect()
+        }
+        Phase::Stripe => {
+            let mut ranges = Vec::with_capacity(domain_fracs.len());
+            let mut hi = 1.0_f64;
+            for &f in domain_fracs {
+                let lo = (hi - 2.0 * f).max(-1.0);
+                ranges.push((lo, hi));
+                hi = lo;
+            }
+            ranges
+        }
+    }
+}
+
+/// A uniform-random unit direction on the spherical band `z ∈ [z_lo, z_hi]`
+/// (Archimedes' method: equal area per unit `z`), seeded for reproducibility.
+fn random_sphere_direction_in_band(rng: &mut impl Rng, z_lo: f64, z_hi: f64) -> [f64; 3] {
+    let z: f64 = if z_hi > z_lo {
+        rng.random_range(z_lo..z_hi)
+    } else {
+        z_lo
+    };
     let phi: f64 = rng.random_range(0.0..2.0 * PI);
-    let r = (1.0 - z * z).sqrt();
+    let r = (1.0 - z * z).max(0.0).sqrt();
     let (sin_phi, cos_phi) = phi.sin_cos();
     [r * cos_phi, r * sin_phi, z]
 }
@@ -611,5 +659,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, BuildError::VesicleTooThin { .. }));
+    }
+
+    #[test]
+    fn phase_raft_separates_polar_cap_on_vesicle() {
+        let ff = ForceField::isolf();
+        let comp = Composition::parse("DPPC=1,DOPC=3").unwrap();
+        let mut rng = StdRng::seed_from_u64(9);
+        let v = build_vesicle(
+            &ff,
+            "v",
+            &comp,
+            &comp,
+            VesicleRadius::Inner(5.0),
+            &BuildOptions {
+                phase: Phase::Raft,
+                ..BuildOptions::default()
+            },
+            &mut rng,
+        )
+        .unwrap();
+        let center_z = 0.5 * v.box_size[2];
+        let mean_z = |res: &str| {
+            let (mut s, mut n) = (0.0, 0usize);
+            for mol in v.particles.chunk_by(|a, b| a.molecule_id == b.molecule_id) {
+                if mol[0].residue == res {
+                    s += mol[0].position[2] - center_z;
+                    n += 1;
+                }
+            }
+            s / n as f64
+        };
+        assert!(
+            mean_z("DPPC") > 3.0 && mean_z("DOPC") < 0.0,
+            "DPPC cap did not separate to +z pole: DPPC z={:.2}, DOPC z={:.2}",
+            mean_z("DPPC"),
+            mean_z("DOPC")
+        );
     }
 }
