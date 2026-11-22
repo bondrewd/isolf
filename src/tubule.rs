@@ -65,7 +65,7 @@ pub fn build_tubule(
     options: &BuildOptions,
     rng: &mut impl Rng,
 ) -> Result<Membrane, BuildError> {
-    build_tubule_inner(
+    build_system(
         force_field,
         name,
         outer,
@@ -73,9 +73,11 @@ pub fn build_tubule(
         radius,
         length,
         options,
+        &[],
         rng,
         None,
     )
+    .map(crate::embed::EmbeddedSystem::into_membrane)
 }
 
 /// Like [`build_tubule`], but also records every relaxation step (the per-shell
@@ -97,7 +99,7 @@ pub fn build_tubule_recorded(
     rng: &mut impl Rng,
 ) -> Result<(Membrane, Vec<RelaxFrame>), BuildError> {
     let mut frames = Vec::new();
-    let tubule = build_tubule_inner(
+    let tubule = build_system(
         force_field,
         name,
         outer,
@@ -105,144 +107,12 @@ pub fn build_tubule_recorded(
         radius,
         length,
         options,
+        &[],
         rng,
         Some(&mut frames),
-    )?;
+    )?
+    .into_membrane();
     Ok((tubule, frames))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_tubule_inner(
-    force_field: &ForceField,
-    name: &str,
-    outer: &Composition,
-    inner: &Composition,
-    radius: TubuleRadius,
-    length: f64,
-    options: &BuildOptions,
-    rng: &mut impl Rng,
-    frames: Option<&mut Vec<RelaxFrame>>,
-) -> Result<Membrane, BuildError> {
-    if !length.is_finite() || length <= 0.0 {
-        return Err(BuildError::InvalidLength(length));
-    }
-
-    let gap = clash_floor(force_field, outer)?.max(clash_floor(force_field, inner)?);
-    let thickness =
-        max_chain_length(force_field, outer)? + max_chain_length(force_field, inner)? + gap;
-
-    let (inner_radius, outer_radius) = match radius {
-        TubuleRadius::Inner(r) => {
-            if !r.is_finite() || r <= 0.0 {
-                return Err(BuildError::TubuleTooSmall {
-                    outer: r,
-                    thickness,
-                });
-            }
-            (r, r + thickness)
-        }
-        TubuleRadius::Outer(r) => {
-            if !r.is_finite() || r <= thickness {
-                return Err(BuildError::TubuleTooSmall {
-                    outer: r,
-                    thickness,
-                });
-            }
-            (r - thickness, r)
-        }
-        TubuleRadius::Both { inner, outer } => {
-            if !inner.is_finite() || inner <= 0.0 {
-                return Err(BuildError::TubuleTooSmall {
-                    outer: inner,
-                    thickness,
-                });
-            }
-            if !outer.is_finite() || outer - inner < thickness {
-                return Err(BuildError::TubuleTooThin {
-                    inner,
-                    outer,
-                    minimum: thickness,
-                });
-            }
-            (inner, outer)
-        }
-    };
-
-    // Size each shell from its tightest bead layer (tail tips on the outer
-    // shell, heads/innermost wide bead on the inner shell) so curved packing
-    // stays clash-free at every radius and approaches area / spacing² as R → ∞.
-    let (outer_count, outer_cvt_radius) =
-        cylinder_shell_plan(force_field, outer, outer_radius, length, Shell::Outer)?;
-    let (inner_count, inner_cvt_radius) =
-        cylinder_shell_plan(force_field, inner, inner_radius, length, Shell::Inner)?;
-
-    let mut molecule_id = 0;
-    let mut atom_id = 0;
-    let mut particles = Vec::new();
-    let mut radii = Vec::new();
-    let mut ranges = Vec::new();
-
-    let outer_counts = place_cylinder_shell(
-        force_field,
-        outer,
-        outer_radius,
-        length,
-        outer_count,
-        Shell::Outer,
-        options,
-        rng,
-        &mut molecule_id,
-        &mut atom_id,
-        &mut particles,
-        &mut radii,
-        &mut ranges,
-    )?;
-    let outer_lipids = molecule_id;
-    let inner_counts = place_cylinder_shell(
-        force_field,
-        inner,
-        inner_radius,
-        length,
-        inner_count,
-        Shell::Inner,
-        options,
-        rng,
-        &mut molecule_id,
-        &mut atom_id,
-        &mut particles,
-        &mut radii,
-        &mut ranges,
-    )?;
-
-    relax_tubule(
-        &mut particles,
-        &radii,
-        &ranges,
-        outer_lipids,
-        outer_radius,
-        outer_cvt_radius,
-        inner_cvt_radius,
-        length,
-        frames,
-    );
-
-    let lipid_counts = aggregate_counts(outer, &outer_counts, inner, &inner_counts);
-    let mut particles = canonicalize(particles, &lipid_counts);
-
-    // Centre the cylinder axis in the padded x/y cross-section; z stays in [0, length).
-    let box_xy = 2.0 * outer_radius + 2.0 * options.padding;
-    let half_xy = 0.5 * box_xy;
-    for particle in &mut particles {
-        particle.position[0] += half_xy;
-        particle.position[1] += half_xy;
-    }
-
-    Ok(Membrane {
-        name: name.to_string(),
-        box_size: [box_xy, box_xy, length],
-        lipid_counts,
-        particles,
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,10 +277,9 @@ fn place_cylinder_shell(
     Ok(counts)
 }
 
-/// Build a cylindrical tubule with embedded proteins (or delegate to
-/// [`build_tubule`] when `proteins` is empty).
+/// Unified cylindrical-tubule builder supporting zero, one, or many embedded proteins.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_with_proteins(
+pub(crate) fn build_system(
     force_field: &ForceField,
     name: &str,
     outer: &Composition,
@@ -422,21 +291,6 @@ pub(crate) fn build_with_proteins(
     rng: &mut impl Rng,
     frames: Option<&mut Vec<RelaxFrame>>,
 ) -> Result<crate::embed::EmbeddedSystem, BuildError> {
-    if proteins.is_empty() {
-        let m = build_tubule_inner(
-            force_field,
-            name,
-            outer,
-            inner,
-            radius,
-            length,
-            options,
-            rng,
-            frames,
-        )?;
-        return Ok(crate::embed::EmbeddedSystem::from_membrane(m));
-    }
-
     if !length.is_finite() || length <= 0.0 {
         return Err(BuildError::InvalidLength(length));
     }
@@ -483,8 +337,16 @@ pub(crate) fn build_with_proteins(
     };
 
     let r_mid = 0.5 * (inner_radius + outer_radius);
-    let mut placed = crate::embed::place_proteins_tubule(proteins, r_mid, length)?;
+    let placed = if proteins.is_empty() {
+        None
+    } else {
+        Some(crate::embed::place_proteins_tubule(
+            proteins, r_mid, length,
+        )?)
+    };
 
+    // Size each shell from its tightest bead layer so curved packing stays
+    // clash-free at every radius and approaches area / spacing² as R → ∞.
     let (outer_count, outer_cvt_radius) =
         cylinder_shell_plan(force_field, outer, outer_radius, length, Shell::Outer)?;
     let (inner_count, inner_cvt_radius) =
@@ -496,7 +358,7 @@ pub(crate) fn build_with_proteins(
     let mut radii = Vec::new();
     let mut ranges = Vec::new();
 
-    place_cylinder_shell(
+    let outer_counts = place_cylinder_shell(
         force_field,
         outer,
         outer_radius,
@@ -512,7 +374,7 @@ pub(crate) fn build_with_proteins(
         &mut ranges,
     )?;
     let mut outer_lipids = molecule_id;
-    place_cylinder_shell(
+    let inner_counts = place_cylinder_shell(
         force_field,
         inner,
         inner_radius,
@@ -528,22 +390,27 @@ pub(crate) fn build_with_proteins(
         &mut ranges,
     )?;
 
-    let carved = crate::embed::carve_lipids(
-        &mut particles,
-        &mut radii,
-        &mut ranges,
-        &mut outer_lipids,
-        &placed.obstacles,
-        0.0,
-        |a, b| crate::embed::dist_sq_cylinder(a, b, length),
-    );
+    let metric = crate::embed::CarveMetric::Cylinder { length };
+    let carved = match &placed {
+        Some(p) => crate::embed::carve_lipids(
+            &mut particles,
+            &mut radii,
+            &mut ranges,
+            &mut outer_lipids,
+            &p.obstacles,
+            0.0,
+            metric,
+        ),
+        None => 0,
+    };
 
-    relax_tubule_with_obstacles(
+    let obstacles: &[pack::Obstacle] = placed.as_ref().map_or(&[], |p| &p.obstacles);
+    relax_tubule(
         &mut particles,
         &radii,
         &ranges,
         outer_lipids,
-        &placed.obstacles,
+        obstacles,
         outer_radius,
         outer_cvt_radius,
         inner_cvt_radius,
@@ -551,73 +418,61 @@ pub(crate) fn build_with_proteins(
         frames,
     );
 
-    let pruned = crate::embed::prune_clashing_lipids(
-        &mut particles,
-        &mut radii,
-        &mut ranges,
-        &mut outer_lipids,
-        &placed.raw_obstacles,
-        |a, b| crate::embed::dist_sq_cylinder(a, b, length),
-    );
+    let pruned = match &placed {
+        Some(p) => crate::embed::prune_clashing_lipids(
+            &mut particles,
+            &mut radii,
+            &mut ranges,
+            &mut outer_lipids,
+            &p.raw_obstacles,
+            metric,
+        ),
+        None => 0,
+    };
 
-    let lipid_counts = crate::embed::count_remaining_lipids(&particles, outer, inner);
+    let lipid_counts = if carved + pruned > 0 {
+        crate::embed::count_remaining_lipids(&particles, outer, inner)
+    } else {
+        aggregate_counts(outer, &outer_counts, inner, &inner_counts)
+    };
     let mut particles = canonicalize(particles, &lipid_counts);
 
     let mut max_r = outer_radius;
-    for prot in &placed.instances {
-        for b in &prot.beads {
-            max_r = max_r.max(b.position[0].hypot(b.position[1]));
+    if let Some(p) = &placed {
+        for pos in p.iter_positions() {
+            max_r = max_r.max(pos[0].hypot(pos[1]));
         }
     }
+    // Centre the cylinder axis in the padded x/y cross-section; z stays in [0, length).
     let box_xy = 2.0 * max_r + 2.0 * options.padding;
     let half_xy = 0.5 * box_xy;
     for particle in &mut particles {
         particle.position[0] += half_xy;
         particle.position[1] += half_xy;
     }
-    for prot in &mut placed.instances {
-        prot.translate([half_xy, half_xy, 0.0]);
+    if let Some(mut placed) = placed {
+        placed.translate([half_xy, half_xy, 0.0]);
+        Ok(crate::embed::assemble_system(
+            name,
+            placed,
+            particles,
+            lipid_counts,
+            [box_xy, box_xy, length],
+            carved,
+            pruned,
+        ))
+    } else {
+        Ok(crate::embed::EmbeddedSystem::from_membrane(Membrane {
+            name: name.to_string(),
+            box_size: [box_xy, box_xy, length],
+            lipid_counts,
+            particles,
+        }))
     }
-
-    Ok(crate::embed::assemble_system(
-        name,
-        placed,
-        particles,
-        lipid_counts,
-        [box_xy, box_xy, length],
-        carved,
-        pruned,
-    ))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn relax_tubule(
-    particles: &mut [Particle],
-    radii: &[f64],
-    ranges: &[std::ops::Range<usize>],
-    outer_lipids: usize,
-    outer_radius: f64,
-    outer_cvt_radius: f64,
-    inner_cvt_radius: f64,
-    length: f64,
-    frames: Option<&mut Vec<RelaxFrame>>,
-) {
-    relax_tubule_with_obstacles(
-        particles,
-        radii,
-        ranges,
-        outer_lipids,
-        &[],
-        outer_radius,
-        outer_cvt_radius,
-        inner_cvt_radius,
-        length,
-        frames,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn relax_tubule_with_obstacles(
     particles: &mut [Particle],
     radii: &[f64],
     ranges: &[std::ops::Range<usize>],

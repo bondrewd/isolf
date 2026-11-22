@@ -834,17 +834,48 @@ const FLEX_DIHEDRAL_OTHER_PRO: [f64; 7] = [
 const IDX_GLY: usize = 7;
 const IDX_PRO: usize = 14;
 
-/// Format a floating-point number in C/Fortran-style scientific notation with a
-/// signed two-digit exponent (e.g. `3.8017E-01`, `-1.2656E+02`), right-aligned
-/// to `width`.
-pub(crate) fn fmt_sci(value: f64, width: usize) -> String {
+/// Fixed-capacity stack buffer for zero-allocation scientific formatting.
+struct StackBuf {
+    buf: [u8; 32],
+    len: usize,
+}
+
+impl std::fmt::Write for StackBuf {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let bytes = s.as_bytes();
+        let end = self.len + bytes.len();
+        if end > self.buf.len() {
+            return Err(std::fmt::Error);
+        }
+        self.buf[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// Append a floating-point number in C/Fortran-style scientific notation with a
+/// signed at-least-two-digit exponent (e.g. `3.8017E-01`, `-1.2656E+02`),
+/// right-aligned to `width`, with zero heap allocations.
+pub(crate) fn write_sci(out: &mut String, value: f64, width: usize) {
     let v = if value == 0.0 { 0.0 } else { value };
-    let raw = format!("{v:.4E}");
-    let (mantissa, exp_str) = raw.split_once('E').unwrap_or((&raw, "0"));
+    let mut tmp = StackBuf {
+        buf: [0; 32],
+        len: 0,
+    };
+    let _ = write!(tmp, "{v:.4E}");
+    let raw = std::str::from_utf8(&tmp.buf[..tmp.len]).unwrap_or("0.0000E0");
+    let (mantissa, exp_str) = raw.split_once('E').unwrap_or((raw, "0"));
     let exp: i32 = exp_str.parse().unwrap_or(0);
-    let sign = if exp < 0 { '-' } else { '+' };
-    let formatted = format!("{mantissa}E{sign}{:02}", exp.abs());
-    format!("{formatted:>width$}")
+    let abs_exp = exp.unsigned_abs();
+    let exp_digits = if abs_exp >= 100 { 3 } else { 2 };
+    let formatted_len = mantissa.len() + 2 + exp_digits;
+    for _ in formatted_len..width {
+        out.push(' ');
+    }
+    out.push_str(mantissa);
+    out.push('E');
+    out.push(if exp < 0 { '-' } else { '+' });
+    let _ = write!(out, "{abs_exp:02}");
 }
 
 /// Render a self-contained GENESIS `aicg2p.itp` parameter file containing
@@ -860,13 +891,12 @@ pub fn render_aicg2p_itp() -> String {
     s.push_str("[ atomtypes ]\n");
     s.push_str(";PROTEIN\n");
     s.push_str(";name  n    mass  charge ptype       rmin      eps\n");
-    for prefix in ["", "i"] {
+    for (pad, prefix) in [("  ", ""), (" ", "i")] {
         for aa in &AMINO_ACIDS {
-            let label = format!("{prefix}{}", aa.name);
             let _ = writeln!(
                 s,
-                "{label:>5} {:>2} {:>7.3} {:>7.3}     A {:>10.4} {:>8.4}",
-                aa.n_val, aa.mass, aa.charge, aa.rmin, aa.eps
+                "{pad}{prefix}{} {:>2} {:>7.3} {:>7.3}     A {:>10.4} {:>8.4}",
+                aa.name, aa.n_val, aa.mass, aa.charge, aa.rmin, aa.eps
             );
         }
     }
@@ -877,14 +907,14 @@ pub fn render_aicg2p_itp() -> String {
         for (idx, aa) in AMINO_ACIDS.iter().enumerate() {
             let _ = writeln!(s, "{prefix}{} 1 10 \\", aa.name);
             for (k, (&x, &(y, y2))) in FLEX_ANGLE_X.iter().zip(&FLEX_ANGLE_Y_Y2[idx]).enumerate() {
-                let tail = if k + 1 < 10 { " \\" } else { "" };
-                let _ = writeln!(
-                    s,
-                    "{}{}{}{tail}",
-                    fmt_sci(x, 15),
-                    fmt_sci(y, 15),
-                    fmt_sci(y2, 15),
-                );
+                write_sci(&mut s, x, 15);
+                write_sci(&mut s, y, 15);
+                write_sci(&mut s, y2, 15);
+                if k + 1 < 10 {
+                    s.push_str(" \\\n");
+                } else {
+                    s.push('\n');
+                }
             }
             s.push('\n');
         }
@@ -907,7 +937,7 @@ pub fn render_aicg2p_itp() -> String {
                 };
                 let _ = writeln!(s, "{prefix}{} {prefix}{} 1 7 \\", aa1.name, aa2.name);
                 for &c in coeffs {
-                    s.push_str(&fmt_sci(c, 15));
+                    write_sci(&mut s, c, 15);
                 }
                 s.push_str("\n\n");
             }
@@ -957,5 +987,20 @@ mod tests {
         // 40 angle blocks (20 AA + 20 iAA) and 800 dihedral blocks (400 + 400).
         assert_eq!(itp.matches(" 1 10 \\").count(), 40);
         assert_eq!(itp.matches(" 1 7 \\").count(), 800);
+    }
+
+    #[test]
+    fn write_sci_formats_edge_values_without_allocating() {
+        let fmt = |v: f64, w: usize| {
+            let mut s = String::new();
+            write_sci(&mut s, v, w);
+            s
+        };
+        assert_eq!(fmt(0.0, 15), "     0.0000E+00");
+        assert_eq!(fmt(-0.0, 15), "     0.0000E+00");
+        assert_eq!(fmt(0.38017, 15), "     3.8017E-01");
+        assert_eq!(fmt(-126.56, 15), "    -1.2656E+02");
+        assert_eq!(fmt(1.5e-100, 15), "    1.5000E-100");
+        assert_eq!(fmt(9.99999, 15), "     1.0000E+01");
     }
 }

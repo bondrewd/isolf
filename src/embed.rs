@@ -25,12 +25,14 @@ use rand::Rng;
 use crate::composition::Composition;
 use crate::error::BuildError;
 use crate::force_field::ForceField;
-use crate::membrane::{BuildOptions, Membrane, Particle, RelaxFrame, Sizing, molecule_ranges};
+use crate::membrane::{
+    BuildOptions, Membrane, Particle, RelaxFrame, Sizing, molecule_ranges, write_particles,
+};
 use crate::pack::Obstacle;
 use crate::protein::{Protein, protein_segname};
 use crate::tubule::TubuleRadius;
 use crate::vesicle::VesicleRadius;
-use crate::voronoi::wrap;
+use crate::voronoi::{norm3, rotate_with_sin_cos, wrap};
 
 /// Golden angle in radians (`π * (3 - √5)`), used for uniform Fibonacci-sphere
 /// and helical multi-copy layouts.
@@ -107,8 +109,6 @@ pub struct EmbeddedSystem {
     pub protein_templates: Vec<Protein>,
     /// Instance counts per template in `[ molecules ]` order.
     pub protein_counts: Vec<(String, usize)>,
-    /// All placed protein copies in `[ molecules ]` order (matching `particles`).
-    pub proteins: Vec<Protein>,
     /// Number of lipids carved before relaxation to accommodate proteins.
     pub carved_lipids: usize,
     /// Number of trapped clashing lipids pruned after relaxation.
@@ -132,7 +132,6 @@ impl EmbeddedSystem {
             name: membrane.name,
             protein_templates: Vec::new(),
             protein_counts: Vec::new(),
-            proteins: Vec::new(),
             carved_lipids: 0,
             pruned_lipids: 0,
             warnings: Vec::new(),
@@ -143,9 +142,19 @@ impl EmbeddedSystem {
         }
     }
 
+    /// Convert a lipid-only [`EmbeddedSystem`] back into a [`Membrane`] without copying.
+    pub(crate) fn into_membrane(self) -> Membrane {
+        Membrane {
+            name: self.name,
+            box_size: self.box_size,
+            lipid_counts: self.lipid_counts,
+            particles: self.particles,
+        }
+    }
+
     /// True if at least one protein is embedded.
     pub fn has_proteins(&self) -> bool {
-        !self.proteins.is_empty()
+        !self.protein_counts.is_empty()
     }
 
     /// Total number of remaining lipid molecules.
@@ -155,7 +164,7 @@ impl EmbeddedSystem {
 
     /// Total number of embedded protein instances.
     pub fn total_proteins(&self) -> usize {
-        self.proteins.len()
+        self.protein_counts.iter().map(|(_, c)| c).sum()
     }
 
     /// Total number of molecule entries in `[ molecules ]` (proteins + lipids).
@@ -163,20 +172,22 @@ impl EmbeddedSystem {
         self.total_proteins() + self.total_lipids()
     }
 
+    /// Slice containing only the protein particles.
+    pub fn protein_particles(&self) -> &[Particle] {
+        &self.particles[..self.lipid_particle_start]
+    }
+
     /// Slice containing only the lipid particles.
     pub fn lipid_particles(&self) -> &[Particle] {
         &self.particles[self.lipid_particle_start..]
     }
 
-    /// Translate every particle (and stored protein copy) by `shift` (nm).
+    /// Translate every particle by `shift` (nm).
     pub fn translate(&mut self, shift: [f64; 3]) {
         for p in &mut self.particles {
             p.position[0] += shift[0];
             p.position[1] += shift[1];
             p.position[2] += shift[2];
-        }
-        for prot in &mut self.proteins {
-            prot.translate(shift);
         }
     }
 
@@ -242,29 +253,7 @@ impl EmbeddedSystem {
 
     /// Render the combined system as a GROMACS `.gro` coordinate file.
     pub fn to_gro(&self) -> String {
-        let mut s = String::with_capacity(self.particles.len() * 72 + 128);
-        let _ = writeln!(s, "{}, t = {:>16.3} ", self.name, 0.0);
-        let _ = writeln!(s, "{:>12} ", self.particles.len());
-        for p in &self.particles {
-            let _ = writeln!(
-                s,
-                "{:>5}{:>5}{:>5}{:>5}{:>8.3}{:>8.3}{:>8.3}  0.0000  0.0000  0.0000 ",
-                p.molecule_id % 100000,
-                p.residue,
-                p.bead,
-                p.atom_id % 100000,
-                p.position[0],
-                p.position[1],
-                p.position[2],
-            );
-        }
-        let _ = writeln!(
-            s,
-            "{:>15.4}{:>15.4}{:>15.4} ",
-            self.box_size[0], self.box_size[1], self.box_size[2]
-        );
-        s.push('\n');
-        s
+        crate::gro::render(&self.particles, &self.name, self.box_size)
     }
 
     /// Render the combined system as a GENESIS `.top` topology file.
@@ -305,24 +294,29 @@ impl EmbeddedSystem {
         if !self.has_proteins() {
             return crate::psf::render(&self.particles, &self.name);
         }
-        let mut chains: Vec<(String, Range<usize>)> = Vec::new();
+        let mut prot_chains: Vec<(String, Range<usize>)> = Vec::new();
         let mut offset = 0usize;
         let mut prot_chain_counter = 0usize;
-        for prot in &self.proteins {
-            for ch in &prot.chains {
-                let seg = protein_segname(prot_chain_counter, &ch.seg_name);
-                let start = offset + ch.range.start;
-                let end = offset + ch.range.end;
-                chains.push((seg, start..end));
-                prot_chain_counter += 1;
+        for (tmpl, &(_, count)) in self.protein_templates.iter().zip(&self.protein_counts) {
+            for _ in 0..count {
+                for ch in &tmpl.chains {
+                    let seg = protein_segname(prot_chain_counter, &ch.seg_name);
+                    prot_chains.push((seg, (offset + ch.range.start)..(offset + ch.range.end)));
+                    prot_chain_counter += 1;
+                }
+                offset += tmpl.beads.len();
             }
-            offset += prot.beads.len();
         }
         let lipid_ranges = molecule_ranges(self.lipid_particles());
-        for r in lipid_ranges {
-            chains.push(("MEMB".to_string(), (offset + r.start)..(offset + r.end)));
+        let mut chains: Vec<(&str, Range<usize>)> =
+            Vec::with_capacity(prot_chains.len() + lipid_ranges.len());
+        for (seg, range) in &prot_chains {
+            chains.push((seg.as_str(), range.clone()));
         }
-        crate::psf::render_chains(&self.particles, &chains, &self.name)
+        for r in lipid_ranges {
+            chains.push(("MEMB", (offset + r.start)..(offset + r.end)));
+        }
+        crate::psf::render_chains_ref(&self.particles, &chains, &self.name)
     }
 
     /// Render the combined system as a `.pdb` coordinate file (coordinates in Å).
@@ -334,46 +328,44 @@ impl EmbeddedSystem {
         let _ = writeln!(s, "TITLE     {:<70}", self.name);
         let mut offset = 0usize;
         let mut chain_counter = 0usize;
-        for prot in &self.proteins {
-            for ch in &prot.chains {
-                let cid = if chain_counter < 26 {
-                    (b'A' + chain_counter as u8) as char
-                } else {
-                    'Z'
-                };
-                for idx in ch.range.clone() {
-                    let p = &self.particles[offset + idx];
-                    let _ = writeln!(
-                        s,
-                        "ATOM  {:>5} {:>4} {:<4}{}{:>4}    {:>8.3}{:>8.3}{:>8.3}  1.00  0.00               ",
-                        p.atom_id % 100000,
-                        p.bead,
-                        p.residue,
-                        cid,
-                        p.molecule_id % 10000,
-                        p.position[0] * 10.0,
-                        p.position[1] * 10.0,
-                        p.position[2] * 10.0,
-                    );
+        for (tmpl, &(_, count)) in self.protein_templates.iter().zip(&self.protein_counts) {
+            for _ in 0..count {
+                for ch in &tmpl.chains {
+                    let cid = if chain_counter < 26 {
+                        (b'A' + chain_counter as u8) as char
+                    } else {
+                        'Z'
+                    };
+                    for p in &self.particles[(offset + ch.range.start)..(offset + ch.range.end)] {
+                        crate::pdb::write_atom_line(
+                            &mut s,
+                            p.atom_id,
+                            &p.bead,
+                            &p.residue,
+                            cid,
+                            p.molecule_id,
+                            p.position,
+                            "1.00",
+                        );
+                    }
+                    s.push_str("TER\n");
+                    chain_counter += 1;
                 }
-                s.push_str("TER\n");
-                chain_counter += 1;
+                offset += tmpl.beads.len();
             }
-            offset += prot.beads.len();
         }
-        for p in self.lipid_particles() {
-            let _ = writeln!(
-                s,
-                "ATOM  {:>5} {:>4} {:<4}M{:>4}    {:>8.3}{:>8.3}{:>8.3}  0.00  0.00               ",
-                p.atom_id % 100000,
-                p.bead,
-                p.residue,
-                p.molecule_id % 10000,
-                p.position[0] * 10.0,
-                p.position[1] * 10.0,
-                p.position[2] * 10.0,
+        write_particles(&mut s, self.lipid_particles(), 82, |buf, p| {
+            crate::pdb::write_atom_line(
+                buf,
+                p.atom_id,
+                &p.bead,
+                &p.residue,
+                'M',
+                p.molecule_id,
+                p.position,
+                "0.00",
             );
-        }
+        });
         s.push_str("TER\nEND\n");
         s
     }
@@ -409,7 +401,7 @@ pub fn embed_membrane(
     proteins: &[ProteinSpec],
     rng: &mut impl Rng,
 ) -> Result<EmbeddedSystem, BuildError> {
-    crate::membrane::build_with_proteins(
+    crate::membrane::build_system(
         force_field,
         name,
         upper,
@@ -439,7 +431,7 @@ pub fn embed_membrane_recorded(
     rng: &mut impl Rng,
 ) -> Result<(EmbeddedSystem, Vec<RelaxFrame>), BuildError> {
     let mut frames = Vec::new();
-    let sys = crate::membrane::build_with_proteins(
+    let sys = crate::membrane::build_system(
         force_field,
         name,
         upper,
@@ -470,7 +462,7 @@ pub fn embed_vesicle(
     proteins: &[ProteinSpec],
     rng: &mut impl Rng,
 ) -> Result<EmbeddedSystem, BuildError> {
-    crate::vesicle::build_with_proteins(
+    crate::vesicle::build_system(
         force_field,
         name,
         outer,
@@ -500,7 +492,7 @@ pub fn embed_vesicle_recorded(
     rng: &mut impl Rng,
 ) -> Result<(EmbeddedSystem, Vec<RelaxFrame>), BuildError> {
     let mut frames = Vec::new();
-    let sys = crate::vesicle::build_with_proteins(
+    let sys = crate::vesicle::build_system(
         force_field,
         name,
         outer,
@@ -532,7 +524,7 @@ pub fn embed_tubule(
     proteins: &[ProteinSpec],
     rng: &mut impl Rng,
 ) -> Result<EmbeddedSystem, BuildError> {
-    crate::tubule::build_with_proteins(
+    crate::tubule::build_system(
         force_field,
         name,
         outer,
@@ -564,7 +556,7 @@ pub fn embed_tubule_recorded(
     rng: &mut impl Rng,
 ) -> Result<(EmbeddedSystem, Vec<RelaxFrame>), BuildError> {
     let mut frames = Vec::new();
-    let sys = crate::tubule::build_with_proteins(
+    let sys = crate::tubule::build_system(
         force_field,
         name,
         outer,
@@ -623,15 +615,92 @@ fn validate_specs(specs: &[ProteinSpec]) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// Deduplicate protein templates and group placed copies in canonical `[ molecules ]`
-/// order, returning `(templates, counts, instances_ordered)`.
+/// Deduplicated protein templates and lightweight placed bead coordinates
+/// `(template_index, positions)` in canonical `[ molecules ]` order.
 pub(crate) struct PlacedProteins {
     pub templates: Vec<Protein>,
     pub counts: Vec<(String, usize)>,
-    pub instances: Vec<Protein>,
+    pub instances: Vec<(usize, Vec<[f64; 3]>)>,
     pub obstacles: Vec<Obstacle>,
     pub raw_obstacles: Vec<Obstacle>,
     pub warnings: Vec<String>,
+}
+
+impl PlacedProteins {
+    /// Translate all placed instance coordinates by `shift` (nm).
+    pub(crate) fn translate(&mut self, shift: [f64; 3]) {
+        for (_, positions) in &mut self.instances {
+            translate_positions(positions, shift);
+        }
+    }
+
+    /// Iterate over every placed protein bead position.
+    pub(crate) fn iter_positions(&self) -> impl Iterator<Item = [f64; 3]> + '_ {
+        self.instances
+            .iter()
+            .flat_map(|(_, pos)| pos.iter().copied())
+    }
+}
+
+fn translate_positions(positions: &mut [[f64; 3]], shift: [f64; 3]) {
+    for p in positions {
+        p[0] += shift[0];
+        p[1] += shift[1];
+        p[2] += shift[2];
+    }
+}
+
+fn rotate_positions_axis(
+    positions: &mut [[f64; 3]],
+    origin: [f64; 3],
+    axis: [f64; 3],
+    angle_rad: f64,
+) {
+    if angle_rad.abs() < 1e-12 {
+        return;
+    }
+    let m = norm3(axis);
+    if m < 1e-12 {
+        return;
+    }
+    let u = [axis[0] / m, axis[1] / m, axis[2] / m];
+    let (sin_a, cos_a) = angle_rad.sin_cos();
+    for p in positions {
+        let rel = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+        let r = rotate_with_sin_cos(rel, u, sin_a, cos_a);
+        *p = [origin[0] + r[0], origin[1] + r[1], origin[2] + r[2]];
+    }
+}
+
+fn apply_frame_positions(
+    positions: &mut [[f64; 3]],
+    origin: [f64; 3],
+    u: [f64; 3],
+    v: [f64; 3],
+    n: [f64; 3],
+) {
+    for p in positions {
+        let [x, y, z] = *p;
+        *p = [
+            origin[0] + x * u[0] + y * v[0] + z * n[0],
+            origin[1] + x * u[1] + y * v[1] + z * n[1],
+            origin[2] + x * u[2] + y * v[2] + z * n[2],
+        ];
+    }
+}
+
+fn positions_bbox(positions: &[[f64; 3]]) -> ([f64; 3], [f64; 3]) {
+    if positions.is_empty() {
+        return ([0.0; 3], [0.0; 3]);
+    }
+    let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for p in positions {
+        for a in 0..3 {
+            lo[a] = lo[a].min(p[a]);
+            hi[a] = hi[a].max(p[a]);
+        }
+    }
+    (lo, hi)
 }
 
 /// Compare two protein topologies (ignoring Cartesian coordinates) so identical
@@ -653,42 +722,52 @@ fn same_topology(a: &Protein, b: &Protein) -> bool {
         })
 }
 
-/// Center protein `(x, y)` on `(0, 0)`, apply `z_mode` + `z_offset`, then tilt
-/// and rotate around `(0, 0, z_offset)`.
-fn orient_local(template: &Protein, p: &ProteinPlacement, extra_rot_deg: f64) -> Protein {
-    let mut prot = template.clone();
-    let c = prot.centroid();
+/// Extract bead coordinates centered on `(0, 0)`, apply `z_mode` + `z_offset`,
+/// then tilt and rotate around `(0, 0, z_offset)`. Avoids cloning `Protein`.
+fn orient_local_positions(template: &Protein, p: &ProteinPlacement) -> Vec<[f64; 3]> {
+    let mut positions: Vec<[f64; 3]> = template.beads.iter().map(|b| b.position).collect();
+    let c = template.centroid();
     let dz = match p.z_mode {
         ZPlacement::Keep => p.z_offset,
         ZPlacement::Center => -c[2] + p.z_offset,
     };
-    prot.translate([-c[0], -c[1], dz]);
+    translate_positions(&mut positions, [-c[0], -c[1], dz]);
     let pivot = [0.0, 0.0, p.z_offset];
     if p.tilt_deg.abs() > 1e-9 {
-        prot.rotate_axis(pivot, [0.0, 1.0, 0.0], p.tilt_deg.to_radians());
+        rotate_positions_axis(
+            &mut positions,
+            pivot,
+            [0.0, 1.0, 0.0],
+            p.tilt_deg.to_radians(),
+        );
     }
-    let rot = p.rot_deg + extra_rot_deg;
-    if rot.abs() > 1e-9 {
-        prot.rotate_axis(pivot, [0.0, 0.0, 1.0], rot.to_radians());
+    if p.rot_deg.abs() > 1e-9 {
+        rotate_positions_axis(
+            &mut positions,
+            pivot,
+            [0.0, 0.0, 1.0],
+            p.rot_deg.to_radians(),
+        );
     }
-    prot
+    positions
 }
 
 /// Check if an oriented local protein sits far from the bilayer midplane `z = 0`.
 fn check_midplane_warning(
-    prot: &Protein,
+    name: &str,
+    positions: &[[f64; 3]],
     placement: &ProteinPlacement,
     warnings: &mut Vec<String>,
 ) {
     if placement.z_mode != ZPlacement::Keep {
         return;
     }
-    let (lo, hi) = prot.bounding_box();
+    let (lo, hi) = positions_bbox(positions);
     if hi[2] < -4.0 || lo[2] > 4.0 {
         warnings.push(format!(
             "protein '{}' sits at z = [{:.1}, {:.1}] nm, far from the bilayer midplane z = 0 \
              (pass z=center to center it in the membrane)",
-            prot.name, lo[2], hi[2]
+            name, lo[2], hi[2]
         ));
     }
 }
@@ -696,11 +775,11 @@ fn check_midplane_warning(
 /// Group placed copies into deduplicated templates with unique `[ moleculetype ]` names.
 fn finalize_placed(
     specs: &[ProteinSpec],
-    per_spec_copies: Vec<Vec<Protein>>,
+    per_spec_copies: Vec<Vec<Vec<[f64; 3]>>>,
     warnings: Vec<String>,
 ) -> PlacedProteins {
     let mut templates: Vec<Protein> = Vec::new();
-    let mut grouped: Vec<Vec<(Protein, f64)>> = Vec::new();
+    let mut grouped: Vec<Vec<(Vec<[f64; 3]>, f64)>> = Vec::new();
     let mut used_names: Vec<String> = Vec::new();
 
     for (spec, copies) in specs.iter().zip(per_spec_copies) {
@@ -709,10 +788,8 @@ fn finalize_placed(
             .iter()
             .position(|t| same_topology(t, &spec.protein))
         {
-            let tmpl_name = templates[pos].name.clone();
-            for mut inst in copies {
-                inst.name = tmpl_name.clone();
-                grouped[pos].push((inst, clearance));
+            for positions in copies {
+                grouped[pos].push((positions, clearance));
             }
         } else {
             let mut tmpl = spec.protein.clone();
@@ -724,15 +801,9 @@ fn finalize_placed(
                 }
                 tmpl.name = format!("{base}_{suffix}");
             }
-            let tmpl_name = tmpl.name.clone();
-            used_names.push(tmpl_name.clone());
+            used_names.push(tmpl.name.clone());
             templates.push(tmpl);
-            let mut list = Vec::with_capacity(copies.len());
-            for mut inst in copies {
-                inst.name = tmpl_name.clone();
-                list.push((inst, clearance));
-            }
-            grouped.push(list);
+            grouped.push(copies.into_iter().map(|pos| (pos, clearance)).collect());
         }
     }
 
@@ -740,20 +811,20 @@ fn finalize_placed(
     let mut instances = Vec::new();
     let mut obstacles = Vec::new();
     let mut raw_obstacles = Vec::new();
-    for (tmpl, list) in templates.iter().zip(grouped) {
+    for (tmpl_idx, (tmpl, list)) in templates.iter().zip(grouped).enumerate() {
         counts.push((tmpl.name.clone(), list.len()));
-        for (inst, clearance) in list {
-            for b in &inst.beads {
+        for (positions, clearance) in list {
+            for (b, &pos) in tmpl.beads.iter().zip(&positions) {
                 obstacles.push(Obstacle {
-                    pos: b.position,
+                    pos,
                     radius: b.radius + clearance,
                 });
                 raw_obstacles.push(Obstacle {
-                    pos: b.position,
+                    pos,
                     radius: b.radius,
                 });
             }
-            instances.push(inst);
+            instances.push((tmpl_idx, positions));
         }
     }
 
@@ -802,10 +873,15 @@ pub(crate) fn place_proteins_membrane(
     let mut per_spec_copies = Vec::with_capacity(specs.len());
     for spec in specs {
         let mut copies = Vec::with_capacity(spec.placement.copies);
-        let base_local = orient_local(&spec.protein, &spec.placement, 0.0);
-        check_midplane_warning(&base_local, &spec.placement, &mut warnings);
+        let base_local = orient_local_positions(&spec.protein, &spec.placement);
+        check_midplane_warning(
+            &spec.protein.name,
+            &base_local,
+            &spec.placement,
+            &mut warnings,
+        );
 
-        let (lo, hi) = base_local.bounding_box();
+        let (lo, hi) = positions_bbox(&base_local);
         if (hi[0] - lo[0]) > box_x || (hi[1] - lo[1]) > box_y {
             warnings.push(format!(
                 "protein '{}' lateral span ({:.1} x {:.1} nm) exceeds membrane box ({:.1} x {:.1} nm)",
@@ -817,17 +893,18 @@ pub(crate) fn place_proteins_membrane(
             ));
         }
 
+        let pivot = [0.0, 0.0, spec.placement.z_offset];
         for k in 0..spec.placement.copies {
-            let extra_rot = if spec.placement.copies > 1 {
-                (k as f64) * 360.0 / (spec.placement.copies as f64)
-            } else {
-                0.0
-            };
-            let mut inst = if k == 0 && extra_rot == 0.0 {
-                base_local.clone()
-            } else {
-                orient_local(&spec.protein, &spec.placement, extra_rot)
-            };
+            let mut positions = base_local.clone();
+            if spec.placement.copies > 1 && k > 0 {
+                let extra_rot = (k as f64) * 360.0 / (spec.placement.copies as f64);
+                rotate_positions_axis(
+                    &mut positions,
+                    pivot,
+                    [0.0, 0.0, 1.0],
+                    extra_rot.to_radians(),
+                );
+            }
 
             let (cx, cy) = if spec.placement.copies == 1
                 && (spec.placement.x.is_some() || spec.placement.y.is_some())
@@ -849,8 +926,8 @@ pub(crate) fn place_proteins_membrane(
                     wrap(gy + spec.placement.y.unwrap_or(0.0), box_y),
                 )
             };
-            inst.translate([cx, cy, 0.0]);
-            copies.push(inst);
+            translate_positions(&mut positions, [cx, cy, 0.0]);
+            copies.push(positions);
         }
         per_spec_copies.push(copies);
     }
@@ -871,15 +948,16 @@ pub(crate) fn place_proteins_vesicle(
     let mut per_spec_copies = Vec::with_capacity(specs.len());
     for spec in specs {
         let mut copies = Vec::with_capacity(spec.placement.copies);
-        let base_local = orient_local(&spec.protein, &spec.placement, 0.0);
-        check_midplane_warning(&base_local, &spec.placement, &mut warnings);
+        let base_local = orient_local_positions(&spec.protein, &spec.placement);
+        check_midplane_warning(
+            &spec.protein.name,
+            &base_local,
+            &spec.placement,
+            &mut warnings,
+        );
 
-        for k in 0..spec.placement.copies {
-            let mut inst = if k == 0 {
-                base_local.clone()
-            } else {
-                orient_local(&spec.protein, &spec.placement, 0.0)
-            };
+        for _ in 0..spec.placement.copies {
+            let mut positions = base_local.clone();
 
             let mut normal = if total_copies == 1 {
                 [0.0, 0.0, 1.0]
@@ -915,8 +993,8 @@ pub(crate) fn place_proteins_vesicle(
 
             let (u, v, n) = crate::protein::orthonormal_frame(normal);
             let origin = [r_mid * n[0], r_mid * n[1], r_mid * n[2]];
-            inst.apply_frame(origin, u, v, n);
-            copies.push(inst);
+            apply_frame_positions(&mut positions, origin, u, v, n);
+            copies.push(positions);
         }
         per_spec_copies.push(copies);
     }
@@ -939,15 +1017,16 @@ pub(crate) fn place_proteins_tubule(
     let mut per_spec_copies = Vec::with_capacity(specs.len());
     for spec in specs {
         let mut copies = Vec::with_capacity(spec.placement.copies);
-        let base_local = orient_local(&spec.protein, &spec.placement, 0.0);
-        check_midplane_warning(&base_local, &spec.placement, &mut warnings);
+        let base_local = orient_local_positions(&spec.protein, &spec.placement);
+        check_midplane_warning(
+            &spec.protein.name,
+            &base_local,
+            &spec.placement,
+            &mut warnings,
+        );
 
-        for k in 0..spec.placement.copies {
-            let mut inst = if k == 0 {
-                base_local.clone()
-            } else {
-                orient_local(&spec.protein, &spec.placement, 0.0)
-            };
+        for _ in 0..spec.placement.copies {
+            let mut positions = base_local.clone();
 
             let (base_theta, base_z) = if total_copies == 1 {
                 (0.0, 0.5 * length)
@@ -965,8 +1044,8 @@ pub(crate) fn place_proteins_tubule(
             let u = [-st, ct, 0.0];
             let v = [0.0, 0.0, 1.0];
             let origin = [r_mid * ct, r_mid * st, z_cyl];
-            inst.apply_frame(origin, u, v, n);
-            copies.push(inst);
+            apply_frame_positions(&mut positions, origin, u, v, n);
+            copies.push(positions);
         }
         per_spec_copies.push(copies);
     }
@@ -974,9 +1053,248 @@ pub(crate) fn place_proteins_tubule(
     Ok(finalize_placed(specs, per_spec_copies, warnings))
 }
 
+/// Distance metric used by [`carve_lipids`] and [`prune_clashing_lipids`].
+#[derive(Clone, Copy)]
+pub(crate) enum CarveMetric {
+    /// Periodic in `x`/`y`, Euclidean in `z` (flat bilayer).
+    Plane { box_x: f64, box_y: f64 },
+    /// Euclidean 3D (vesicle).
+    Sphere,
+    /// Euclidean in `x`/`y`, periodic in `z` (tubule).
+    Cylinder { length: f64 },
+}
+
+impl CarveMetric {
+    #[inline]
+    fn dist_sq(self, a: [f64; 3], b: [f64; 3]) -> f64 {
+        match self {
+            CarveMetric::Plane { box_x, box_y } => dist_sq_plane(a, b, box_x, box_y),
+            CarveMetric::Sphere => dist_sq_3d(a, b),
+            CarveMetric::Cylinder { length } => dist_sq_cylinder(a, b, length),
+        }
+    }
+}
+
+/// One axis of a 3D obstacle cell grid (either periodic or AABB-bounded).
+#[derive(Clone, Copy)]
+enum AxisGrid {
+    Periodic {
+        len: f64,
+        n: usize,
+        inv: f64,
+    },
+    Bounded {
+        lo: f64,
+        hi: f64,
+        n: usize,
+        inv: f64,
+    },
+}
+
+impl AxisGrid {
+    fn periodic(len: f64, cell: f64) -> Self {
+        let n = if len <= 2.0 * cell {
+            1
+        } else {
+            ((len / cell).floor() as usize).max(1)
+        };
+        AxisGrid::Periodic {
+            len,
+            n,
+            inv: n as f64 / len.max(1e-12),
+        }
+    }
+
+    fn bounded(lo: f64, hi: f64, cell: f64) -> Self {
+        let inv = 1.0 / cell;
+        let n = (((hi - lo) * inv).floor() as usize + 1).max(1);
+        AxisGrid::Bounded { lo, hi, n, inv }
+    }
+
+    #[inline]
+    fn count(self) -> usize {
+        match self {
+            AxisGrid::Periodic { n, .. } | AxisGrid::Bounded { n, .. } => n,
+        }
+    }
+
+    #[inline]
+    fn obs_cell(self, coord: f64) -> usize {
+        match self {
+            AxisGrid::Periodic { len, n, inv } => {
+                if n == 1 {
+                    0
+                } else {
+                    ((wrap(coord, len) * inv) as usize).min(n - 1)
+                }
+            }
+            AxisGrid::Bounded { lo, n, inv, .. } => {
+                (((coord - lo) * inv).max(0.0) as usize).min(n - 1)
+            }
+        }
+    }
+
+    /// Return the 1..=3 neighbor cell indices for `coord`, or `None` if outside
+    /// `[lo - max_cut, hi + max_cut]` on a bounded axis.
+    #[inline]
+    fn neighbor_cells(self, coord: f64, max_cut: f64) -> Option<([usize; 3], usize)> {
+        match self {
+            AxisGrid::Periodic { len, n, inv } => {
+                if n == 1 {
+                    return Some(([0, 0, 0], 1));
+                }
+                let c = ((wrap(coord, len) * inv) as usize).min(n - 1);
+                if n == 2 {
+                    Some(([0, 1, 0], 2))
+                } else {
+                    let prev = if c == 0 { n - 1 } else { c - 1 };
+                    let next = if c + 1 == n { 0 } else { c + 1 };
+                    Some(([prev, c, next], 3))
+                }
+            }
+            AxisGrid::Bounded { lo, hi, n, inv } => {
+                if coord < lo - max_cut || coord > hi + max_cut {
+                    return None;
+                }
+                let c = if coord <= lo {
+                    0
+                } else {
+                    (((coord - lo) * inv) as usize).min(n - 1)
+                };
+                let start = c.saturating_sub(1);
+                let end = (c + 1).min(n - 1);
+                let mut out = [0usize; 3];
+                let mut len = 0;
+                for idx in start..=end {
+                    out[len] = idx;
+                    len += 1;
+                }
+                Some((out, len))
+            }
+        }
+    }
+}
+
+/// Compact CSR 3D cell grid over fixed obstacles supporting mixed periodic and
+/// bounded axes for O(N_beads) lipid carving and post-relaxation pruning.
+struct ObstacleGrid {
+    axes: [AxisGrid; 3],
+    offsets: Vec<u32>,
+    sorted: Vec<Obstacle>,
+    max_cut: f64,
+    metric: CarveMetric,
+}
+
+impl ObstacleGrid {
+    fn build(obstacles: &[Obstacle], max_cut: f64, metric: CarveMetric) -> Option<Self> {
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for o in obstacles {
+            for a in 0..3 {
+                lo[a] = lo[a].min(o.pos[a]);
+                hi[a] = hi[a].max(o.pos[a]);
+            }
+        }
+        let cell = max_cut.max(0.5);
+        let axes = match metric {
+            CarveMetric::Plane { box_x, box_y } => [
+                AxisGrid::periodic(box_x, cell),
+                AxisGrid::periodic(box_y, cell),
+                AxisGrid::bounded(lo[2], hi[2], cell),
+            ],
+            CarveMetric::Sphere => [
+                AxisGrid::bounded(lo[0], hi[0], cell),
+                AxisGrid::bounded(lo[1], hi[1], cell),
+                AxisGrid::bounded(lo[2], hi[2], cell),
+            ],
+            CarveMetric::Cylinder { length } => [
+                AxisGrid::bounded(lo[0], hi[0], cell),
+                AxisGrid::bounded(lo[1], hi[1], cell),
+                AxisGrid::periodic(length, cell),
+            ],
+        };
+        let (nx, ny, nz) = (axes[0].count(), axes[1].count(), axes[2].count());
+        let ncells = nx.saturating_mul(ny).saturating_mul(nz);
+        if ncells == 0 || ncells > 2_000_000 {
+            return None;
+        }
+
+        let mut counts = vec![0u32; ncells];
+        let mut cell_of = Vec::with_capacity(obstacles.len());
+        for o in obstacles {
+            let cx = axes[0].obs_cell(o.pos[0]);
+            let cy = axes[1].obs_cell(o.pos[1]);
+            let cz = axes[2].obs_cell(o.pos[2]);
+            let c = (cz * ny + cy) * nx + cx;
+            cell_of.push(c as u32);
+            counts[c] += 1;
+        }
+        let mut offsets = vec![0u32; ncells + 1];
+        let mut acc = 0u32;
+        for c in 0..ncells {
+            offsets[c] = acc;
+            acc += counts[c];
+            counts[c] = offsets[c];
+        }
+        offsets[ncells] = acc;
+
+        let mut sorted = vec![
+            Obstacle {
+                pos: [0.0; 3],
+                radius: 0.0,
+            };
+            obstacles.len()
+        ];
+        for (&o, c) in obstacles.iter().zip(cell_of) {
+            let slot = counts[c as usize] as usize;
+            counts[c as usize] += 1;
+            sorted[slot] = o;
+        }
+        Some(Self {
+            axes,
+            offsets,
+            sorted,
+            max_cut,
+            metric,
+        })
+    }
+
+    #[inline]
+    fn overlaps(&self, p: [f64; 3], rl: f64, margin: f64) -> bool {
+        let Some((xs, n_xs)) = self.axes[0].neighbor_cells(p[0], self.max_cut) else {
+            return false;
+        };
+        let Some((ys, n_ys)) = self.axes[1].neighbor_cells(p[1], self.max_cut) else {
+            return false;
+        };
+        let Some((zs, n_zs)) = self.axes[2].neighbor_cells(p[2], self.max_cut) else {
+            return false;
+        };
+        let (nx, ny) = (self.axes[0].count(), self.axes[1].count());
+        for &cz in &zs[..n_zs] {
+            let z_base = cz * ny;
+            for &cy in &ys[..n_ys] {
+                let row = (z_base + cy) * nx;
+                for &cx in &xs[..n_xs] {
+                    let c = row + cx;
+                    let start = self.offsets[c] as usize;
+                    let end = self.offsets[c + 1] as usize;
+                    for o in &self.sorted[start..end] {
+                        let cut = (rl + o.radius - margin).max(0.0);
+                        if cut > 0.0 && self.metric.dist_sq(p, o.pos) < cut * cut {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
 /// Remove every lipid molecule in `ranges` that has any bead overlapping any
 /// obstacle according to `dist_sq(p_lipid, p_obs) < (r_lipid + r_obs - margin)²`.
-/// Compacts `particles`, `radii`, `ranges`, and updates `first_leaflet_lipids`.
+/// Compacts `particles`, `radii`, `ranges` in place and updates `first_leaflet_lipids`.
 /// Returns the number of removed lipids.
 pub(crate) fn carve_lipids(
     particles: &mut Vec<Particle>,
@@ -985,24 +1303,47 @@ pub(crate) fn carve_lipids(
     first_leaflet_lipids: &mut usize,
     obstacles: &[Obstacle],
     margin: f64,
-    dist_sq: impl Fn([f64; 3], [f64; 3]) -> f64,
+    metric: CarveMetric,
 ) -> usize {
     if obstacles.is_empty() || ranges.is_empty() {
         return 0;
     }
 
+    let max_lipid_r = radii.iter().copied().fold(0.0_f64, f64::max);
+    let max_obs_r = obstacles.iter().map(|o| o.radius).fold(0.0_f64, f64::max);
+    let max_cut = (max_lipid_r + max_obs_r - margin).max(0.0);
+    if max_cut <= 0.0 {
+        return 0;
+    }
+
+    let grid = (obstacles.len() > 32)
+        .then(|| ObstacleGrid::build(obstacles, max_cut, metric))
+        .flatten();
+
     let mut keep_lipid = vec![true; ranges.len()];
     let mut removed = 0usize;
-    for (li, range) in ranges.iter().enumerate() {
-        'lipid: for k in range.clone() {
-            let p = particles[k].position;
-            let rl = radii[k];
-            for o in obstacles {
-                let cut = (rl + o.radius - margin).max(0.0);
-                if cut > 0.0 && dist_sq(p, o.pos) < cut * cut {
+    if let Some(grid) = &grid {
+        for (li, range) in ranges.iter().enumerate() {
+            for k in range.clone() {
+                if grid.overlaps(particles[k].position, radii[k], margin) {
                     keep_lipid[li] = false;
                     removed += 1;
-                    break 'lipid;
+                    break;
+                }
+            }
+        }
+    } else {
+        for (li, range) in ranges.iter().enumerate() {
+            'lipid: for k in range.clone() {
+                let p = particles[k].position;
+                let rl = radii[k];
+                for o in obstacles {
+                    let cut = (rl + o.radius - margin).max(0.0);
+                    if cut > 0.0 && metric.dist_sq(p, o.pos) < cut * cut {
+                        keep_lipid[li] = false;
+                        removed += 1;
+                        break 'lipid;
+                    }
                 }
             }
         }
@@ -1011,11 +1352,12 @@ pub(crate) fn carve_lipids(
         return 0;
     }
 
+    // Compact particles and radii in place without cloning Particle strings.
     let old_first = *first_leaflet_lipids;
-    let mut new_particles = Vec::with_capacity(particles.len());
-    let mut new_radii = Vec::with_capacity(radii.len());
+    let mut keep_bead = vec![false; particles.len()];
     let mut new_ranges = Vec::with_capacity(ranges.len() - removed);
     let mut new_first = 0usize;
+    let mut cursor = 0usize;
     for (li, range) in ranges.iter().enumerate() {
         if !keep_lipid[li] {
             continue;
@@ -1023,13 +1365,25 @@ pub(crate) fn carve_lipids(
         if li < old_first {
             new_first += 1;
         }
-        let start = new_particles.len();
-        new_particles.extend(particles[range.clone()].iter().cloned());
-        new_radii.extend_from_slice(&radii[range.clone()]);
-        new_ranges.push(start..new_particles.len());
+        for slot in &mut keep_bead[range.clone()] {
+            *slot = true;
+        }
+        let len = range.len();
+        new_ranges.push(cursor..(cursor + len));
+        cursor += len;
     }
-    *particles = new_particles;
-    *radii = new_radii;
+    let mut idx = 0usize;
+    particles.retain(|_| {
+        let keep = keep_bead[idx];
+        idx += 1;
+        keep
+    });
+    idx = 0;
+    radii.retain(|_| {
+        let keep = keep_bead[idx];
+        idx += 1;
+        keep
+    });
     *ranges = new_ranges;
     *first_leaflet_lipids = new_first;
     removed
@@ -1042,7 +1396,7 @@ pub(crate) fn prune_clashing_lipids(
     ranges: &mut Vec<Range<usize>>,
     first_leaflet_lipids: &mut usize,
     raw_obstacles: &[Obstacle],
-    dist_sq: impl Fn([f64; 3], [f64; 3]) -> f64,
+    metric: CarveMetric,
 ) -> usize {
     carve_lipids(
         particles,
@@ -1051,7 +1405,7 @@ pub(crate) fn prune_clashing_lipids(
         first_leaflet_lipids,
         raw_obstacles,
         POST_RELAX_PRUNE_TOL,
-        dist_sq,
+        metric,
     )
 }
 
@@ -1095,15 +1449,26 @@ pub(crate) fn assemble_system(
     carved_lipids: usize,
     pruned_lipids: usize,
 ) -> EmbeddedSystem {
-    let mut particles = Vec::new();
+    let prot_beads: usize = placed.instances.iter().map(|(_, pos)| pos.len()).sum();
+    let mut particles = Vec::with_capacity(prot_beads + lipid_particles.len());
     let mut next_res_id = 1usize;
     let mut next_atom_id = 1usize;
 
-    for prot in &placed.instances {
-        let prot_parts = prot.to_particles(next_res_id, next_atom_id);
-        next_res_id += prot.beads.len();
-        next_atom_id += prot.beads.len();
-        particles.extend(prot_parts);
+    for (tmpl_idx, positions) in &placed.instances {
+        let tmpl = &placed.templates[*tmpl_idx];
+        for (b, &position) in tmpl.beads.iter().zip(positions) {
+            particles.push(Particle {
+                residue: b.residue.clone(),
+                bead: b.atom.clone(),
+                molecule_id: next_res_id,
+                atom_id: next_atom_id,
+                position,
+                charge: b.charge,
+                mass: b.mass,
+            });
+            next_res_id += 1;
+            next_atom_id += 1;
+        }
     }
 
     let lipid_particle_start = particles.len();
@@ -1119,7 +1484,6 @@ pub(crate) fn assemble_system(
         name: name.to_string(),
         protein_templates: placed.templates,
         protein_counts: placed.counts,
-        proteins: placed.instances,
         carved_lipids,
         pruned_lipids,
         warnings: placed.warnings,
@@ -1248,7 +1612,7 @@ mod tests {
         // Verify zero steric clash between protein and lipid beads.
         let (bx, by) = (sys.box_size[0], sys.box_size[1]);
         let mut min_dist = f64::INFINITY;
-        for pb in &sys.proteins[0].beads {
+        for pb in sys.protein_particles() {
             for lp in sys.lipid_particles() {
                 let d = dist_sq_plane(pb.position, lp.position, bx, by).sqrt();
                 min_dist = min_dist.min(d);
@@ -1304,12 +1668,10 @@ mod tests {
         assert_eq!(ves.total_proteins(), 3);
         assert_eq!(ves.protein_counts, vec![("tmhelix_cg".to_string(), 3)]);
         assert!(ves.carved_lipids > 0);
-        for prot in &ves.proteins {
-            for pb in &prot.beads {
-                for lp in ves.lipid_particles() {
-                    let d = dist_sq_3d(pb.position, lp.position).sqrt();
-                    assert!(d > 0.45, "vesicle protein-lipid clash: d={d:.3}");
-                }
+        for pb in ves.protein_particles() {
+            for lp in ves.lipid_particles() {
+                let d = dist_sq_3d(pb.position, lp.position).sqrt();
+                assert!(d > 0.45, "vesicle protein-lipid clash: d={d:.3}");
             }
         }
 
@@ -1328,12 +1690,59 @@ mod tests {
         .unwrap();
         assert_eq!(tub.total_proteins(), 3);
         assert!(tub.carved_lipids > 0);
-        for prot in &tub.proteins {
-            for pb in &prot.beads {
-                for lp in tub.lipid_particles() {
-                    let d = dist_sq_cylinder(pb.position, lp.position, 16.0).sqrt();
-                    assert!(d > 0.45, "tubule protein-lipid clash: d={d:.3}");
-                }
+        for pb in tub.protein_particles() {
+            for lp in tub.lipid_particles() {
+                let d = dist_sq_cylinder(pb.position, lp.position, 16.0).sqrt();
+                assert!(d > 0.45, "tubule protein-lipid clash: d={d:.3}");
+            }
+        }
+    }
+
+    #[test]
+    fn obstacle_grid_matches_brute_force_across_all_metrics() {
+        use rand::Rng;
+
+        let mut rng = StdRng::seed_from_u64(123);
+        let obstacles: Vec<Obstacle> = (0..120)
+            .map(|_| Obstacle {
+                pos: [
+                    rng.random_range(0.0..12.0),
+                    rng.random_range(0.0..10.0),
+                    rng.random_range(-3.0..3.0),
+                ],
+                radius: rng.random_range(0.25..0.55),
+            })
+            .collect();
+        let queries: Vec<([f64; 3], f64)> = (0..400)
+            .map(|_| {
+                (
+                    [
+                        rng.random_range(-1.0..13.0),
+                        rng.random_range(-1.0..11.0),
+                        rng.random_range(-4.5..4.5),
+                    ],
+                    rng.random_range(0.2..0.45),
+                )
+            })
+            .collect();
+
+        let margin = 0.05;
+        let max_cut = 0.45 + 0.55 - margin;
+        for metric in [
+            CarveMetric::Plane {
+                box_x: 12.0,
+                box_y: 10.0,
+            },
+            CarveMetric::Sphere,
+            CarveMetric::Cylinder { length: 6.0 },
+        ] {
+            let grid = ObstacleGrid::build(&obstacles, max_cut, metric).unwrap();
+            for &(p, rl) in &queries {
+                let brute = obstacles.iter().any(|o| {
+                    let cut = (rl + o.radius - margin).max(0.0);
+                    cut > 0.0 && metric.dist_sq(p, o.pos) < cut * cut
+                });
+                assert_eq!(grid.overlaps(p, rl, margin), brute);
             }
         }
     }

@@ -21,36 +21,53 @@ impl<'a> Gro<'a> {
     }
 }
 
-fn write_gro_particle(f: &mut impl fmt::Write, p: &Particle) -> fmt::Result {
+pub(crate) fn write_gro_line(
+    f: &mut impl fmt::Write,
+    res_id: usize,
+    residue: &str,
+    bead: &str,
+    atom_id: usize,
+    position: [f64; 3],
+) -> fmt::Result {
     writeln!(
         f,
         "{:>5}{:>5}{:>5}{:>5}{:>8.3}{:>8.3}{:>8.3}  0.0000  0.0000  0.0000 ",
-        p.molecule_id % 100000,
-        p.residue,
-        p.bead,
-        p.atom_id % 100000,
-        p.position[0],
-        p.position[1],
-        p.position[2],
+        res_id % 100000,
+        residue,
+        bead,
+        atom_id % 100000,
+        position[0],
+        position[1],
+        position[2],
     )
+}
+
+fn write_gro_particle(f: &mut impl fmt::Write, p: &Particle) -> fmt::Result {
+    write_gro_line(f, p.molecule_id, &p.residue, &p.bead, p.atom_id, p.position)
+}
+
+/// Render a particle list as a GROMACS `.gro` coordinate file using parallel
+/// formatting for large systems.
+pub fn render(particles: &[Particle], title: &str, box_size: [f64; 3]) -> String {
+    let mut s = String::with_capacity(particles.len() * 70 + 128);
+    let _ = writeln!(s, "{title}, t = {:>16.3} ", 0.0);
+    let _ = writeln!(s, "{:>12} ", particles.len());
+    write_particles(&mut s, particles, 70, |buf, p| {
+        let _ = write_gro_particle(buf, p);
+    });
+    let _ = writeln!(
+        s,
+        "{:>15.4}{:>15.4}{:>15.4} ",
+        box_size[0], box_size[1], box_size[2]
+    );
+    let _ = writeln!(s);
+    s
 }
 
 impl Membrane {
     /// Render this membrane as a GROMACS `.gro` coordinate file.
     pub fn to_gro(&self) -> String {
-        let mut s = String::with_capacity(self.particles.len() * 70 + 128);
-        let _ = writeln!(s, "{}, t = {:>16.3} ", self.name, 0.0);
-        let _ = writeln!(s, "{:>12} ", self.particles.len());
-        write_particles(&mut s, &self.particles, 70, |buf, p| {
-            let _ = write_gro_particle(buf, p);
-        });
-        let _ = writeln!(
-            s,
-            "{:>15.4}{:>15.4}{:>15.4} ",
-            self.box_size[0], self.box_size[1], self.box_size[2]
-        );
-        let _ = writeln!(s);
-        s
+        render(&self.particles, &self.name, self.box_size)
     }
 }
 

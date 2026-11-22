@@ -39,7 +39,8 @@ use isolf::embed::{
 use isolf::error::BuildError;
 use isolf::force_field::ForceField;
 use isolf::membrane::{
-    BuildOptions, DEFAULT_NAME, DEFAULT_PADDING, DEFAULT_TEMPERATURE, Phase, RelaxFrame, Sizing,
+    BuildOptions, DEFAULT_NAME, DEFAULT_PADDING, DEFAULT_TEMPERATURE, Particle, Phase, RelaxFrame,
+    Sizing,
 };
 use isolf::protein::Protein;
 use isolf::protein::aicg2p::{
@@ -552,6 +553,73 @@ struct CommonBuildArgs {
     #[arg(long, help_heading = "Output files")]
     gif: bool,
 
+    #[command(flatten)]
+    formats: FormatArgs,
+
+    #[command(flatten)]
+    controls: ControlArgs,
+
+    #[command(flatten)]
+    vmd_opts: VmdArgs,
+
+    /// Colouring scheme [default: head] (implies --vmd).
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        value_name = "SCOPE",
+        help_heading = "VMD visualization (--vmd)"
+    )]
+    vmd_color_by: Option<LipidColorScope>,
+
+    // ---- Relaxation animation (--gif) ----
+    /// Render mode: point scatter or density heatmap [default: point] (implies --gif).
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        value_name = "MODE",
+        help_heading = "Relaxation animation (--gif)"
+    )]
+    gif_mode: Option<GifModeArg>,
+
+    /// Resolution multiplier, e.g. 2 doubles it [default: 1] (implies --gif).
+    #[arg(
+        long,
+        value_name = "FACTOR",
+        help_heading = "Relaxation animation (--gif)"
+    )]
+    gif_scale: Option<f64>,
+
+    /// Playback speed in frames per second [default: 14] (implies --gif).
+    #[arg(
+        long,
+        value_name = "FPS",
+        help_heading = "Relaxation animation (--gif)"
+    )]
+    gif_fps: Option<u16>,
+
+    #[command(flatten)]
+    general: GeneralArgs,
+}
+
+impl CommonBuildArgs {
+    fn want_inp(&self) -> bool {
+        self.inp || self.controls.has_overrides()
+    }
+
+    fn want_vmd(&self) -> bool {
+        self.vmd || self.vmd_opts.any_set() || self.vmd_color_by.is_some()
+    }
+
+    fn want_gif(&self) -> bool {
+        self.gif || self.gif_mode.is_some() || self.gif_scale.is_some() || self.gif_fps.is_some()
+    }
+}
+
+/// Optional coordinate / structure formats shared across all build subcommands.
+#[derive(clap::Args, Debug)]
+struct FormatArgs {
     /// Write a .pdb coordinate file.
     #[arg(long, help_heading = "Output files")]
     pdb: bool,
@@ -567,8 +635,11 @@ struct CommonBuildArgs {
     /// Write an mmCIF .cif coordinate file.
     #[arg(long, help_heading = "Output files")]
     cif: bool,
+}
 
-    // ---- GENESIS control files (--inp) ----
+/// GENESIS `.inp` stage override flags shared across all build subcommands.
+#[derive(clap::Args, Debug)]
+struct ControlArgs {
     /// Simulation temperature in K for GENESIS .inp files [default: 323.15].
     #[arg(
         short = 't',
@@ -615,9 +686,66 @@ struct CommonBuildArgs {
         help_heading = "GENESIS control files (--inp)"
     )]
     prod: Vec<String>,
+}
 
-    // ---- VMD visualization (--vmd) ----
-    /// Use a smooth QuickSurf surface instead of VDW spheres (implies --vmd).
+impl ControlArgs {
+    fn has_overrides(&self) -> bool {
+        !self.min.is_empty() || !self.equil.is_empty() || !self.prod.is_empty()
+    }
+
+    /// Parse and pre-validate `--min`, `--equil`, `--prod`, and `--temperature`
+    /// before building so bad period multiples fail immediately.
+    fn prepare(
+        &self,
+        want_inp: bool,
+        is_npt: bool,
+    ) -> Result<(ControlSpecs, Option<String>), Box<dyn Error>> {
+        if let Some(t) = self.temperature
+            && (!t.is_finite() || t <= 0.0)
+        {
+            return Err(format!("--temperature: '{t}' is not a positive temperature in K").into());
+        }
+        let temperature = self.temperature.unwrap_or(DEFAULT_TEMPERATURE);
+        let min = parse_min_spec(&self.min)?;
+        let equil = parse_dyn_spec("--equil", &self.equil, DynSpec::default_equil())?;
+        let prod = parse_dyn_spec("--prod", &self.prod, DynSpec::default_prod())?;
+
+        if want_inp {
+            // Validate step/period divisibility up front (placeholder seed & box).
+            isolf::inp::minimization("x", &min.to_params([1.0; 3], temperature))
+                .map_err(|e| format!("--min: {e}"))?;
+            let check_dyn = |flag: &str, spec: DynSpec| -> Result<(), Box<dyn Error>> {
+                let p = spec.to_params(temperature, 1);
+                let res = if is_npt {
+                    isolf::inp::npt("x", "x", "x", &p)
+                } else {
+                    isolf::inp::nvt("x", "x", "x", &p)
+                };
+                res.map(|_| ()).map_err(|e| format!("{flag}: {e}").into())
+            };
+            check_dyn("--equil", equil)?;
+            check_dyn("--prod", prod)?;
+        }
+
+        let temp_note = (self.temperature.is_some() && !want_inp).then(|| {
+            "--temperature only affects GENESIS .inp files (pass --inp to write them)".to_string()
+        });
+        Ok((
+            ControlSpecs {
+                temperature,
+                min,
+                equil,
+                prod,
+            },
+            temp_note,
+        ))
+    }
+}
+
+/// VMD visualization options shared across all build subcommands.
+#[derive(clap::Args, Debug)]
+struct VmdArgs {
+    /// Use a smooth QuickSurf surface instead of VDW spheres / CA Tube (implies --vmd).
     #[arg(long, help_heading = "VMD visualization (--vmd)")]
     vmd_surface: bool,
 
@@ -640,45 +768,22 @@ struct CommonBuildArgs {
     /// Trajectory smoothing window in frames [default: 5] (implies --vmd).
     #[arg(long, value_name = "N", help_heading = "VMD visualization (--vmd)")]
     vmd_smooth: Option<usize>,
+}
 
-    /// Colouring scheme [default: head] (implies --vmd).
-    #[arg(
-        long,
-        value_enum,
-        ignore_case = true,
-        value_name = "SCOPE",
-        help_heading = "VMD visualization (--vmd)"
-    )]
-    vmd_color_by: Option<LipidColorScope>,
+impl VmdArgs {
+    fn any_set(&self) -> bool {
+        self.vmd_surface
+            || self.vmd_cutaway
+            || self.vmd_render
+            || self.vmd_background.is_some()
+            || self.vmd_material.is_some()
+            || self.vmd_smooth.is_some()
+    }
+}
 
-    // ---- Relaxation animation (--gif) ----
-    /// Render mode: point scatter or density heatmap [default: point] (implies --gif).
-    #[arg(
-        long,
-        value_enum,
-        ignore_case = true,
-        value_name = "MODE",
-        help_heading = "Relaxation animation (--gif)"
-    )]
-    gif_mode: Option<GifModeArg>,
-
-    /// Resolution multiplier, e.g. 2 doubles it [default: 1] (implies --gif).
-    #[arg(
-        long,
-        value_name = "FACTOR",
-        help_heading = "Relaxation animation (--gif)"
-    )]
-    gif_scale: Option<f64>,
-
-    /// Playback speed in frames per second [default: 14] (implies --gif).
-    #[arg(
-        long,
-        value_name = "FPS",
-        help_heading = "Relaxation animation (--gif)"
-    )]
-    gif_fps: Option<u16>,
-
-    // ---- General ----
+/// Seed and terminal-output flags shared across all build subcommands.
+#[derive(clap::Args, Debug)]
+struct GeneralArgs {
     /// Seed value for the RNG (random if unset).
     #[arg(long, value_name = "SEED", help_heading = "General")]
     seed: Option<u64>,
@@ -703,27 +808,6 @@ struct CommonBuildArgs {
     /// Use ASCII status markers instead of Unicode glyphs.
     #[arg(long, help_heading = "General")]
     ascii: bool,
-}
-
-impl CommonBuildArgs {
-    fn want_inp(&self) -> bool {
-        self.inp || !self.min.is_empty() || !self.equil.is_empty() || !self.prod.is_empty()
-    }
-
-    fn want_vmd(&self) -> bool {
-        self.vmd
-            || self.vmd_surface
-            || self.vmd_cutaway
-            || self.vmd_render
-            || self.vmd_background.is_some()
-            || self.vmd_material.is_some()
-            || self.vmd_smooth.is_some()
-            || self.vmd_color_by.is_some()
-    }
-
-    fn want_gif(&self) -> bool {
-        self.gif || self.gif_mode.is_some() || self.gif_scale.is_some() || self.gif_fps.is_some()
-    }
 }
 
 /// Arguments for `isolf protein`.
@@ -846,121 +930,26 @@ struct ProteinArgs {
     #[arg(long, help_heading = "Output files")]
     vmd: bool,
 
-    /// Write a .pdb coordinate file.
-    #[arg(long, help_heading = "Output files")]
-    pdb: bool,
+    #[command(flatten)]
+    formats: FormatArgs,
 
-    /// Write a CHARMM .psf structure file.
-    #[arg(long, help_heading = "Output files")]
-    psf: bool,
+    #[command(flatten)]
+    controls: ControlArgs,
 
-    /// Write a CHARMM .crd coordinate file.
-    #[arg(long, help_heading = "Output files")]
-    crd: bool,
+    #[command(flatten)]
+    vmd_opts: VmdArgs,
 
-    /// Write an mmCIF .cif coordinate file.
-    #[arg(long, help_heading = "Output files")]
-    cif: bool,
-
-    // ---- GENESIS control files (--inp) ----
-    /// Simulation temperature in K for GENESIS .inp files [default: 323.15].
-    #[arg(
-        short = 't',
-        long,
-        value_name = "K",
-        help_heading = "GENESIS control files (--inp)"
-    )]
-    temperature: Option<f64>,
-
-    /// Minimization (min.inp) overrides as KEY=VAL or <steps> (implies --inp).
-    #[arg(
-        long,
-        value_name = "SPEC",
-        help_heading = "GENESIS control files (--inp)"
-    )]
-    min: Vec<String>,
-
-    /// Equilibration (nvt.inp) overrides as KEY=VAL or <steps> (implies --inp).
-    #[arg(
-        long,
-        value_name = "SPEC",
-        help_heading = "GENESIS control files (--inp)"
-    )]
-    equil: Vec<String>,
-
-    /// Production (pro.inp) overrides as KEY=VAL or <steps> (implies --inp).
-    #[arg(
-        long,
-        value_name = "SPEC",
-        help_heading = "GENESIS control files (--inp)"
-    )]
-    prod: Vec<String>,
-
-    // ---- VMD visualization (--vmd) ----
-    /// Use a smooth QuickSurf surface instead of a CA Tube (implies --vmd).
-    #[arg(long, help_heading = "VMD visualization (--vmd)")]
-    vmd_surface: bool,
-
-    /// Slice the system with a clipping plane (implies --vmd).
-    #[arg(long, help_heading = "VMD visualization (--vmd)")]
-    vmd_cutaway: bool,
-
-    /// Append a Tachyon ray-tracing render command to each script (implies --vmd).
-    #[arg(long, help_heading = "VMD visualization (--vmd)")]
-    vmd_render: bool,
-
-    /// VMD background colour name [default: white] (implies --vmd).
-    #[arg(long, value_name = "COLOR", help_heading = "VMD visualization (--vmd)")]
-    vmd_background: Option<String>,
-
-    /// VMD representation material [default: AOChalky] (implies --vmd).
-    #[arg(long, value_name = "NAME", help_heading = "VMD visualization (--vmd)")]
-    vmd_material: Option<String>,
-
-    /// Trajectory smoothing window in frames [default: 5] (implies --vmd).
-    #[arg(long, value_name = "N", help_heading = "VMD visualization (--vmd)")]
-    vmd_smooth: Option<usize>,
-
-    // ---- General ----
-    /// Seed value for the RNG (random if unset).
-    #[arg(long, value_name = "SEED", help_heading = "General")]
-    seed: Option<u64>,
-
-    /// Print only the final summary and any warnings.
-    #[arg(
-        short = 'q',
-        long,
-        conflicts_with = "verbose",
-        help_heading = "General"
-    )]
-    quiet: bool,
-
-    /// Print full file paths in the Write section.
-    #[arg(short = 'v', long, help_heading = "General")]
-    verbose: bool,
-
-    /// Disable coloured terminal output.
-    #[arg(long, help_heading = "General")]
-    no_color: bool,
-
-    /// Use ASCII status markers instead of Unicode glyphs.
-    #[arg(long, help_heading = "General")]
-    ascii: bool,
+    #[command(flatten)]
+    general: GeneralArgs,
 }
 
 impl ProteinArgs {
     fn want_inp(&self) -> bool {
-        self.inp || !self.min.is_empty() || !self.equil.is_empty() || !self.prod.is_empty()
+        self.inp || self.controls.has_overrides()
     }
 
     fn want_vmd(&self) -> bool {
-        self.vmd
-            || self.vmd_surface
-            || self.vmd_cutaway
-            || self.vmd_render
-            || self.vmd_background.is_some()
-            || self.vmd_material.is_some()
-            || self.vmd_smooth.is_some()
+        self.vmd || self.vmd_opts.any_set()
     }
 }
 
@@ -1100,24 +1089,29 @@ fn main() {
 
     let (ascii, quiet, verbose, flag_no_color) = match &cli.command {
         Command::Membrane(a) => (
-            a.common.ascii,
-            a.common.quiet,
-            a.common.verbose,
-            a.common.no_color,
+            a.common.general.ascii,
+            a.common.general.quiet,
+            a.common.general.verbose,
+            a.common.general.no_color,
         ),
         Command::Vesicle(a) => (
-            a.common.ascii,
-            a.common.quiet,
-            a.common.verbose,
-            a.common.no_color,
+            a.common.general.ascii,
+            a.common.general.quiet,
+            a.common.general.verbose,
+            a.common.general.no_color,
         ),
         Command::Tubule(a) => (
-            a.common.ascii,
-            a.common.quiet,
-            a.common.verbose,
-            a.common.no_color,
+            a.common.general.ascii,
+            a.common.general.quiet,
+            a.common.general.verbose,
+            a.common.general.no_color,
         ),
-        Command::Protein(a) => (a.ascii, a.quiet, a.verbose, a.no_color),
+        Command::Protein(a) => (
+            a.general.ascii,
+            a.general.quiet,
+            a.general.verbose,
+            a.general.no_color,
+        ),
         Command::Lipids(a) => (a.ascii, false, false, a.no_color),
         Command::Update | Command::Uninstall => (false, false, false, false),
     };
@@ -1151,54 +1145,6 @@ struct ControlSpecs {
     min: MinSpec,
     equil: DynSpec,
     prod: DynSpec,
-}
-
-/// Parse and pre-validate `--min`, `--equil`, `--prod`, and `--temperature`
-/// before building so bad period multiples fail immediately.
-fn prepare_controls(
-    common: &CommonBuildArgs,
-    geometry: Geometry,
-) -> Result<(ControlSpecs, Option<String>), Box<dyn Error>> {
-    if let Some(t) = common.temperature
-        && (!t.is_finite() || t <= 0.0)
-    {
-        return Err(format!("--temperature: '{t}' is not a positive temperature in K").into());
-    }
-    let temperature = common.temperature.unwrap_or(DEFAULT_TEMPERATURE);
-    let min = parse_min_spec(&common.min)?;
-    let equil = parse_dyn_spec("--equil", &common.equil, DynSpec::default_equil())?;
-    let prod = parse_dyn_spec("--prod", &common.prod, DynSpec::default_prod())?;
-
-    let want_inp = common.want_inp();
-    if want_inp {
-        // Validate step/period divisibility up front (placeholder seed & box).
-        isolf::inp::minimization("x", &min.to_params([1.0; 3], temperature))
-            .map_err(|e| format!("--min: {e}"))?;
-        let check_dyn = |flag: &str, spec: DynSpec| -> Result<(), Box<dyn Error>> {
-            let p = spec.to_params(temperature, 1);
-            let res = if geometry.is_npt() {
-                isolf::inp::npt("x", "x", "x", &p)
-            } else {
-                isolf::inp::nvt("x", "x", "x", &p)
-            };
-            res.map(|_| ()).map_err(|e| format!("{flag}: {e}").into())
-        };
-        check_dyn("--equil", equil)?;
-        check_dyn("--prod", prod)?;
-    }
-
-    let temp_note = (common.temperature.is_some() && !want_inp).then(|| {
-        "--temperature only affects GENESIS .inp files (pass --inp to write them)".to_string()
-    });
-    Ok((
-        ControlSpecs {
-            temperature,
-            min,
-            equil,
-            prod,
-        },
-        temp_note,
-    ))
 }
 
 fn validate_padding(padding: f64) -> Result<(), Box<dyn Error>> {
@@ -1421,9 +1367,16 @@ fn run_membrane(args: MembraneArgs) -> Result<(), Box<dyn Error>> {
     )
     .map_err(|e| enrich_build_error(&force_field, e))?;
     let protein_specs = parse_protein_specs(&args.common.proteins)?;
-    let (controls, temp_note) = prepare_controls(&args.common, Geometry::Membrane)?;
+    let (controls, temp_note) = args
+        .common
+        .controls
+        .prepare(args.common.want_inp(), Geometry::Membrane.is_npt())?;
 
-    let seed = args.common.seed.unwrap_or_else(|| rand::rng().random());
+    let seed = args
+        .common
+        .general
+        .seed
+        .unwrap_or_else(|| rand::rng().random());
     let mut rng = StdRng::seed_from_u64(seed);
     let options = BuildOptions {
         padding: args.padding,
@@ -1503,9 +1456,16 @@ fn run_vesicle(args: VesicleArgs) -> Result<(), Box<dyn Error>> {
     isolf::membrane::area_per_lipid(&force_field, &inner)
         .map_err(|e| enrich_build_error(&force_field, e))?;
     let protein_specs = parse_protein_specs(&args.common.proteins)?;
-    let (controls, temp_note) = prepare_controls(&args.common, Geometry::Vesicle)?;
+    let (controls, temp_note) = args
+        .common
+        .controls
+        .prepare(args.common.want_inp(), Geometry::Vesicle.is_npt())?;
 
-    let seed = args.common.seed.unwrap_or_else(|| rand::rng().random());
+    let seed = args
+        .common
+        .general
+        .seed
+        .unwrap_or_else(|| rand::rng().random());
     let mut rng = StdRng::seed_from_u64(seed);
     let options = BuildOptions {
         padding: args.padding,
@@ -1591,9 +1551,16 @@ fn run_tubule(args: TubuleArgs) -> Result<(), Box<dyn Error>> {
     isolf::membrane::area_per_lipid(&force_field, &inner)
         .map_err(|e| enrich_build_error(&force_field, e))?;
     let protein_specs = parse_protein_specs(&args.common.proteins)?;
-    let (controls, temp_note) = prepare_controls(&args.common, Geometry::Tubule)?;
+    let (controls, temp_note) = args
+        .common
+        .controls
+        .prepare(args.common.want_inp(), Geometry::Tubule.is_npt())?;
 
-    let seed = args.common.seed.unwrap_or_else(|| rand::rng().random());
+    let seed = args
+        .common
+        .general
+        .seed
+        .unwrap_or_else(|| rand::rng().random());
     let mut rng = StdRng::seed_from_u64(seed);
     let options = BuildOptions {
         padding: args.padding,
@@ -1668,12 +1635,6 @@ fn run_protein(args: ProteinArgs) -> Result<(), Box<dyn Error>> {
         )
         .into());
     }
-    if let Some(t) = args.temperature
-        && (!t.is_finite() || t <= 0.0)
-    {
-        return Err(format!("--temperature: '{t}' is not a positive temperature in K").into());
-    }
-
     let mut idr_local = match &args.idr {
         Some(s) => parse_selection(s)?,
         None => Vec::new(),
@@ -1698,20 +1659,9 @@ fn run_protein(args: ProteinArgs) -> Result<(), Box<dyn Error>> {
         None => Vec::new(),
     };
 
-    let temperature = args.temperature.unwrap_or(DEFAULT_TEMPERATURE);
-    let min = parse_min_spec(&args.min)?;
-    let equil = parse_dyn_spec("--equil", &args.equil, DynSpec::default_equil())?;
-    let prod = parse_dyn_spec("--prod", &args.prod, DynSpec::default_prod())?;
     let want_inp = args.want_inp();
     let want_vmd = args.want_vmd();
-    if want_inp {
-        isolf::inp::minimization("x", &min.to_params([1.0; 3], temperature))
-            .map_err(|e| format!("--min: {e}"))?;
-        isolf::inp::nvt("x", "x", "x", &equil.to_params(temperature, 1))
-            .map_err(|e| format!("--equil: {e}"))?;
-        isolf::inp::nvt("x", "x", "x", &prod.to_params(temperature, 1))
-            .map_err(|e| format!("--prod: {e}"))?;
-    }
+    let (controls, temp_note) = args.controls.prepare(want_inp, false)?;
 
     let prot_options = ProteinOptions {
         model: args.model.into(),
@@ -1723,7 +1673,7 @@ fn run_protein(args: ProteinArgs) -> Result<(), Box<dyn Error>> {
         ccgo_contact_scale: args.contact_scale,
     };
 
-    let seed = args.seed.unwrap_or_else(|| rand::rng().random());
+    let seed = args.general.seed.unwrap_or_else(|| rand::rng().random());
     let mut rng = StdRng::seed_from_u64(seed);
 
     report::header();
@@ -1777,8 +1727,8 @@ fn run_protein(args: ProteinArgs) -> Result<(), Box<dyn Error>> {
     for w in &protein.warnings {
         report::warn(w);
     }
-    if args.temperature.is_some() && !want_inp {
-        report::warn("--temperature only affects GENESIS .inp files (pass --inp to write them)");
+    if let Some(note) = &temp_note {
+        report::warn(note);
     }
 
     fs::create_dir_all(&args.out)?;
@@ -1789,81 +1739,42 @@ fn run_protein(args: ProteinArgs) -> Result<(), Box<dyn Error>> {
     write(&named("itp"), &protein.to_itp())?;
     write(&args.out.join("aicg2p.itp"), &render_aicg2p_itp())?;
     write(&named("top"), &protein.to_top())?;
-    if args.pdb {
+    if args.formats.pdb {
         write(&named("pdb"), &protein.to_pdb())?;
     }
-    if args.psf || want_vmd {
+    if args.formats.psf || want_vmd {
         write(&named("psf"), &protein.to_psf())?;
     }
-    if args.crd {
+    if args.formats.crd {
         write(&named("crd"), &protein.to_crd())?;
     }
-    if args.cif {
+    if args.formats.cif {
         write(&named("cif"), &protein.to_cif())?;
     }
 
-    let controls = ControlSpecs {
-        temperature,
-        min,
-        equil,
-        prod,
-    };
     if want_inp {
-        write_control_files(
-            &args.out,
-            &base,
-            Geometry::Vesicle,
-            box_size,
-            &controls,
-            &mut rng,
-        )?;
+        write_control_files(&args.out, &base, false, box_size, &controls, &mut rng)?;
     }
     if want_vmd {
         let ff = ForceField::isolf();
         let particles = protein.to_particles(1, 1);
-        let background = args.vmd_background.as_deref().unwrap_or("white");
-        let material = args.vmd_material.as_deref().unwrap_or("AOChalky");
-        let vmd_opts = VmdOptions {
-            surface: args.vmd_surface,
-            cutaway: args.vmd_cutaway,
-            render: args.vmd_render,
-            background,
-            material,
-            smooth: args.vmd_smooth.unwrap_or(5),
-            lipid_coloring: isolf::vmd::LipidColoring::Head,
-            recenter_to_box: matches!(args.center, ProteinCenterArg::Origin),
-        };
-        let script = |source| {
-            isolf::vmd::vmd_script(&ff, &particles, &base, Layout::Protein, source, &vmd_opts)
-        };
-        write(
-            &args.out.join(format!("{base}.vmd")),
-            &script(VmdSource::Structure),
+        write_vmd_scripts(
+            &args.out,
+            &base,
+            Layout::Protein,
+            false,
+            want_inp,
+            matches!(args.center, ProteinCenterArg::Origin),
+            &particles,
+            &ff,
+            &args.vmd_opts,
+            None,
+            &controls,
         )?;
-        if want_inp {
-            for (stage, steps, crdout) in [
-                ("min", controls.min.num_steps, controls.min.crdout_period),
-                (
-                    "nvt",
-                    controls.equil.num_steps,
-                    controls.equil.crdout_period,
-                ),
-                ("pro", controls.prod.num_steps, controls.prod.crdout_period),
-            ] {
-                let frames = (crdout > 0).then(|| steps / crdout);
-                write(
-                    &args.out.join(format!("{stage}.vmd")),
-                    &script(VmdSource::Trajectory {
-                        name: stage,
-                        frames,
-                    }),
-                )?;
-            }
-        }
     }
 
     let log_path = named("log");
-    let log_content = render_protein_log(&protein, box_size, seed, args.seed.is_some());
+    let log_content = render_protein_log(&protein, box_size, seed, args.general.seed.is_some());
     write(&log_path, &log_content)?;
 
     let out_dir = args.out.display().to_string();
@@ -2020,7 +1931,7 @@ fn finish_build(
         .iter()
         .filter_map(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
         .collect();
-    let command = reproduce_command(seed, common.seed.is_some());
+    let command = reproduce_command(seed, common.general.seed.is_some());
     let log_path = common.out.join(format!("{base}.log"));
     runlog::Run {
         command: &command,
@@ -2702,10 +2613,14 @@ fn write_outputs(
 
     let formats: [StructureFormat; 5] = [
         (true, "gro", EmbeddedSystem::to_gro),
-        (common.pdb, "pdb", EmbeddedSystem::to_pdb),
-        (common.psf || want_vmd, "psf", EmbeddedSystem::to_psf),
-        (common.crd, "crd", EmbeddedSystem::to_crd),
-        (common.cif, "cif", EmbeddedSystem::to_cif),
+        (common.formats.pdb, "pdb", EmbeddedSystem::to_pdb),
+        (
+            common.formats.psf || want_vmd,
+            "psf",
+            EmbeddedSystem::to_psf,
+        ),
+        (common.formats.crd, "crd", EmbeddedSystem::to_crd),
+        (common.formats.cif, "cif", EmbeddedSystem::to_cif),
     ];
     for (enabled, ext, render) in formats {
         if enabled {
@@ -2742,17 +2657,27 @@ fn write_outputs(
     }
 
     if want_inp {
-        write_control_files(&common.out, base, geometry, box_size, controls, rng)?;
+        write_control_files(
+            &common.out,
+            base,
+            geometry.is_npt(),
+            box_size,
+            controls,
+            rng,
+        )?;
     }
     if want_vmd {
         write_vmd_scripts(
             &common.out,
             base,
-            geometry,
-            center,
-            system,
+            geometry.layout(),
+            geometry.is_npt(),
+            want_inp,
+            matches!(center, CenterArg::Origin),
+            &system.particles,
             force_field,
-            common,
+            &common.vmd_opts,
+            common.vmd_color_by,
             controls,
         )?;
     }
@@ -2760,12 +2685,12 @@ fn write_outputs(
 }
 
 /// Write the GENESIS control files: minimize, then equilibrate and run
-/// production under the build mode's ensemble (NPT for a flat membrane, NVT for
-/// a vesicle).
+/// production under the requested ensemble (`is_npt`: NPT for flat membranes,
+/// NVT for vesicles, tubules, and standalone proteins).
 fn write_control_files(
     out: &Path,
     base: &str,
-    geometry: Geometry,
+    is_npt: bool,
     box_size: [f64; 3],
     controls: &ControlSpecs,
     rng: &mut StdRng,
@@ -2781,7 +2706,7 @@ fn write_control_files(
     let production = controls.prod.to_params(controls.temperature, prod_seed);
     let equilibration = controls.equil.to_params(controls.temperature, equil_seed);
 
-    if geometry.is_npt() {
+    if is_npt {
         write(
             &out.join("npt.inp"),
             &isolf::inp::npt(base, "min.rst", "npt", &equilibration)?,
@@ -2809,48 +2734,42 @@ fn write_control_files(
 fn write_vmd_scripts(
     out: &Path,
     base: &str,
-    geometry: Geometry,
-    center: CenterArg,
-    system: &EmbeddedSystem,
+    layout: Layout,
+    is_npt: bool,
+    want_inp: bool,
+    recenter_to_box: bool,
+    particles: &[Particle],
     force_field: &ForceField,
-    common: &CommonBuildArgs,
+    vmd: &VmdArgs,
+    color_by: Option<LipidColorScope>,
     controls: &ControlSpecs,
 ) -> Result<(), Box<dyn Error>> {
-    let background = common.vmd_background.as_deref().unwrap_or("white");
-    let material = common.vmd_material.as_deref().unwrap_or("AOChalky");
+    let background = vmd.vmd_background.as_deref().unwrap_or("white");
+    let material = vmd.vmd_material.as_deref().unwrap_or("AOChalky");
     let options = VmdOptions {
-        surface: common.vmd_surface,
-        cutaway: common.vmd_cutaway,
-        render: common.vmd_render,
+        surface: vmd.vmd_surface,
+        cutaway: vmd.vmd_cutaway,
+        render: vmd.vmd_render,
         background,
         material,
-        smooth: common.vmd_smooth.unwrap_or(5),
-        lipid_coloring: match common.vmd_color_by.unwrap_or(LipidColorScope::Head) {
+        smooth: vmd.vmd_smooth.unwrap_or(5),
+        lipid_coloring: match color_by.unwrap_or(LipidColorScope::Head) {
             LipidColorScope::Head => isolf::vmd::LipidColoring::Head,
             LipidColorScope::Bead => isolf::vmd::LipidColoring::Role,
             LipidColorScope::Whole => isolf::vmd::LipidColoring::Whole,
         },
-        recenter_to_box: matches!(center, CenterArg::Origin),
+        recenter_to_box,
     };
-    let layout = geometry.layout();
-    let script = |source| {
-        isolf::vmd::vmd_script(
-            force_field,
-            &system.particles,
-            base,
-            layout,
-            source,
-            &options,
-        )
-    };
+    let script =
+        |source| isolf::vmd::vmd_script(force_field, particles, base, layout, source, &options);
 
     write(
         &out.join(format!("{base}.vmd")),
         &script(VmdSource::Structure),
     )?;
 
-    if common.want_inp() {
-        let equil_name = if geometry.is_npt() { "npt" } else { "nvt" };
+    if want_inp {
+        let equil_name = if is_npt { "npt" } else { "nvt" };
         let stages = [
             ("min", controls.min.num_steps, controls.min.crdout_period),
             (

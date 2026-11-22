@@ -351,16 +351,8 @@ impl Protein {
         let _ = writeln!(s, "CG model {}, t = {:>16.3} ", self.name, 0.0);
         let _ = writeln!(s, "{:>12} ", self.beads.len());
         for b in &self.beads {
-            let _ = writeln!(
-                s,
-                "{:>5}{:>5}{:>5}{:>5}{:>8.3}{:>8.3}{:>8.3}  0.0000  0.0000  0.0000 ",
-                b.res_id % 100000,
-                b.residue,
-                b.atom,
-                b.atom_id % 100000,
-                b.position[0],
-                b.position[1],
-                b.position[2],
+            let _ = crate::gro::write_gro_line(
+                &mut s, b.res_id, &b.residue, &b.atom, b.atom_id, b.position,
             );
         }
         let _ = writeln!(
@@ -375,13 +367,18 @@ impl Protein {
     /// Render a chain-aware CHARMM `.psf` file for this protein alone.
     pub fn to_psf(&self) -> String {
         let particles = self.to_particles(1, 1);
-        let chains: Vec<(String, Range<usize>)> = self
+        let segs: Vec<String> = self
             .chains
             .iter()
             .enumerate()
-            .map(|(i, c)| (protein_segname(i, &c.seg_name), c.range.clone()))
+            .map(|(i, c)| protein_segname(i, &c.seg_name))
             .collect();
-        crate::psf::render_chains(&particles, &chains, &self.name)
+        let chains: Vec<(&str, Range<usize>)> = segs
+            .iter()
+            .zip(&self.chains)
+            .map(|(seg, c)| (seg.as_str(), c.range.clone()))
+            .collect();
+        crate::psf::render_chains_ref(&particles, &chains, &self.name)
     }
 
     /// Render a chain-aware `.pdb` file (coordinates in Å, `TER` between chains).
@@ -391,17 +388,8 @@ impl Protein {
         for ch in &self.chains {
             let cid = if ch.chain_id == ' ' { 'A' } else { ch.chain_id };
             for b in &self.beads[ch.range.clone()] {
-                let _ = writeln!(
-                    s,
-                    "ATOM  {:>5} {:>4} {:<4}{}{:>4}    {:>8.3}{:>8.3}{:>8.3}  1.00  0.00               ",
-                    b.atom_id % 100000,
-                    b.atom,
-                    b.residue,
-                    cid,
-                    b.res_id % 10000,
-                    b.position[0] * 10.0,
-                    b.position[1] * 10.0,
-                    b.position[2] * 10.0,
+                crate::pdb::write_atom_line(
+                    &mut s, b.atom_id, &b.atom, &b.residue, cid, b.res_id, b.position, "1.00",
                 );
             }
             s.push_str("TER\n");

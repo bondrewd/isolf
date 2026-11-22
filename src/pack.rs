@@ -149,47 +149,141 @@ pub struct Obstacle {
 const PINNED_SITE_SPACING: f64 = 0.35;
 
 /// Deduplicate 2D periodic pinned sites closer than `min_dist` (nm).
+///
+/// Uses an O(N) periodic cell grid with an intrusive linked list for large
+/// inputs, preserving exact greedy insertion order.
 fn dedup_plane_sites(candidates: Vec<[f64; 2]>, box_xy: [f64; 2], min_dist: f64) -> Vec<[f64; 2]> {
     let min_d2 = min_dist * min_dist;
     let half_x = 0.5 * box_xy[0];
     let half_y = 0.5 * box_xy[1];
+    let periodic_close = |p: [f64; 2], q: [f64; 2]| -> bool {
+        let mut dx = p[0] - q[0];
+        if dx > half_x {
+            dx -= box_xy[0];
+        } else if dx < -half_x {
+            dx += box_xy[0];
+        }
+        let mut dy = p[1] - q[1];
+        if dy > half_y {
+            dy -= box_xy[1];
+        } else if dy < -half_y {
+            dy += box_xy[1];
+        }
+        dx * dx + dy * dy < min_d2
+    };
+
     let mut kept: Vec<[f64; 2]> = Vec::new();
+    let nx = ((box_xy[0] / min_dist).floor() as usize).clamp(1, 512);
+    let ny = ((box_xy[1] / min_dist).floor() as usize).clamp(1, 512);
+    if candidates.len() <= 64 || nx.saturating_mul(ny) > 262_144 {
+        for p in candidates {
+            if !kept.iter().any(|&q| periodic_close(p, q)) {
+                kept.push(p);
+            }
+        }
+        return kept;
+    }
+
+    let inv_wx = nx as f64 / box_xy[0];
+    let inv_wy = ny as f64 / box_xy[1];
+    let dxs: &[isize] = match nx {
+        1 => &[0],
+        2 => &[0, 1],
+        _ => &[-1, 0, 1],
+    };
+    let dys: &[isize] = match ny {
+        1 => &[0],
+        2 => &[0, 1],
+        _ => &[-1, 0, 1],
+    };
+    let mut head = vec![u32::MAX; nx * ny];
+    let mut next: Vec<u32> = Vec::with_capacity(candidates.len());
+
     for p in candidates {
-        let too_close = kept.iter().any(|q| {
-            let mut dx = p[0] - q[0];
-            if dx > half_x {
-                dx -= box_xy[0];
-            } else if dx < -half_x {
-                dx += box_xy[0];
+        let cx = ((p[0] * inv_wx) as usize).min(nx - 1);
+        let cy = ((p[1] * inv_wy) as usize).min(ny - 1);
+        let mut too_close = false;
+        'search: for &dy in dys {
+            let ny_i = (cy as isize + dy).rem_euclid(ny as isize) as usize;
+            let row = ny_i * nx;
+            for &dx in dxs {
+                let nx_i = (cx as isize + dx).rem_euclid(nx as isize) as usize;
+                let mut cur = head[row + nx_i];
+                while cur != u32::MAX {
+                    if periodic_close(p, kept[cur as usize]) {
+                        too_close = true;
+                        break 'search;
+                    }
+                    cur = next[cur as usize];
+                }
             }
-            let mut dy = p[1] - q[1];
-            if dy > half_y {
-                dy -= box_xy[1];
-            } else if dy < -half_y {
-                dy += box_xy[1];
-            }
-            dx * dx + dy * dy < min_d2
-        });
+        }
         if !too_close {
+            let idx = kept.len() as u32;
             kept.push(p);
+            let cell = cy * nx + cx;
+            next.push(head[cell]);
+            head[cell] = idx;
         }
     }
     kept
 }
 
 /// Deduplicate unit sphere directions closer than `min_chord` in 3D chord distance.
+///
+/// Uses an O(N) 3D cell grid over `[-1, 1]³` for large inputs.
 fn dedup_sphere_dirs(candidates: Vec<[f64; 3]>, min_chord: f64) -> Vec<[f64; 3]> {
     let min_d2 = min_chord * min_chord;
+    let chord_close = |d: [f64; 3], q: [f64; 3]| -> bool {
+        let dx = d[0] - q[0];
+        let dy = d[1] - q[1];
+        let dz = d[2] - q[2];
+        dx * dx + dy * dy + dz * dz < min_d2
+    };
+
     let mut kept: Vec<[f64; 3]> = Vec::new();
+    if candidates.len() <= 64 || min_chord <= 0.0 {
+        for d in candidates {
+            if !kept.iter().any(|&q| chord_close(d, q)) {
+                kept.push(d);
+            }
+        }
+        return kept;
+    }
+
+    // Cell width `2 / n >= min_chord`, so the 3×3×3 cell neighborhood is exact.
+    let n = ((2.0 / min_chord).floor() as usize).clamp(1, 32);
+    let inv_w = 0.5 * n as f64;
+    let mut head = vec![u32::MAX; n * n * n];
+    let mut next: Vec<u32> = Vec::with_capacity(candidates.len());
+
     for d in candidates {
-        let too_close = kept.iter().any(|q| {
-            let dx = d[0] - q[0];
-            let dy = d[1] - q[1];
-            let dz = d[2] - q[2];
-            dx * dx + dy * dy + dz * dz < min_d2
-        });
+        let cx = (((d[0] + 1.0) * inv_w) as usize).min(n - 1);
+        let cy = (((d[1] + 1.0) * inv_w) as usize).min(n - 1);
+        let cz = (((d[2] + 1.0) * inv_w) as usize).min(n - 1);
+        let mut too_close = false;
+        'search: for iz in cz.saturating_sub(1)..=(cz + 1).min(n - 1) {
+            let z_base = iz * n;
+            for iy in cy.saturating_sub(1)..=(cy + 1).min(n - 1) {
+                let row = (z_base + iy) * n;
+                for ix in cx.saturating_sub(1)..=(cx + 1).min(n - 1) {
+                    let mut cur = head[row + ix];
+                    while cur != u32::MAX {
+                        if chord_close(d, kept[cur as usize]) {
+                            too_close = true;
+                            break 'search;
+                        }
+                        cur = next[cur as usize];
+                    }
+                }
+            }
+        }
         if !too_close {
+            let idx = kept.len() as u32;
             kept.push(d);
+            let cell = (cz * n + cy) * n + cx;
+            next.push(head[cell]);
+            head[cell] = idx;
         }
     }
     kept

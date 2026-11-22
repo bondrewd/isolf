@@ -25,7 +25,7 @@ use crate::protein::params::{
     CCGO_NATIVE_EPSILON, ITYPE_BB_CX, ITYPE_BB_DA, ITYPE_BB_HB, ITYPE_BB_XX, ITYPE_LR_CT,
     ITYPE_OFFST, ITYPE_SB_CX, ITYPE_SB_DA, ITYPE_SB_HB, ITYPE_SB_QX, ITYPE_SB_XX, ITYPE_SS_CX,
     ITYPE_SS_DA, ITYPE_SS_HB, ITYPE_SS_QX, ITYPE_SS_SB, ITYPE_SS_XX, aa_charge, aa_mass, aa_rmin,
-    fmt_sci,
+    write_sci,
 };
 use crate::protein::structure::{AllAtom, AllAtomStructure};
 use crate::protein::{
@@ -1003,15 +1003,10 @@ pub fn render_protein_itp(protein: &Protein, moleculetype_name: &str) -> String 
         s.push_str("[ bonds ]\n");
         s.push_str(";        i         j    f                eq              coef\n");
         for b in &protein.bonds {
-            let _ = writeln!(
-                s,
-                "{:>10}{:>10}{:>5}{}{}",
-                b.i,
-                b.j,
-                b.func,
-                fmt_sci(b.eq_nm, 18),
-                fmt_sci(b.coef_kj, 18)
-            );
+            let _ = write!(s, "{:>10}{:>10}{:>5}", b.i, b.j, b.func);
+            write_sci(&mut s, b.eq_nm, 18);
+            write_sci(&mut s, b.coef_kj, 18);
+            s.push('\n');
         }
         s.push('\n');
     }
@@ -1025,29 +1020,17 @@ pub fn render_protein_itp(protein: &Protein, moleculetype_name: &str) -> String 
         for a in &protein.angles {
             match a.func {
                 1 => {
-                    let _ = writeln!(
-                        s,
-                        "{:>10}{:>10}{:>10}{:>5}{}{}",
-                        a.i,
-                        a.j,
-                        a.k,
-                        a.func,
-                        fmt_sci(a.eq, 15),
-                        fmt_sci(a.coef_kj, 15)
-                    );
+                    let _ = write!(s, "{:>10}{:>10}{:>10}{:>5}", a.i, a.j, a.k, a.func);
+                    write_sci(&mut s, a.eq, 15);
+                    write_sci(&mut s, a.coef_kj, 15);
+                    s.push('\n');
                 }
                 21 => {
-                    let _ = writeln!(
-                        s,
-                        "{:>10}{:>10}{:>10}{:>5}{}{}{}",
-                        a.i,
-                        a.j,
-                        a.k,
-                        a.func,
-                        fmt_sci(a.eq, 15),
-                        fmt_sci(a.coef_kj, 15),
-                        fmt_sci(a.width, 15)
-                    );
+                    let _ = write!(s, "{:>10}{:>10}{:>10}{:>5}", a.i, a.j, a.k, a.func);
+                    write_sci(&mut s, a.eq, 15);
+                    write_sci(&mut s, a.coef_kj, 15);
+                    write_sci(&mut s, a.width, 15);
+                    s.push('\n');
                 }
                 22 => {
                     let _ = writeln!(s, "{:>10}{:>10}{:>10}{:>5}", a.i, a.j, a.k, a.func);
@@ -1065,32 +1048,25 @@ pub fn render_protein_itp(protein: &Protein, moleculetype_name: &str) -> String 
         for d in &protein.dihedrals {
             match d.func {
                 1 | 32 | 33 => {
-                    let _ = writeln!(
+                    let _ = write!(
                         s,
-                        "{:>10}{:>10}{:>10}{:>10}{:>5}{}{}{:>15}",
-                        d.i,
-                        d.j,
-                        d.k,
-                        d.l,
-                        d.func,
-                        fmt_sci(d.eq_deg, 15),
-                        fmt_sci(d.coef_kj, 15),
-                        d.multiplicity
+                        "{:>10}{:>10}{:>10}{:>10}{:>5}",
+                        d.i, d.j, d.k, d.l, d.func
                     );
+                    write_sci(&mut s, d.eq_deg, 15);
+                    write_sci(&mut s, d.coef_kj, 15);
+                    let _ = writeln!(s, "{:>15}", d.multiplicity);
                 }
                 21 | 41 | 43 => {
-                    let _ = writeln!(
+                    let _ = write!(
                         s,
-                        "{:>10}{:>10}{:>10}{:>10}{:>5}{}{}{}",
-                        d.i,
-                        d.j,
-                        d.k,
-                        d.l,
-                        d.func,
-                        fmt_sci(d.eq_deg, 15),
-                        fmt_sci(d.coef_kj, 15),
-                        fmt_sci(d.width, 15)
+                        "{:>10}{:>10}{:>10}{:>10}{:>5}",
+                        d.i, d.j, d.k, d.l, d.func
                     );
+                    write_sci(&mut s, d.eq_deg, 15);
+                    write_sci(&mut s, d.coef_kj, 15);
+                    write_sci(&mut s, d.width, 15);
+                    s.push('\n');
                 }
                 22 | 52 => {
                     let _ = writeln!(
@@ -1110,15 +1086,10 @@ pub fn render_protein_itp(protein: &Protein, moleculetype_name: &str) -> String 
         s.push_str("[ pairs ]\n");
         s.push_str(";        i         j         f             eq           coef\n");
         for p in &protein.pairs {
-            let _ = writeln!(
-                s,
-                "{:>10}{:>10}{:>10}{}{}",
-                p.i,
-                p.j,
-                p.func,
-                fmt_sci(p.eq_nm, 15),
-                fmt_sci(p.coef_kj, 15)
-            );
+            let _ = write!(s, "{:>10}{:>10}{:>10}", p.i, p.j, p.func);
+            write_sci(&mut s, p.eq_nm, 15);
+            write_sci(&mut s, p.coef_kj, 15);
+            s.push('\n');
         }
         s.push('\n');
     }

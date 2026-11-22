@@ -199,7 +199,18 @@ impl Membrane {
         options: &BuildOptions,
         rng: &mut impl Rng,
     ) -> Result<Self, BuildError> {
-        Self::build_inner(force_field, name, upper, lower, sizing, options, rng, None)
+        build_system(
+            force_field,
+            name,
+            upper,
+            lower,
+            sizing,
+            options,
+            &[],
+            rng,
+            None,
+        )
+        .map(crate::embed::EmbeddedSystem::into_membrane)
     }
 
     /// Like [`build`](Membrane::build), but also records every relaxation step (the
@@ -219,105 +230,19 @@ impl Membrane {
         rng: &mut impl Rng,
     ) -> Result<(Self, Vec<RelaxFrame>), BuildError> {
         let mut frames = Vec::new();
-        let membrane = Self::build_inner(
+        let membrane = build_system(
             force_field,
             name,
             upper,
             lower,
             sizing,
             options,
+            &[],
             rng,
             Some(&mut frames),
-        )?;
+        )?
+        .into_membrane();
         Ok((membrane, frames))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn build_inner(
-        force_field: &ForceField,
-        name: &str,
-        upper: &Composition,
-        lower: &Composition,
-        sizing: Sizing,
-        options: &BuildOptions,
-        rng: &mut impl Rng,
-        frames: Option<&mut Vec<RelaxFrame>>,
-    ) -> Result<Self, BuildError> {
-        let upper_spacing = leaflet_spacing(force_field, upper)?;
-        let lower_spacing = leaflet_spacing(force_field, lower)?;
-        let plan = resolve_geometry(sizing, upper_spacing, lower_spacing)?;
-
-        let mut molecule_id = 0;
-        let mut atom_id = 0;
-        let mut particles = Vec::new();
-        let mut radii = Vec::new();
-        let mut ranges = Vec::new();
-
-        let upper_counts = place_leaflet(
-            force_field,
-            upper,
-            plan.box_x,
-            plan.box_y,
-            plan.upper,
-            upper_spacing,
-            Leaflet::Upper,
-            options,
-            rng,
-            &mut molecule_id,
-            &mut atom_id,
-            &mut particles,
-            &mut radii,
-            &mut ranges,
-        )?;
-        // The lipids placed so far form the upper leaflet (the lower follows).
-        let upper_lipids = molecule_id;
-        let lower_counts = place_leaflet(
-            force_field,
-            lower,
-            plan.box_x,
-            plan.box_y,
-            plan.lower,
-            lower_spacing,
-            Leaflet::Lower,
-            options,
-            rng,
-            &mut molecule_id,
-            &mut atom_id,
-            &mut particles,
-            &mut radii,
-            &mut ranges,
-        )?;
-
-        // Relax the random placement to a uniform, clash-free start: an independent
-        // centroidal-Voronoi (Lloyd) pass per leaflet, then a shared de-clash.
-        relax_membrane(
-            &mut particles,
-            &radii,
-            &ranges,
-            upper_lipids,
-            plan.box_x,
-            plan.box_y,
-            frames,
-        );
-
-        // Centre the bilayer on the origin in x/y (z is already on the midplane), the
-        // convention the output writers expect.
-        for particle in &mut particles {
-            particle.position[0] -= plan.box_x / 2.0;
-            particle.position[1] -= plan.box_y / 2.0;
-        }
-
-        let lipid_counts = aggregate_counts(upper, &upper_counts, lower, &lower_counts);
-        // Reorder into one canonical layout (grouped by species) shared by every
-        // output file, so any coordinate file matches any topology file.
-        let particles = canonicalize(particles, &lipid_counts);
-
-        Ok(Self {
-            name: name.to_string(),
-            box_size: periodic_box(&particles, plan.box_x, plan.box_y, options.padding),
-            lipid_counts,
-            particles,
-        })
     }
 
     /// Total number of lipid molecules in the membrane.
@@ -851,10 +776,9 @@ fn place_leaflet(
     Ok(counts)
 }
 
-/// Build a flat bilayer with embedded proteins (or delegate to `Membrane::build`
-/// when `proteins` is empty).
+/// Unified flat-bilayer builder supporting zero, one, or many embedded proteins.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_with_proteins(
+pub(crate) fn build_system(
     force_field: &ForceField,
     name: &str,
     upper: &Composition,
@@ -865,25 +789,17 @@ pub(crate) fn build_with_proteins(
     rng: &mut impl Rng,
     frames: Option<&mut Vec<RelaxFrame>>,
 ) -> Result<crate::embed::EmbeddedSystem, BuildError> {
-    if proteins.is_empty() {
-        let m = Membrane::build_inner(
-            force_field,
-            name,
-            upper,
-            lower,
-            sizing,
-            options,
-            rng,
-            frames,
-        )?;
-        return Ok(crate::embed::EmbeddedSystem::from_membrane(m));
-    }
-
     let upper_spacing = leaflet_spacing(force_field, upper)?;
     let lower_spacing = leaflet_spacing(force_field, lower)?;
     let plan = resolve_geometry(sizing, upper_spacing, lower_spacing)?;
 
-    let mut placed = crate::embed::place_proteins_membrane(proteins, plan.box_x, plan.box_y)?;
+    let mut placed = if proteins.is_empty() {
+        None
+    } else {
+        Some(crate::embed::place_proteins_membrane(
+            proteins, plan.box_x, plan.box_y,
+        )?)
+    };
 
     let mut molecule_id = 0;
     let mut atom_id = 0;
@@ -891,7 +807,7 @@ pub(crate) fn build_with_proteins(
     let mut radii = Vec::new();
     let mut ranges = Vec::new();
 
-    place_leaflet(
+    let upper_counts = place_leaflet(
         force_field,
         upper,
         plan.box_x,
@@ -907,8 +823,9 @@ pub(crate) fn build_with_proteins(
         &mut radii,
         &mut ranges,
     )?;
+    // The lipids placed so far form the upper leaflet (the lower follows).
     let mut upper_lipids = molecule_id;
-    place_leaflet(
+    let lower_counts = place_leaflet(
         force_field,
         lower,
         plan.box_x,
@@ -926,46 +843,76 @@ pub(crate) fn build_with_proteins(
     )?;
 
     let (bx, by) = (plan.box_x, plan.box_y);
-    let carved = crate::embed::carve_lipids(
-        &mut particles,
-        &mut radii,
-        &mut ranges,
-        &mut upper_lipids,
-        &placed.obstacles,
-        0.0,
-        |a, b| crate::embed::dist_sq_plane(a, b, bx, by),
-    );
+    let metric = crate::embed::CarveMetric::Plane {
+        box_x: bx,
+        box_y: by,
+    };
+    let carved = match &placed {
+        Some(p) => crate::embed::carve_lipids(
+            &mut particles,
+            &mut radii,
+            &mut ranges,
+            &mut upper_lipids,
+            &p.obstacles,
+            0.0,
+            metric,
+        ),
+        None => 0,
+    };
 
-    relax_membrane_with_obstacles(
+    // Relax the random placement to a uniform, clash-free start: an independent
+    // centroidal-Voronoi (Lloyd) pass per leaflet, then a shared de-clash.
+    let obstacles: &[pack::Obstacle] = placed.as_ref().map_or(&[], |p| &p.obstacles);
+    relax_membrane(
         &mut particles,
         &radii,
         &ranges,
         upper_lipids,
-        &placed.obstacles,
+        obstacles,
         bx,
         by,
         frames,
     );
 
-    let pruned = crate::embed::prune_clashing_lipids(
-        &mut particles,
-        &mut radii,
-        &mut ranges,
-        &mut upper_lipids,
-        &placed.raw_obstacles,
-        |a, b| crate::embed::dist_sq_plane(a, b, bx, by),
-    );
+    let pruned = match &placed {
+        Some(p) => crate::embed::prune_clashing_lipids(
+            &mut particles,
+            &mut radii,
+            &mut ranges,
+            &mut upper_lipids,
+            &p.raw_obstacles,
+            metric,
+        ),
+        None => 0,
+    };
 
+    // Centre the bilayer on the origin in x/y (z is already on the midplane).
     for particle in &mut particles {
         particle.position[0] -= bx / 2.0;
         particle.position[1] -= by / 2.0;
     }
-    for prot in &mut placed.instances {
-        prot.translate([-bx / 2.0, -by / 2.0, 0.0]);
+    if let Some(p) = &mut placed {
+        p.translate([-bx / 2.0, -by / 2.0, 0.0]);
     }
 
-    let lipid_counts = crate::embed::count_remaining_lipids(&particles, upper, lower);
+    let lipid_counts = if carved + pruned > 0 {
+        crate::embed::count_remaining_lipids(&particles, upper, lower)
+    } else {
+        aggregate_counts(upper, &upper_counts, lower, &lower_counts)
+    };
+    // Reorder into one canonical layout (grouped by species) shared by every
+    // output file, so any coordinate file matches any topology file.
     let particles = canonicalize(particles, &lipid_counts);
+
+    let Some(placed) = placed else {
+        let box_size = periodic_box(&particles, bx, by, options.padding);
+        return Ok(crate::embed::EmbeddedSystem::from_membrane(Membrane {
+            name: name.to_string(),
+            box_size,
+            lipid_counts,
+            particles,
+        }));
+    };
 
     let mut z_min = f64::INFINITY;
     let mut z_max = f64::NEG_INFINITY;
@@ -973,11 +920,9 @@ pub(crate) fn build_with_proteins(
         z_min = z_min.min(p.position[2]);
         z_max = z_max.max(p.position[2]);
     }
-    for prot in &placed.instances {
-        for b in &prot.beads {
-            z_min = z_min.min(b.position[2]);
-            z_max = z_max.max(b.position[2]);
-        }
+    for pos in placed.iter_positions() {
+        z_min = z_min.min(pos[2]);
+        z_max = z_max.max(pos[2]);
     }
     let z_span = if z_min.is_finite() && z_max.is_finite() {
         z_max - z_min
@@ -999,32 +944,8 @@ pub(crate) fn build_with_proteins(
 
 /// Relax the randomly-placed leaflets to a uniform, clash-free configuration: an
 /// independent centroidal-Voronoi (Lloyd) pass per leaflet plus a shared de-clash.
-/// `upper_lipids` is the number of lipids in the upper leaflet (placed first), so
-/// the two leaflets' molecule ranges can be separated and relaxed at their own
-/// densities while the de-clash resolves any overlap between them.
-fn relax_membrane(
-    particles: &mut [Particle],
-    radii: &[f64],
-    ranges: &[std::ops::Range<usize>],
-    upper_lipids: usize,
-    box_x: f64,
-    box_y: f64,
-    frames: Option<&mut Vec<RelaxFrame>>,
-) {
-    relax_membrane_with_obstacles(
-        particles,
-        radii,
-        ranges,
-        upper_lipids,
-        &[],
-        box_x,
-        box_y,
-        frames,
-    );
-}
-
 #[allow(clippy::too_many_arguments)]
-fn relax_membrane_with_obstacles(
+fn relax_membrane(
     particles: &mut [Particle],
     radii: &[f64],
     ranges: &[std::ops::Range<usize>],
