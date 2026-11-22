@@ -7,20 +7,14 @@
 
 use std::fmt::Write;
 
-use crate::membrane::{Membrane, Particle};
+use crate::membrane::{Membrane, Particle, write_particles};
 
 /// nm → ångström conversion for cartesian coordinates.
 const ANGSTROM_PER_NM: f64 = 10.0;
 
-/// Placeholder element written for every coarse-grained bead.
-const ELEMENT: &str = "C";
-
-/// Single-chain identifier.
-const CHAIN: &str = "A";
-
 /// Render a particle list as an mmCIF `.cif` file.
 pub fn render(particles: &[Particle], name: &str) -> String {
-    let mut s = String::new();
+    let mut s = String::with_capacity(particles.len() * 64 + 320);
     let _ = writeln!(s, "data_{}", data_block_name(name));
     let _ = writeln!(s, "#");
     let _ = writeln!(s, "loop_");
@@ -41,24 +35,14 @@ pub fn render(particles: &[Particle], name: &str) -> String {
         let _ = writeln!(s, "{column}");
     }
 
-    for particle in particles {
+    write_particles(&mut s, particles, 64, |buf, particle| {
         let [x, y, z] = particle.position.map(|c| c * ANGSTROM_PER_NM);
         let _ = writeln!(
-            s,
-            "ATOM {} {} {} {} {} {} {:.3} {:.3} {:.3} {:.2} {:.2}",
-            particle.atom_id,
-            ELEMENT,
-            particle.bead,
-            particle.residue,
-            CHAIN,
-            particle.molecule_id,
-            x,
-            y,
-            z,
-            1.0,
-            0.0,
+            buf,
+            "ATOM {} C {} {} A {} {:.3} {:.3} {:.3} 1.00 0.00",
+            particle.atom_id, particle.bead, particle.residue, particle.molecule_id, x, y, z,
         );
-    }
+    });
     let _ = writeln!(s, "#");
     s
 }

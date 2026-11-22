@@ -11,16 +11,27 @@
 //! the run would stop mid-interval; the generators enforce this and return an
 //! [`InpError`] on a mismatch.
 
+use std::fmt;
+
 /// nm → Ångström, the unit GENESIS uses internally and in `box_size`.
 const ANGSTROM_PER_NM: f64 = 10.0;
 
 /// Error from generating a control file.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InpError {
     /// `nsteps` is not an exact multiple of the named output/update period.
-    #[error("nsteps must be a multiple of {0}")]
     NotMultipleOf(&'static str),
 }
+
+impl fmt::Display for InpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotMultipleOf(name) => write!(f, "nsteps must be a multiple of {name}"),
+        }
+    }
+}
+
+impl std::error::Error for InpError {}
 
 /// Require `num_steps` to be an exact multiple of `period` (a period of 0
 /// disables that output, so it carries no constraint).

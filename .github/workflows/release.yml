@@ -28,8 +28,6 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-          # aarch64-musl is cross-compiled from the x86_64 runner via cross's
-          # Docker image, which carries the aarch64 C toolchain that ring needs.
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
           - target: universal-apple-darwin

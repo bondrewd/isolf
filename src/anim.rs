@@ -10,13 +10,14 @@
 //!
 //! Both draw two panels (upper/outer left, lower/inner right). `--gif-scale`
 //! multiplies the resolution and `--gif-fps` the playback speed. Frames are
-//! subsampled to a cap, and the indexed buffers are LZW-encoded by the `gif` crate.
+//! subsampled to a cap, rasterised in parallel chunks, and LZW-encoded by `gif`.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, BufWriter};
 use std::path::Path;
 
 use isolf::membrane::RelaxFrame;
+use rayon::prelude::*;
 
 /// Pixels the longer box side maps to in each panel, before `--gif-scale`.
 const PANEL: u32 = 360;
@@ -34,6 +35,8 @@ const SPLAT_RADIUS: i32 = 4;
 const RAMP: usize = 24;
 /// Hold time for the final frame (~1.6 s) so the result is readable.
 const HOLD_CS: u16 = 160;
+/// Frames rasterised per parallel batch (bounds peak memory for high `--gif-scale`).
+const RASTER_BATCH: usize = 16;
 
 /// Point-mode palette, RGB triples: background, upper leaflet, lower leaflet, field.
 const PALETTE: &[u8] = &[
@@ -85,6 +88,10 @@ pub fn write_gif(
     let width = MARGIN + pw + GAP + pw + MARGIN;
     let height = MARGIN + ph + MARGIN;
     let splat_r = (SPLAT_RADIUS as f64 * scale).round().max(1.0) as i32;
+    let spans = match opts.mode {
+        GifMode::Point => disc_spans(DOT_RADIUS),
+        GifMode::Density => disc_spans(splat_r),
+    };
 
     let palette: Vec<u8> = match opts.mode {
         GifMode::Point => PALETTE.to_vec(),
@@ -93,26 +100,44 @@ pub fn write_gif(
     // GIF playback is a per-frame delay in centiseconds; turn fps into one.
     let delay = (100.0 / opts.fps.max(1) as f64).round().clamp(1.0, 255.0) as u16;
     let selected = subsample(frames.len(), MAX_FRAMES);
+    let last_frame = selected.len().saturating_sub(1);
 
-    let mut file = File::create(path)?;
+    let file = BufWriter::new(File::create(path)?);
     let mut encoder =
-        gif::Encoder::new(&mut file, width as u16, height as u16, &palette).map_err(to_io)?;
+        gif::Encoder::new(file, width as u16, height as u16, &palette).map_err(to_io)?;
     encoder.set_repeat(gif::Repeat::Infinite).map_err(to_io)?;
 
-    for (n, &i) in selected.iter().enumerate() {
-        let pixels = match opts.mode {
-            GifMode::Point => draw_point(&frames[i], bounds, width, pw, ph),
-            GifMode::Density => draw_density(&frames[i], bounds, width, pw, ph, splat_r),
-        };
-        let mut frame = gif::Frame::from_indexed_pixels(width as u16, height as u16, pixels, None);
-        frame.delay = if n + 1 == selected.len() {
-            HOLD_CS
-        } else {
-            delay
-        };
-        encoder.write_frame(&frame).map_err(to_io)?;
+    let mut written = 0usize;
+    for batch in selected.chunks(RASTER_BATCH) {
+        let rendered: Vec<Vec<u8>> = batch
+            .par_iter()
+            .map(|&i| match opts.mode {
+                GifMode::Point => draw_point(&frames[i], bounds, width, pw, ph, &spans),
+                GifMode::Density => draw_density(&frames[i], bounds, width, pw, ph, &spans),
+            })
+            .collect();
+        for pixels in rendered {
+            let mut frame =
+                gif::Frame::from_indexed_pixels(width as u16, height as u16, pixels, None);
+            frame.delay = if written == last_frame {
+                HOLD_CS
+            } else {
+                delay
+            };
+            encoder.write_frame(&frame).map_err(to_io)?;
+            written += 1;
+        }
     }
     Ok(())
+}
+
+/// Precomputed horizontal spans `(dy, half_dx)` of a filled disc of radius `r`,
+/// so splats and dots operate on contiguous pixel slices with no per-pixel circle test.
+fn disc_spans(r: i32) -> Vec<(i32, i32)> {
+    let r2 = r * r;
+    (-r..=r)
+        .map(|dy| (dy, ((r2 - dy * dy) as f64).sqrt().floor() as i32))
+        .collect()
 }
 
 /// Indices of up to `cap` frames evenly spaced across `len`, always with the last.
@@ -126,21 +151,29 @@ fn subsample(len: usize, cap: usize) -> Vec<usize> {
 }
 
 /// Rasterise one frame as a scatter (point mode) into a `width * height` buffer.
-fn draw_point(frame: &RelaxFrame, bounds: [f64; 4], width: u32, pw: u32, ph: u32) -> Vec<u8> {
+fn draw_point(
+    frame: &RelaxFrame,
+    bounds: [f64; 4],
+    width: u32,
+    pw: u32,
+    ph: u32,
+    spans: &[(i32, i32)],
+) -> Vec<u8> {
     let height = MARGIN + ph + MARGIN;
-    let span_x = (bounds[2] - bounds[0]).max(1e-6);
-    let span_y = (bounds[3] - bounds[1]).max(1e-6);
+    let inv_x = 1.0 / (bounds[2] - bounds[0]).max(1e-6);
+    let inv_y = 1.0 / (bounds[3] - bounds[1]).max(1e-6);
     let mut buf = vec![BG; (width * height) as usize];
     let left = MARGIN;
     let right = MARGIN + pw + GAP;
+    let (pw_f, ph_f) = ((pw - 1) as f64, (ph - 1) as f64);
     for (origin_x, color, points) in [(left, UPPER, &frame.upper), (right, LOWER, &frame.lower)] {
         fill_rect(&mut buf, width, origin_x, MARGIN, pw, ph, FIELD);
         for &[x, y] in points {
             // Map (x, y) within the bounds to panel pixels; flip y so +y points up.
-            let px = origin_x as f64 + ((x - bounds[0]) / span_x).clamp(0.0, 1.0) * (pw - 1) as f64;
-            let py = MARGIN as f64
-                + (1.0 - ((y - bounds[1]) / span_y).clamp(0.0, 1.0)) * (ph - 1) as f64;
-            draw_dot(&mut buf, width, height, px as i32, py as i32, color);
+            let px = (origin_x as f64 + ((x - bounds[0]) * inv_x).clamp(0.0, 1.0) * pw_f) as i32;
+            let py =
+                (MARGIN as f64 + (1.0 - ((y - bounds[1]) * inv_y).clamp(0.0, 1.0)) * ph_f) as i32;
+            draw_dot(&mut buf, width, height, px, py, spans, color);
         }
     }
     buf
@@ -153,45 +186,51 @@ fn draw_density(
     width: u32,
     pw: u32,
     ph: u32,
-    splat_r: i32,
+    spans: &[(i32, i32)],
 ) -> Vec<u8> {
     let height = MARGIN + ph + MARGIN;
-    let span_x = (bounds[2] - bounds[0]).max(1e-6);
-    let span_y = (bounds[3] - bounds[1]).max(1e-6);
+    let inv_x = 1.0 / (bounds[2] - bounds[0]).max(1e-6);
+    let inv_y = 1.0 / (bounds[3] - bounds[1]).max(1e-6);
     let mut buf = vec![BG; (width * height) as usize];
     let left = MARGIN;
     let right = MARGIN + pw + GAP;
     let outer_base = 1u8;
     let inner_base = 1 + RAMP as u8;
+    let (pw_f, ph_f) = ((pw - 1) as f64, (ph - 1) as f64);
+    let mut accum = vec![0.0f32; (pw * ph) as usize];
     for (origin_x, base, points) in [
         (left, outer_base, &frame.upper),
         (right, inner_base, &frame.lower),
     ] {
-        // Splat every lipid into an accumulation buffer; overlapping splats build
-        // up the local density.
-        let mut accum = vec![0.0f32; (pw * ph) as usize];
+        accum.fill(0.0);
         for &[x, y] in points {
-            let px = (((x - bounds[0]) / span_x).clamp(0.0, 1.0) * (pw - 1) as f64).round() as i32;
-            let py = ((1.0 - ((y - bounds[1]) / span_y).clamp(0.0, 1.0)) * (ph - 1) as f64).round()
-                as i32;
-            splat(&mut accum, pw, ph, px, py, splat_r);
+            let px = (((x - bounds[0]) * inv_x).clamp(0.0, 1.0) * pw_f).round() as i32;
+            let py = ((1.0 - ((y - bounds[1]) * inv_y).clamp(0.0, 1.0)) * ph_f).round() as i32;
+            splat(&mut accum, pw, ph, px, py, spans);
         }
         // Calibrate against the mean over the covered area, so an even shell sits
         // mid-ramp: brighter where denser, darker where sparser.
-        let sum: f64 = accum.iter().map(|&v| v as f64).sum();
-        let covered = accum.iter().filter(|&&v| v > 0.0).count();
-        let reference = if covered > 0 {
-            sum / covered as f64 * 1.6
+        let mut sum = 0.0_f64;
+        let mut covered = 0usize;
+        for &v in &accum {
+            if v > 0.0 {
+                sum += v as f64;
+                covered += 1;
+            }
+        }
+        let scale = if covered > 0 {
+            (RAMP - 1) as f64 / (sum / covered as f64 * 1.6)
         } else {
-            1.0
+            (RAMP - 1) as f64
         };
+        let max_idx = (RAMP - 1) as f64;
         for y in 0..ph {
-            for x in 0..pw {
-                let v = accum[(y * pw + x) as usize] as f64 / reference;
-                let idx = (v * (RAMP - 1) as f64)
-                    .round()
-                    .clamp(0.0, (RAMP - 1) as f64) as u8;
-                buf[((MARGIN + y) * width + origin_x + x) as usize] = base + idx;
+            let src = &accum[(y * pw) as usize..((y + 1) * pw) as usize];
+            let dst_start = ((MARGIN + y) * width + origin_x) as usize;
+            let dst = &mut buf[dst_start..dst_start + pw as usize];
+            for (out, &v) in dst.iter_mut().zip(src) {
+                let idx = (v as f64 * scale).round().clamp(0.0, max_idx) as u8;
+                *out = base + idx;
             }
         }
     }
@@ -199,15 +238,19 @@ fn draw_density(
 }
 
 /// Add a filled disc of weight to `accum`, centred at `(cx, cy)` and clipped to the panel.
-fn splat(accum: &mut [f32], pw: u32, ph: u32, cx: i32, cy: i32, r: i32) {
-    for dy in -r..=r {
-        for dx in -r..=r {
-            if dx * dx + dy * dy > r * r {
-                continue;
-            }
-            let (x, y) = (cx + dx, cy + dy);
-            if x >= 0 && y >= 0 && (x as u32) < pw && (y as u32) < ph {
-                accum[(y as u32 * pw + x as u32) as usize] += 1.0;
+fn splat(accum: &mut [f32], pw: u32, ph: u32, cx: i32, cy: i32, spans: &[(i32, i32)]) {
+    let (pw_i, ph_i) = (pw as i32, ph as i32);
+    for &(dy, half_dx) in spans {
+        let y = cy + dy;
+        if y < 0 || y >= ph_i {
+            continue;
+        }
+        let x0 = (cx - half_dx).max(0);
+        let x1 = (cx + half_dx).min(pw_i - 1);
+        if x0 <= x1 {
+            let row = (y as u32 * pw) as usize;
+            for v in &mut accum[row + x0 as usize..=row + x1 as usize] {
+                *v += 1.0;
             }
         }
     }
@@ -246,17 +289,26 @@ fn fill_rect(buf: &mut [u8], width: u32, x0: u32, y0: u32, w: u32, h: u32, color
 }
 
 /// Draw a filled disc of `color` centred at `(cx, cy)`, clipped to the canvas.
-fn draw_dot(buf: &mut [u8], width: u32, height: u32, cx: i32, cy: i32, color: u8) {
-    let r = DOT_RADIUS;
-    for dy in -r..=r {
-        for dx in -r..=r {
-            if dx * dx + dy * dy > r * r {
-                continue;
-            }
-            let (x, y) = (cx + dx, cy + dy);
-            if x >= 0 && y >= 0 && (x as u32) < width && (y as u32) < height {
-                buf[(y as u32 * width + x as u32) as usize] = color;
-            }
+fn draw_dot(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    cx: i32,
+    cy: i32,
+    spans: &[(i32, i32)],
+    color: u8,
+) {
+    let (w_i, h_i) = (width as i32, height as i32);
+    for &(dy, half_dx) in spans {
+        let y = cy + dy;
+        if y < 0 || y >= h_i {
+            continue;
+        }
+        let x0 = (cx - half_dx).max(0);
+        let x1 = (cx + half_dx).min(w_i - 1);
+        if x0 <= x1 {
+            let row = (y as u32 * width) as usize;
+            buf[row + x0 as usize..=row + x1 as usize].fill(color);
         }
     }
 }

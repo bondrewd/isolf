@@ -25,9 +25,7 @@ jobs:
         run: RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --no-deps --all-features
 
   # Type-check (and lint) the binary for Windows so the platform-specific
-  # --update path in src/update.rs cannot break unnoticed. Cross-compiling from
-  # Linux keeps it cheap; ureq's TLS (ring) needs the mingw C compiler. The full
-  # msvc binary is still built on a Windows runner at release time.
+  # --update path in src/update.rs cannot break unnoticed.
   windows:
     name: windows cross-check
     runs-on: ubuntu-latest
@@ -38,5 +36,4 @@ jobs:
           targets: x86_64-pc-windows-gnu
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
       - run: cargo clippy --target x86_64-pc-windows-gnu --bin isolf -- -D warnings

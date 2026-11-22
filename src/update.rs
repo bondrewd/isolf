@@ -121,30 +121,126 @@ fn target_triple() -> Option<&'static str> {
 /// Resolve the latest release version (without the leading `v`) from GitHub.
 fn latest_version() -> Result<String, Box<dyn Error>> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let mut resp = ureq::get(&url).header("User-Agent", USER_AGENT).call()?;
-    let body = resp.body_mut().read_to_string()?;
+    let body = fetch_text(&url)?;
     let tag =
         json_field(&body, "tag_name").ok_or("could not read the latest version from GitHub")?;
     Ok(tag.trim_start_matches('v').to_string())
 }
 
-/// Download `url` to `path`.
+/// Download `url` to `path` using the platform's HTTP client (`curl`, with
+/// `wget` fallback on Unix and PowerShell on Windows).
 fn download(url: &str, path: &Path) -> Result<(), Box<dyn Error>> {
-    let mut resp = ureq::get(url).header("User-Agent", USER_AGENT).call()?;
-    let bytes = resp
-        .body_mut()
-        .with_config()
-        .limit(256 * 1024 * 1024)
-        .read_to_vec()?;
-    fs::write(path, bytes)?;
-    Ok(())
+    let curl = if cfg!(windows) { "curl.exe" } else { "curl" };
+    match Command::new(curl)
+        .args(["-fsSL", "-A", USER_AGENT, "-o"])
+        .arg(path)
+        .arg(url)
+        .status()
+    {
+        Ok(status) if status.success() => return Ok(()),
+        Ok(status) => return Err(format!("download failed ({curl} exited with {status})").into()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    #[cfg(not(windows))]
+    match Command::new("wget")
+        .args(["-q", "-U", USER_AGENT, "-O"])
+        .arg(path)
+        .arg(url)
+        .status()
+    {
+        Ok(status) if status.success() => return Ok(()),
+        Ok(status) => return Err(format!("download failed (wget exited with {status})").into()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    #[cfg(windows)]
+    match Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = $env:ISOLF_UA } -Uri $env:ISOLF_URL -OutFile $env:ISOLF_OUT",
+        ])
+        .env("ISOLF_UA", USER_AGENT)
+        .env("ISOLF_URL", url)
+        .env("ISOLF_OUT", path)
+        .status()
+    {
+        Ok(status) if status.success() => return Ok(()),
+        Ok(status) => {
+            return Err(format!("download failed (powershell exited with {status})").into());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    Err(format!(
+        "no downloader found (need curl or wget); \
+         download the latest from https://github.com/{REPO}/releases"
+    )
+    .into())
+}
+
+/// Fetch `url` as UTF-8 text using the platform's HTTP client.
+fn fetch_text(url: &str) -> Result<String, Box<dyn Error>> {
+    let curl = if cfg!(windows) { "curl.exe" } else { "curl" };
+    match Command::new(curl)
+        .args(["-fsSL", "-A", USER_AGENT])
+        .arg(url)
+        .output()
+    {
+        Ok(out) if out.status.success() => return Ok(String::from_utf8(out.stdout)?),
+        Ok(out) => {
+            return Err(format!("request failed ({curl} exited with {})", out.status).into());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    #[cfg(not(windows))]
+    match Command::new("wget")
+        .args(["-q", "-U", USER_AGENT, "-O", "-"])
+        .arg(url)
+        .output()
+    {
+        Ok(out) if out.status.success() => return Ok(String::from_utf8(out.stdout)?),
+        Ok(out) => return Err(format!("request failed (wget exited with {})", out.status).into()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    #[cfg(windows)]
+    match Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = $env:ISOLF_UA } -Uri $env:ISOLF_URL).Content",
+        ])
+        .env("ISOLF_UA", USER_AGENT)
+        .env("ISOLF_URL", url)
+        .output()
+    {
+        Ok(out) if out.status.success() => return Ok(String::from_utf8(out.stdout)?),
+        Ok(out) => {
+            return Err(format!("request failed (powershell exited with {})", out.status).into());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    Err(format!(
+        "no downloader found (need curl or wget); \
+         download the latest from https://github.com/{REPO}/releases"
+    )
+    .into())
 }
 
 /// Verify `archive` against the sha256 published at `sum_url`. Best-effort: with
 /// no sha256 tool on the system it warns and proceeds (the download was HTTPS).
 fn verify(archive: &Path, sum_url: &str) -> Result<(), Box<dyn Error>> {
-    let mut resp = ureq::get(sum_url).header("User-Agent", USER_AGENT).call()?;
-    let published = resp.body_mut().read_to_string()?;
+    let published = fetch_text(sum_url)?;
     let expected = published
         .split_whitespace()
         .next()

@@ -5,9 +5,9 @@
 //! 100000, per the five-column `.gro` convention. Velocities are written as
 //! zeros.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
-use crate::membrane::Membrane;
+use crate::membrane::{Membrane, Particle, write_particles};
 
 /// Wraps a [`Membrane`] for `.gro` rendering via [`fmt::Display`].
 pub struct Gro<'a> {
@@ -21,10 +21,36 @@ impl<'a> Gro<'a> {
     }
 }
 
+fn write_gro_particle(f: &mut impl fmt::Write, p: &Particle) -> fmt::Result {
+    writeln!(
+        f,
+        "{:>5}{:>5}{:>5}{:>5}{:>8.3}{:>8.3}{:>8.3}  0.0000  0.0000  0.0000 ",
+        p.molecule_id % 100000,
+        p.residue,
+        p.bead,
+        p.atom_id % 100000,
+        p.position[0],
+        p.position[1],
+        p.position[2],
+    )
+}
+
 impl Membrane {
     /// Render this membrane as a GROMACS `.gro` coordinate file.
     pub fn to_gro(&self) -> String {
-        Gro::new(self).to_string()
+        let mut s = String::with_capacity(self.particles.len() * 70 + 128);
+        let _ = writeln!(s, "{}, t = {:>16.3} ", self.name, 0.0);
+        let _ = writeln!(s, "{:>12} ", self.particles.len());
+        write_particles(&mut s, &self.particles, 70, |buf, p| {
+            let _ = write_gro_particle(buf, p);
+        });
+        let _ = writeln!(
+            s,
+            "{:>15.4}{:>15.4}{:>15.4} ",
+            self.box_size[0], self.box_size[1], self.box_size[2]
+        );
+        let _ = writeln!(s);
+        s
     }
 }
 
@@ -33,27 +59,9 @@ impl fmt::Display for Gro<'_> {
         let membrane = self.membrane;
         writeln!(f, "{}, t = {:>16.3} ", membrane.name, 0.0)?;
         writeln!(f, "{:>12} ", membrane.particles.len())?;
-
-        // Particles are already in the canonical species-grouped order, so the
-        // stored molecule/atom ids (wrapped at 100000 per the .gro convention)
-        // are written directly.
         for particle in &membrane.particles {
-            writeln!(
-                f,
-                "{:>5}{:>5}{:>5}{:>5}{:>8.3}{:>8.3}{:>8.3}{:>8.4}{:>8.4}{:>8.4} ",
-                particle.molecule_id % 100000,
-                particle.residue,
-                particle.bead,
-                particle.atom_id % 100000,
-                particle.position[0],
-                particle.position[1],
-                particle.position[2],
-                0.0,
-                0.0,
-                0.0,
-            )?;
+            write_gro_particle(f, particle)?;
         }
-
         writeln!(
             f,
             "{:>15.4}{:>15.4}{:>15.4} ",

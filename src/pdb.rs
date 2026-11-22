@@ -6,21 +6,21 @@
 
 use std::fmt::Write;
 
-use crate::membrane::{Membrane, Particle};
+use crate::membrane::{Membrane, Particle, write_particles};
 
 /// nm → ångström conversion for PDB coordinates.
 const ANGSTROM_PER_NM: f64 = 10.0;
 
 /// Render a particle list as a `.pdb` coordinate file.
 pub fn render(particles: &[Particle], name: &str) -> String {
-    let mut s = String::new();
+    let mut s = String::with_capacity(particles.len() * 82 + 96);
     let _ = writeln!(s, "TITLE     {name:<70}");
-    for particle in particles {
+    write_particles(&mut s, particles, 82, |buf, particle| {
         // Columns after the temperature factor (element/charge) are unused by the
         // CG model and left blank.
         let _ = writeln!(
-            s,
-            "ATOM  {:>5} {:>4} {:<4}A{:>4}    {:>8.3}{:>8.3}{:>8.3}{:>6.2}{:>6.2}{:>10}{:>2}{:>2} ",
+            buf,
+            "ATOM  {:>5} {:>4} {:<4}A{:>4}    {:>8.3}{:>8.3}{:>8.3}  0.00  0.00               ",
             particle.atom_id % 100000,
             particle.bead,
             particle.residue,
@@ -28,13 +28,8 @@ pub fn render(particles: &[Particle], name: &str) -> String {
             particle.position[0] * ANGSTROM_PER_NM,
             particle.position[1] * ANGSTROM_PER_NM,
             particle.position[2] * ANGSTROM_PER_NM,
-            0.0,
-            0.0,
-            "",
-            "",
-            "",
         );
-    }
+    });
     let _ = writeln!(s, "TER");
     s
 }

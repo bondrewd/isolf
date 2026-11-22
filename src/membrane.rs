@@ -17,6 +17,7 @@
 //! shared box.
 
 use rand::Rng;
+use rayon::prelude::*;
 
 use crate::composition::Composition;
 use crate::error::BuildError;
@@ -225,6 +226,8 @@ impl Membrane {
         let mut molecule_id = 0;
         let mut atom_id = 0;
         let mut particles = Vec::new();
+        let mut radii = Vec::new();
+        let mut ranges = Vec::new();
 
         let upper_counts = place_leaflet(
             force_field,
@@ -238,6 +241,8 @@ impl Membrane {
             &mut molecule_id,
             &mut atom_id,
             &mut particles,
+            &mut radii,
+            &mut ranges,
         )?;
         // The lipids placed so far form the upper leaflet (the lower follows).
         let upper_lipids = molecule_id;
@@ -253,13 +258,16 @@ impl Membrane {
             &mut molecule_id,
             &mut atom_id,
             &mut particles,
+            &mut radii,
+            &mut ranges,
         )?;
 
         // Relax the random placement to a uniform, clash-free start: an independent
         // centroidal-Voronoi (Lloyd) pass per leaflet, then a shared de-clash.
         relax_membrane(
-            force_field,
             &mut particles,
+            &radii,
+            &ranges,
             upper_lipids,
             plan.box_x,
             plan.box_y,
@@ -291,6 +299,26 @@ impl Membrane {
         self.lipid_counts.iter().map(|(_, count)| count).sum()
     }
 
+    /// Translate every particle in place so the particle centroid sits at the
+    /// centre of the box `[0, box_size]` on each axis.
+    pub fn center_in_box(&mut self) {
+        let n = self.particles.len() as f64;
+        if n == 0.0 {
+            return;
+        }
+        let mut sum = [0.0; 3];
+        for p in &self.particles {
+            sum[0] += p.position[0];
+            sum[1] += p.position[1];
+            sum[2] += p.position[2];
+        }
+        self.translate([
+            self.box_size[0] / 2.0 - sum[0] / n,
+            self.box_size[1] / 2.0 - sum[1] / n,
+            self.box_size[2] / 2.0 - sum[2] / n,
+        ]);
+    }
+
     /// A copy translated so the particle centroid sits at the centre of the box
     /// `[0, box_size]` on each axis. The build leaves a flat bilayer centred on the
     /// origin (so it draws in a corner of the periodic box a viewer renders); this
@@ -298,21 +326,7 @@ impl Membrane {
     /// already-centred membrane, e.g. a vesicle.
     pub fn centered_in_box(&self) -> Membrane {
         let mut centered = self.clone();
-        let n = centered.particles.len() as f64;
-        if n == 0.0 {
-            return centered;
-        }
-        let mut sum = [0.0; 3];
-        for p in &centered.particles {
-            for (acc, v) in sum.iter_mut().zip(p.position) {
-                *acc += v;
-            }
-        }
-        centered.translate([
-            self.box_size[0] / 2.0 - sum[0] / n,
-            self.box_size[1] / 2.0 - sum[1] / n,
-            self.box_size[2] / 2.0 - sum[2] / n,
-        ]);
+        centered.center_in_box();
         centered
     }
 
@@ -381,15 +395,6 @@ pub(crate) fn clash_floor(
         return Err(BuildError::EmptyComposition);
     }
     Ok(minimum)
-}
-
-/// A bead's clash-free packing radius (nm): half its potential-minimum contact
-/// distance, so two beads of types `i`, `j` touch at `2^(1/6)·(σ_i+σ_j)/2`. Unknown
-/// beads get radius 0 (ignored by the relaxer); every placed bead is known.
-pub(crate) fn bead_packing_radius(force_field: &ForceField, bead_name: &str) -> f64 {
-    force_field.bead_type(bead_name).map_or(0.0, |bead| {
-        POTENTIAL_MINIMUM_FACTOR * bead.interaction.sigma() / 2.0
-    })
 }
 
 /// Resolve the shared in-plane box and per-leaflet grids for the chosen sizing,
@@ -487,9 +492,19 @@ fn pack_grid_into_box(
     Ok(grid)
 }
 
+/// Pre-resolved lipid template: all force-field lookups done once per species
+/// rather than once per placed bead.
+struct BeadTemplate<'a> {
+    name: &'a str,
+    charge: f64,
+    mass: f64,
+    packing_radius: f64,
+    z: f64,
+}
+
 /// Place `grid.count` lipids of `composition` at uniform-random positions in the
-/// `box_x` by `box_y` box, append them to `particles`, and return the
-/// per-component molecule counts. `molecule_id`/`atom_id` continue across calls.
+/// `box_x` by `box_y` box, append them to `particles` (along with their packing
+/// radii and molecule bead ranges), and return the per-component molecule counts.
 #[allow(clippy::too_many_arguments)]
 fn place_leaflet(
     force_field: &ForceField,
@@ -503,53 +518,75 @@ fn place_leaflet(
     molecule_id: &mut usize,
     atom_id: &mut usize,
     particles: &mut Vec<Particle>,
+    radii: &mut Vec<f64>,
+    ranges: &mut Vec<std::ops::Range<usize>>,
 ) -> Result<Vec<usize>, BuildError> {
     let counts = composition.partition(grid.count);
     if grid.count == 0 {
         return Ok(counts);
     }
 
-    // One species name per lipid, in partition order.
-    let mut species: Vec<&str> = Vec::with_capacity(grid.count);
-    for (component, &n) in composition.components().iter().zip(&counts) {
-        species.extend(std::iter::repeat_n(component.name.as_str(), n));
-    }
-
-    let start = particles.len();
-
-    for &lipid_name in &species {
-        *molecule_id += 1;
+    // Resolve each species once: bead properties, packing radii, and chain z offsets.
+    let mut templates: Vec<(&str, Vec<BeadTemplate<'_>>, usize)> = Vec::with_capacity(counts.len());
+    let mut extra_beads = 0usize;
+    for (component, &count) in composition.components().iter().zip(&counts) {
+        if count == 0 {
+            continue;
+        }
         let lipid = force_field
-            .lipid(lipid_name)
-            .ok_or_else(|| BuildError::UnknownLipid(lipid_name.to_string()))?;
+            .lipid(&component.name)
+            .ok_or_else(|| BuildError::UnknownLipid(component.name.clone()))?;
         let phosphate = lipid
             .phosphate_index()
-            .ok_or_else(|| BuildError::MissingPhosphate(lipid_name.to_string()))?;
-
-        // Uniform-random lateral placement; Lloyd's relaxation makes it uniform.
-        let x = rng.random_range(0.0..box_x);
-        let y = rng.random_range(0.0..box_y);
-        // Start above the phosphate by the head-side bond lengths, then walk
-        // down the chain one bond at a time.
+            .ok_or_else(|| BuildError::MissingPhosphate(component.name.clone()))?;
         let mut z: f64 = lipid.bonds[..phosphate].iter().map(|b| b.length).sum();
         let last = lipid.beads.len() - 1;
-        for (k, bead) in lipid.beads.iter().enumerate() {
-            let bead_type = force_field
-                .bead_type(bead)
-                .ok_or_else(|| BuildError::UnknownBead(bead.clone()))?;
-            *atom_id += 1;
-            particles.push(Particle {
-                residue: lipid.name.clone(),
-                bead: bead.clone(),
-                molecule_id: *molecule_id,
-                atom_id: *atom_id,
-                position: [x, y, z],
-                charge: bead_type.charge,
-                mass: bead_type.mass,
+        let mut beads = Vec::with_capacity(lipid.beads.len());
+        for (k, bead_name) in lipid.beads.iter().enumerate() {
+            let bt = force_field
+                .bead_type(bead_name)
+                .ok_or_else(|| BuildError::UnknownBead(bead_name.clone()))?;
+            beads.push(BeadTemplate {
+                name: bt.name.as_str(),
+                charge: bt.charge,
+                mass: bt.mass,
+                packing_radius: POTENTIAL_MINIMUM_FACTOR * bt.interaction.sigma() * 0.5,
+                z,
             });
             if k < last {
                 z -= lipid.bonds[k].length;
             }
+        }
+        extra_beads += beads.len() * count;
+        templates.push((lipid.name.as_str(), beads, count));
+    }
+
+    particles.reserve(extra_beads);
+    radii.reserve(extra_beads);
+    ranges.reserve(grid.count);
+
+    let start = particles.len();
+    for (lipid_name, beads, count) in &templates {
+        for _ in 0..*count {
+            *molecule_id += 1;
+            let mol_start = particles.len();
+            // Uniform-random lateral placement; Lloyd's relaxation makes it uniform.
+            let x = rng.random_range(0.0..box_x);
+            let y = rng.random_range(0.0..box_y);
+            for b in beads {
+                *atom_id += 1;
+                particles.push(Particle {
+                    residue: (*lipid_name).to_string(),
+                    bead: b.name.to_string(),
+                    molecule_id: *molecule_id,
+                    atom_id: *atom_id,
+                    position: [x, y, b.z],
+                    charge: b.charge,
+                    mass: b.mass,
+                });
+                radii.push(b.packing_radius);
+            }
+            ranges.push(mol_start..particles.len());
         }
     }
 
@@ -563,14 +600,14 @@ fn place_leaflet(
 /// the two leaflets' molecule ranges can be separated and relaxed at their own
 /// densities while the de-clash resolves any overlap between them.
 fn relax_membrane(
-    force_field: &ForceField,
     particles: &mut [Particle],
+    radii: &[f64],
+    ranges: &[std::ops::Range<usize>],
     upper_lipids: usize,
     box_x: f64,
     box_y: f64,
     frames: Option<&mut Vec<RelaxFrame>>,
 ) {
-    let ranges = molecule_ranges(particles);
     if ranges.len() < 2 {
         return;
     }
@@ -578,10 +615,6 @@ fn relax_membrane(
     let leaflets: Vec<&[std::ops::Range<usize>]> = [upper, lower]
         .into_iter()
         .filter(|l| !l.is_empty())
-        .collect();
-    let radii: Vec<f64> = particles
-        .iter()
-        .map(|p| bead_packing_radius(force_field, &p.bead))
         .collect();
     let mut positions: Vec<[f64; 3]> = particles.iter().map(|p| p.position).collect();
 
@@ -612,7 +645,7 @@ fn relax_membrane(
 
     pack::equalize_plane(
         &mut positions,
-        &radii,
+        radii,
         &leaflets,
         [box_x, box_y],
         DEFAULT_PACK_ITERATIONS,
@@ -673,31 +706,91 @@ pub(crate) fn aggregate_counts(
 }
 
 /// Reorder particles so molecules are grouped by species (in `order`) and
-/// renumber molecule and atom ids sequentially. Within a species, molecules keep
-/// their placement order, and each molecule's beads stay contiguous and in chain
-/// order. This is the single layout every output file uses.
-pub(crate) fn canonicalize(particles: Vec<Particle>, order: &[(String, usize)]) -> Vec<Particle> {
-    let molecules = molecule_ranges(&particles);
-    let mut result = Vec::with_capacity(particles.len());
+/// renumber molecule and atom ids sequentially, moving every particle without
+/// cloning. Within a species, molecules keep their placement order, and each
+/// molecule's beads stay contiguous and in chain order.
+pub(crate) fn canonicalize(
+    mut particles: Vec<Particle>,
+    order: &[(String, usize)],
+) -> Vec<Particle> {
+    if order.len() <= 1 {
+        let mut molecule_id = 0;
+        let mut prev_mol = usize::MAX;
+        for (i, p) in particles.iter_mut().enumerate() {
+            if p.molecule_id != prev_mol {
+                molecule_id += 1;
+                prev_mol = p.molecule_id;
+            }
+            p.molecule_id = molecule_id;
+            p.atom_id = i + 1;
+        }
+        return particles;
+    }
+
+    let mut buckets: Vec<Vec<Particle>> = order
+        .iter()
+        .map(|(_, count)| Vec::with_capacity(count * 6))
+        .collect();
+    let mut prev_mol = usize::MAX;
+    let mut current_bucket: Option<usize> = None;
+    for p in particles {
+        if p.molecule_id != prev_mol {
+            prev_mol = p.molecule_id;
+            current_bucket = order.iter().position(|(name, _)| *name == p.residue);
+        }
+        if let Some(b) = current_bucket {
+            buckets[b].push(p);
+        }
+    }
+
+    let total: usize = buckets.iter().map(Vec::len).sum();
+    let mut result = Vec::with_capacity(total);
     let mut molecule_id = 0;
     let mut atom_id = 0;
-    for (lipid, _) in order {
-        for range in &molecules {
-            if particles[range.start].residue != *lipid {
-                continue;
+    for bucket in buckets {
+        let mut prev_mol = usize::MAX;
+        for mut p in bucket {
+            if p.molecule_id != prev_mol {
+                molecule_id += 1;
+                prev_mol = p.molecule_id;
             }
-            molecule_id += 1;
-            for source in &particles[range.clone()] {
-                atom_id += 1;
-                result.push(Particle {
-                    molecule_id,
-                    atom_id,
-                    ..source.clone()
-                });
-            }
+            atom_id += 1;
+            p.molecule_id = molecule_id;
+            p.atom_id = atom_id;
+            result.push(p);
         }
     }
     result
+}
+
+/// Format `particles` into `out`, parallelising across chunks on large systems
+/// so coordinate/structure writers saturate all cores without duplicating boilerplate.
+pub(crate) fn write_particles(
+    out: &mut String,
+    particles: &[Particle],
+    bytes_per_particle: usize,
+    format_one: impl Fn(&mut String, &Particle) + Sync,
+) {
+    const PAR_CHUNK: usize = 4096;
+    if particles.len() >= PAR_CHUNK * 2 {
+        let chunks: Vec<String> = particles
+            .par_chunks(PAR_CHUNK)
+            .map(|chunk| {
+                let mut buf = String::with_capacity(chunk.len() * bytes_per_particle);
+                for p in chunk {
+                    format_one(&mut buf, p);
+                }
+                buf
+            })
+            .collect();
+        for chunk in chunks {
+            out.push_str(&chunk);
+        }
+    } else {
+        for p in particles {
+            format_one(out, p);
+        }
+    }
 }
 
 /// Index ranges of `particles` belonging to each molecule. A molecule's beads

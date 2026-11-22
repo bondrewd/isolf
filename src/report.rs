@@ -7,12 +7,12 @@
 //! `--verbose` levels. State lives in a process-global so the build code can
 //! report from anywhere without threading a handle through every function.
 
-use std::io::IsTerminal;
+use std::fmt::Write as _;
+use std::io::{IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-
-use indicatif::{ProgressBar, ProgressStyle};
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
@@ -229,7 +229,7 @@ fn gradient_line(text: &str, width: usize, depth: Depth) -> String {
     if depth == Depth::None {
         return text.to_string();
     }
-    let mut out = String::new();
+    let mut out = String::with_capacity(text.len() * 8);
     for (i, ch) in text.chars().enumerate() {
         if ch == ' ' {
             out.push(' ');
@@ -240,12 +240,23 @@ fn gradient_line(text: &str, width: usize, depth: Depth) -> String {
         } else {
             0.0
         };
-        let color = if t < 0.5 {
+        let (r, g, b) = if t < 0.5 {
             lerp_rgb(GRADIENT[0], GRADIENT[1], t * 2.0)
         } else {
             lerp_rgb(GRADIENT[1], GRADIENT[2], (t - 0.5) * 2.0)
         };
-        out.push_str(&rgb(&ch.to_string(), color, depth, true));
+        match depth {
+            Depth::None => out.push(ch),
+            Depth::True => {
+                let _ = write!(out, "\x1b[1;38;2;{r};{g};{b}m{ch}\x1b[0m");
+            }
+            Depth::Ansi256 => {
+                let _ = write!(out, "\x1b[1;38;5;{}m{ch}\x1b[0m", rgb_to_256(r, g, b));
+            }
+            Depth::Ansi16 => {
+                let _ = write!(out, "\x1b[1;{}m{ch}\x1b[0m", rgb_to_16(r, g, b));
+            }
+        }
     }
     out
 }
@@ -542,16 +553,18 @@ pub fn summary(sum: &Summary) {
                 }
             }
         }
+        let dash = if s.unicode { "—" } else { "-" };
+        let sep = format!(" {} ", g.dot);
         for (label, counts) in leaflets {
             let body = if counts.is_empty() {
-                "—".to_string()
+                dash.to_string()
             } else {
                 counts
                     .iter()
                     .enumerate()
                     .map(|(j, (sp, c))| format!("{sp} {:>w$}", thousands(*c), w = col_width[j]))
                     .collect::<Vec<_>>()
-                    .join(" · ")
+                    .join(&sep)
             };
             comp.push(format!(
                 "{} {body}",
@@ -599,10 +612,15 @@ pub fn error(msg: &str) {
 
 // ---- spinner ----
 
+struct SpinnerHandle {
+    signal: Arc<(Mutex<bool>, Condvar)>,
+    thread: JoinHandle<()>,
+}
+
 /// A live spinner over a slow step. Finishing it (explicitly or on drop) clears
 /// the line; the caller then prints the matching `✓` row.
 pub struct Spinner {
-    bar: Option<ProgressBar>,
+    handle: Option<SpinnerHandle>,
 }
 
 impl Spinner {
@@ -612,8 +630,11 @@ impl Spinner {
 
 impl Drop for Spinner {
     fn drop(&mut self) {
-        if let Some(bar) = self.bar.take() {
-            bar.finish_and_clear();
+        if let Some(SpinnerHandle { signal, thread }) = self.handle.take() {
+            let (lock, cvar) = &*signal;
+            *lock.lock().unwrap() = true;
+            cvar.notify_one();
+            let _ = thread.join();
         }
     }
 }
@@ -623,22 +644,50 @@ impl Drop for Spinner {
 pub fn spin(msg: &str) -> Spinner {
     let s = state();
     if s.quiet || !std::io::stderr().is_terminal() {
-        return Spinner { bar: None };
+        return Spinner { handle: None };
     }
-    let ticks: &[&str] = if s.unicode {
+    let ticks: &'static [&'static str] = if s.unicode {
         &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     } else {
         &["|", "/", "-", "\\"]
     };
-    let bar = ProgressBar::new_spinner();
-    bar.set_style(
-        ProgressStyle::with_template("    {spinner:.cyan} {msg}")
-            .unwrap()
-            .tick_strings(ticks),
-    );
-    bar.set_message(msg.to_string());
-    bar.enable_steady_tick(Duration::from_millis(80));
-    Spinner { bar: Some(bar) }
+    let color = s.color;
+    let msg = msg.to_string();
+    drop(s);
+
+    let signal = Arc::new((Mutex::new(false), Condvar::new()));
+    let worker_signal = Arc::clone(&signal);
+    let thread = std::thread::spawn(move || {
+        let (lock, cvar) = &*worker_signal;
+        let mut guard = lock.lock().unwrap();
+        let mut frame = 0usize;
+        let mut drew = false;
+        loop {
+            let (g, _) = cvar.wait_timeout(guard, Duration::from_millis(80)).unwrap();
+            guard = g;
+            if *guard {
+                break;
+            }
+            drew = true;
+            let tick = ticks[frame % ticks.len()];
+            frame = frame.wrapping_add(1);
+            let mut stderr = std::io::stderr().lock();
+            if color {
+                let _ = write!(stderr, "\r    \x1b[36m{tick}\x1b[0m {msg}");
+            } else {
+                let _ = write!(stderr, "\r    {tick} {msg}");
+            }
+            let _ = stderr.flush();
+        }
+        if drew {
+            let mut stderr = std::io::stderr().lock();
+            let _ = write!(stderr, "\r\x1b[2K");
+            let _ = stderr.flush();
+        }
+    });
+    Spinner {
+        handle: Some(SpinnerHandle { signal, thread }),
+    }
 }
 
 #[cfg(test)]

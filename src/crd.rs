@@ -7,13 +7,10 @@
 
 use std::fmt::Write;
 
-use crate::membrane::{Membrane, Particle};
+use crate::membrane::{Membrane, Particle, write_particles};
 
 /// nm → ångström conversion for CHARMM coordinates.
 const ANGSTROM_PER_NM: f64 = 10.0;
-
-/// Segment name used for every lipid molecule.
-const SEGMENT: &str = "MEMB";
 
 /// Largest atom count the standard (five-digit) format can represent.
 const MAX_STANDARD_ATOMS: usize = 99_999;
@@ -25,8 +22,8 @@ const MAX_STANDARD_RESIDUES: usize = 9_999;
 /// the molecule count, used only to pick the standard or extended layout.
 pub fn render(particles: &[Particle], name: &str, num_residues: usize) -> String {
     let extended = particles.len() > MAX_STANDARD_ATOMS || num_residues > MAX_STANDARD_RESIDUES;
-
-    let mut s = String::new();
+    let per_line = if extended { 140 } else { 72 };
+    let mut s = String::with_capacity(particles.len() * per_line + 64);
     let _ = writeln!(s, "* {name}");
     let _ = writeln!(s, "*");
     if extended {
@@ -35,12 +32,12 @@ pub fn render(particles: &[Particle], name: &str, num_residues: usize) -> String
         let _ = writeln!(s, "{:>5}", particles.len());
     }
 
-    for particle in particles {
+    write_particles(&mut s, particles, per_line, |buf, particle| {
         let [x, y, z] = particle.position.map(|c| c * ANGSTROM_PER_NM);
         if extended {
             let _ = writeln!(
-                s,
-                "{:>10}{:>10}  {:<8}  {:<8}{:>20.10}{:>20.10}{:>20.10}  {:<8}  {:<8}{:>20.10}",
+                buf,
+                "{:>10}{:>10}  {:<8}  {:<8}{:>20.10}{:>20.10}{:>20.10}  MEMB      {:<8}        0.0000000000",
                 particle.atom_id,
                 particle.molecule_id,
                 particle.residue,
@@ -48,14 +45,12 @@ pub fn render(particles: &[Particle], name: &str, num_residues: usize) -> String
                 x,
                 y,
                 z,
-                SEGMENT,
                 particle.molecule_id,
-                0.0,
             );
         } else {
             let _ = writeln!(
-                s,
-                "{:>5}{:>5} {:<4} {:<4}{:>10.5}{:>10.5}{:>10.5} {:<4} {:<4}{:>10.5}",
+                buf,
+                "{:>5}{:>5} {:<4} {:<4}{:>10.5}{:>10.5}{:>10.5} MEMB {:<4}   0.00000",
                 particle.atom_id,
                 particle.molecule_id,
                 particle.residue,
@@ -63,12 +58,10 @@ pub fn render(particles: &[Particle], name: &str, num_residues: usize) -> String
                 x,
                 y,
                 z,
-                SEGMENT,
                 particle.molecule_id,
-                0.0,
             );
         }
-    }
+    });
     s
 }
 

@@ -19,11 +19,10 @@ use rand::Rng;
 
 use crate::composition::Composition;
 use crate::error::BuildError;
-use crate::force_field::ForceField;
+use crate::force_field::{ForceField, POTENTIAL_MINIMUM_FACTOR};
 use crate::membrane::{
     BuildOptions, DEFAULT_PACK_ITERATIONS, DEFAULT_PACK_TOLERANCE, Membrane, Particle, RelaxFrame,
-    aggregate_counts, bead_packing_radius, canonicalize, clash_floor, leaflet_spacing,
-    molecule_ranges,
+    aggregate_counts, canonicalize, clash_floor, leaflet_spacing,
 };
 use crate::pack;
 
@@ -143,6 +142,8 @@ fn build_vesicle_inner(
     let mut molecule_id = 0;
     let mut atom_id = 0;
     let mut particles = Vec::new();
+    let mut radii = Vec::new();
+    let mut ranges = Vec::new();
 
     let outer_counts = place_shell(
         force_field,
@@ -154,6 +155,8 @@ fn build_vesicle_inner(
         &mut molecule_id,
         &mut atom_id,
         &mut particles,
+        &mut radii,
+        &mut ranges,
     )?;
     // The lipids placed so far form the outer shell (the inner follows).
     let outer_lipids = molecule_id;
@@ -167,13 +170,16 @@ fn build_vesicle_inner(
         &mut molecule_id,
         &mut atom_id,
         &mut particles,
+        &mut radii,
+        &mut ranges,
     )?;
 
     // Relax the random placement to a uniform, clash-free start: an independent
     // spherical centroidal-Voronoi (Lloyd) pass per shell, then a shared de-clash.
     relax_vesicle(
-        force_field,
         &mut particles,
+        &radii,
+        &ranges,
         outer_lipids,
         outer_radius,
         inner_radius,
@@ -230,8 +236,17 @@ fn max_chain_length(
     Ok(longest)
 }
 
+struct ShellBeadTemplate<'a> {
+    name: &'a str,
+    charge: f64,
+    mass: f64,
+    packing_radius: f64,
+    radius: f64,
+}
+
 /// Place `count` lipids of `composition` over a shell, appending them to
-/// `particles` and returning the per-component molecule counts.
+/// `particles` (along with packing radii and molecule bead ranges) and returning
+/// the per-component molecule counts.
 #[allow(clippy::too_many_arguments)]
 fn place_shell(
     force_field: &ForceField,
@@ -243,43 +258,38 @@ fn place_shell(
     molecule_id: &mut usize,
     atom_id: &mut usize,
     particles: &mut Vec<Particle>,
+    radii: &mut Vec<f64>,
+    ranges: &mut Vec<std::ops::Range<usize>>,
 ) -> Result<Vec<usize>, BuildError> {
     let counts = composition.partition(count);
     if count == 0 {
         return Ok(counts);
     }
 
-    // One species per lipid, in partition order; the random directions below mix
-    // the species over the sphere, and Lloyd's relaxation makes the layout uniform.
-    let mut species: Vec<&str> = Vec::with_capacity(count);
+    // Resolve each species once: bead properties, packing radii, and shell radii.
+    let mut templates: Vec<(&str, Vec<ShellBeadTemplate<'_>>, usize)> =
+        Vec::with_capacity(counts.len());
+    let mut extra_beads = 0usize;
     for (component, &n) in composition.components().iter().zip(&counts) {
-        species.extend(std::iter::repeat_n(component.name.as_str(), n));
-    }
-
-    for &lipid_name in &species {
-        *molecule_id += 1;
+        if n == 0 {
+            continue;
+        }
         let lipid = force_field
-            .lipid(lipid_name)
-            .ok_or_else(|| BuildError::UnknownLipid(lipid_name.to_string()))?;
-        let direction = random_sphere_direction(rng);
-
-        // Head bead 0 sits on the shell; walk the chain radially toward the
-        // bilayer centre (inward for the outer shell, outward for the inner).
+            .lipid(&component.name)
+            .ok_or_else(|| BuildError::UnknownLipid(component.name.clone()))?;
         let mut r = radius;
         let last = lipid.beads.len() - 1;
-        for (k, bead) in lipid.beads.iter().enumerate() {
-            let bead_type = force_field
-                .bead_type(bead)
-                .ok_or_else(|| BuildError::UnknownBead(bead.clone()))?;
-            *atom_id += 1;
-            particles.push(Particle {
-                residue: lipid.name.clone(),
-                bead: bead.clone(),
-                molecule_id: *molecule_id,
-                atom_id: *atom_id,
-                position: [direction[0] * r, direction[1] * r, direction[2] * r],
-                charge: bead_type.charge,
-                mass: bead_type.mass,
+        let mut beads = Vec::with_capacity(lipid.beads.len());
+        for (k, bead_name) in lipid.beads.iter().enumerate() {
+            let bt = force_field
+                .bead_type(bead_name)
+                .ok_or_else(|| BuildError::UnknownBead(bead_name.clone()))?;
+            beads.push(ShellBeadTemplate {
+                name: bt.name.as_str(),
+                charge: bt.charge,
+                mass: bt.mass,
+                packing_radius: POTENTIAL_MINIMUM_FACTOR * bt.interaction.sigma() * 0.5,
+                radius: r,
             });
             if k < last {
                 r += match shell {
@@ -287,6 +297,38 @@ fn place_shell(
                     Shell::Inner => lipid.bonds[k].length,
                 };
             }
+        }
+        extra_beads += beads.len() * n;
+        templates.push((lipid.name.as_str(), beads, n));
+    }
+
+    particles.reserve(extra_beads);
+    radii.reserve(extra_beads);
+    ranges.reserve(count);
+
+    for (lipid_name, beads, n) in &templates {
+        for _ in 0..*n {
+            *molecule_id += 1;
+            let mol_start = particles.len();
+            let direction = random_sphere_direction(rng);
+            for b in beads {
+                *atom_id += 1;
+                particles.push(Particle {
+                    residue: (*lipid_name).to_string(),
+                    bead: b.name.to_string(),
+                    molecule_id: *molecule_id,
+                    atom_id: *atom_id,
+                    position: [
+                        direction[0] * b.radius,
+                        direction[1] * b.radius,
+                        direction[2] * b.radius,
+                    ],
+                    charge: b.charge,
+                    mass: b.mass,
+                });
+                radii.push(b.packing_radius);
+            }
+            ranges.push(mol_start..particles.len());
         }
     }
 
@@ -299,7 +341,8 @@ fn random_sphere_direction(rng: &mut impl Rng) -> [f64; 3] {
     let z: f64 = rng.random_range(-1.0..1.0);
     let phi: f64 = rng.random_range(0.0..2.0 * PI);
     let r = (1.0 - z * z).sqrt();
-    [r * phi.cos(), r * phi.sin(), z]
+    let (sin_phi, cos_phi) = phi.sin_cos();
+    [r * cos_phi, r * sin_phi, z]
 }
 
 /// Relax the randomly-placed shells to a uniform, clash-free configuration: an
@@ -308,14 +351,14 @@ fn random_sphere_direction(rng: &mut impl Rng) -> [f64; 3] {
 /// first), so the two shells' molecule ranges can be separated. Placement is about
 /// the origin, so the sphere centre is `[0, 0, 0]`.
 fn relax_vesicle(
-    force_field: &ForceField,
     particles: &mut [Particle],
+    radii: &[f64],
+    ranges: &[std::ops::Range<usize>],
     outer_lipids: usize,
     outer_radius: f64,
     inner_radius: f64,
     frames: Option<&mut Vec<RelaxFrame>>,
 ) {
-    let ranges = molecule_ranges(particles);
     if ranges.len() < 2 {
         return;
     }
@@ -325,10 +368,6 @@ fn relax_vesicle(
             .into_iter()
             .filter(|(s, _)| !s.is_empty())
             .collect();
-    let radii: Vec<f64> = particles
-        .iter()
-        .map(|p| bead_packing_radius(force_field, &p.bead))
-        .collect();
     let mut positions: Vec<[f64; 3]> = particles.iter().map(|p| p.position).collect();
 
     // When recording, project each lipid (its first bead, about the origin) to 2D
@@ -357,7 +396,7 @@ fn relax_vesicle(
 
     pack::equalize_on_sphere(
         &mut positions,
-        &radii,
+        radii,
         &shells,
         [0.0, 0.0, 0.0],
         DEFAULT_PACK_ITERATIONS,

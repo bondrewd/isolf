@@ -136,16 +136,19 @@ impl Composition {
     /// component.
     pub fn partition(&self, total: usize) -> Vec<usize> {
         let species = self.components.len();
+        if species == 1 {
+            return vec![total];
+        }
         let mut counts = vec![0usize; species];
 
         for placed in 1..=total {
             // Hand this lipid to the species whose fraction of the lipids placed
             // so far is furthest below its target proportion.
-            let denominator = (placed - 1).max(1) as f64;
+            let inv_denom = 1.0 / (placed - 1).max(1) as f64;
             let mut chosen = 0;
             let mut lowest = f64::INFINITY;
             for (k, component) in self.components.iter().enumerate() {
-                let shortfall = counts[k] as f64 / denominator - component.proportion;
+                let shortfall = counts[k] as f64 * inv_denom - component.proportion;
                 if shortfall < lowest {
                     lowest = shortfall;
                     chosen = k;

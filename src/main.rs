@@ -552,63 +552,65 @@ struct VmdControl {
     vmd_color_by: LipidColorScope,
 }
 
-impl NvtControl {
-    /// Build the GENESIS dynamics parameters from these NVT flags, drawing a
-    /// random thermostat seed when one was not given explicitly.
-    fn dynamics(&self, default_temperature: f64, rng: &mut StdRng) -> isolf::inp::Dynamics {
-        isolf::inp::Dynamics {
-            temperature: self.nvt_temperature.unwrap_or(default_temperature),
-            num_steps: self.nvt_num_steps,
-            time_step: self.nvt_time_step,
-            eneout_period: self.nvt_eneout_period,
-            crdout_period: self.nvt_crdout_period,
-            rstout_period: self.nvt_rstout_period,
-            stoptr_period: self.nvt_stoptr_period,
-            nbupdate_period: self.nvt_nbupdate_period,
-            seed: self
-                .nvt_seed
-                .unwrap_or_else(|| rng.random_range(1..=MAX_ISEED)),
+macro_rules! impl_dynamics {
+    ($ty:ty, $temp:ident, $steps:ident, $dt:ident, $ene:ident, $crd:ident, $rst:ident, $stoptr:ident, $nb:ident, $seed:ident) => {
+        impl $ty {
+            /// Build GENESIS dynamics parameters, drawing a random thermostat seed when unset.
+            fn dynamics(&self, default_temperature: f64, rng: &mut StdRng) -> isolf::inp::Dynamics {
+                isolf::inp::Dynamics {
+                    temperature: self.$temp.unwrap_or(default_temperature),
+                    num_steps: self.$steps,
+                    time_step: self.$dt,
+                    eneout_period: self.$ene,
+                    crdout_period: self.$crd,
+                    rstout_period: self.$rst,
+                    stoptr_period: self.$stoptr,
+                    nbupdate_period: self.$nb,
+                    seed: self
+                        .$seed
+                        .unwrap_or_else(|| rng.random_range(1..=MAX_ISEED)),
+                }
+            }
         }
-    }
+    };
 }
 
-impl NptControl {
-    /// Build the GENESIS dynamics parameters from these NPT flags.
-    fn dynamics(&self, default_temperature: f64, rng: &mut StdRng) -> isolf::inp::Dynamics {
-        isolf::inp::Dynamics {
-            temperature: self.npt_temperature.unwrap_or(default_temperature),
-            num_steps: self.npt_num_steps,
-            time_step: self.npt_time_step,
-            eneout_period: self.npt_eneout_period,
-            crdout_period: self.npt_crdout_period,
-            rstout_period: self.npt_rstout_period,
-            stoptr_period: self.npt_stoptr_period,
-            nbupdate_period: self.npt_nbupdate_period,
-            seed: self
-                .npt_seed
-                .unwrap_or_else(|| rng.random_range(1..=MAX_ISEED)),
-        }
-    }
-}
-
-impl ProControl {
-    /// Build the GENESIS dynamics parameters from these production flags.
-    fn dynamics(&self, default_temperature: f64, rng: &mut StdRng) -> isolf::inp::Dynamics {
-        isolf::inp::Dynamics {
-            temperature: self.pro_temperature.unwrap_or(default_temperature),
-            num_steps: self.pro_num_steps,
-            time_step: self.pro_time_step,
-            eneout_period: self.pro_eneout_period,
-            crdout_period: self.pro_crdout_period,
-            rstout_period: self.pro_rstout_period,
-            stoptr_period: self.pro_stoptr_period,
-            nbupdate_period: self.pro_nbupdate_period,
-            seed: self
-                .pro_seed
-                .unwrap_or_else(|| rng.random_range(1..=MAX_ISEED)),
-        }
-    }
-}
+impl_dynamics!(
+    NvtControl,
+    nvt_temperature,
+    nvt_num_steps,
+    nvt_time_step,
+    nvt_eneout_period,
+    nvt_crdout_period,
+    nvt_rstout_period,
+    nvt_stoptr_period,
+    nvt_nbupdate_period,
+    nvt_seed
+);
+impl_dynamics!(
+    NptControl,
+    npt_temperature,
+    npt_num_steps,
+    npt_time_step,
+    npt_eneout_period,
+    npt_crdout_period,
+    npt_rstout_period,
+    npt_stoptr_period,
+    npt_nbupdate_period,
+    npt_seed
+);
+impl_dynamics!(
+    ProControl,
+    pro_temperature,
+    pro_num_steps,
+    pro_time_step,
+    pro_eneout_period,
+    pro_crdout_period,
+    pro_rstout_period,
+    pro_stoptr_period,
+    pro_nbupdate_period,
+    pro_seed
+);
 
 /// Upper bound for a randomly drawn Langevin thermostat seed.
 const MAX_ISEED: u64 = 999_999;
@@ -707,13 +709,9 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let options = BuildOptions {
         padding: args.padding,
     };
-    let kind = if geometry == Geometry::Vesicle {
-        "vesicle"
-    } else {
-        "membrane"
-    };
+    let kind = geometry.label();
     let spin = report::spin(&format!("building {kind}"));
-    let (membrane, note, gif_frames) = match geometry {
+    let (mut membrane, note, gif_frames) = match geometry {
         Geometry::Vesicle => {
             let radius = vesicle.expect("a vesicle geometry has a radius");
             let (membrane, frames) = if args.gif {
@@ -793,10 +791,10 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let base = args
         .name
         .clone()
-        .unwrap_or_else(|| geometry.default_base_name().to_string());
+        .unwrap_or_else(|| geometry.label().to_string());
 
     write_outputs(
-        &membrane,
+        &mut membrane,
         &force_field,
         &args,
         geometry,
@@ -809,7 +807,7 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     let out_dir = args.out.display().to_string();
     let box_size = membrane.box_size;
     let beads = membrane.particles.len();
-    let identity = mode_label(geometry);
+    let identity = geometry.label();
 
     // The always-on run log, written next to the output and listed within it.
     let files: Vec<String> = report::recorded_files()
@@ -898,19 +896,20 @@ enum Geometry {
 }
 
 impl Geometry {
+    /// Short mode label (`"membrane"` or `"vesicle"`), also used as the default
+    /// output base name when `--name` is not given.
+    fn label(self) -> &'static str {
+        match self {
+            Geometry::Membrane => "membrane",
+            Geometry::Vesicle => "vesicle",
+        }
+    }
+
     /// System title written into the structure-file headers.
     fn title(self) -> &'static str {
         match self {
             Geometry::Membrane => DEFAULT_NAME,
             Geometry::Vesicle => "CG vesicle model",
-        }
-    }
-
-    /// Default base name for the output files when `--name` is not given.
-    fn default_base_name(self) -> &'static str {
-        match self {
-            Geometry::Membrane => "membrane",
-            Geometry::Vesicle => "vesicle",
         }
     }
 
@@ -949,13 +948,12 @@ fn parse_count(value: &str) -> Result<usize, Box<dyn Error>> {
         .ok_or_else(|| format!("'{value}' is not a positive lipid count").into())
 }
 
-/// Parse the repeatable `--lipids-per-leaflet` occurrences into per-leaflet lipid
-/// counts `(upper, lower)`, or `None` if the flag was absent. Each occurrence is a
-/// comma-separated list of `up=<N>`, `lo=<N>`, or a bare number (sets `up`); an
-/// unspecified leaflet copies the other, so `1000` and `up=1000` both mean 1000
-/// lipids in each leaflet.
-fn parse_lipids_per_leaflet(specs: &[String]) -> Result<Option<(usize, usize)>, Box<dyn Error>> {
-    let (mut up, mut lo) = (None, None);
+/// Walk non-empty comma-separated `KEY=VALUE` (or bare `VALUE`) tokens across
+/// repeatable CLI flag occurrences. Returns `true` if any token was seen.
+fn for_each_kv(
+    specs: &[String],
+    mut handle: impl FnMut(Option<&str>, &str) -> Result<(), Box<dyn Error>>,
+) -> Result<bool, Box<dyn Error>> {
     let mut seen = false;
     for token in specs.iter().flat_map(|s| s.split(',')) {
         let token = token.trim();
@@ -964,32 +962,47 @@ fn parse_lipids_per_leaflet(specs: &[String]) -> Result<Option<(usize, usize)>, 
         }
         seen = true;
         match token.split_once('=') {
-            Some((key, value)) => match key.trim().to_ascii_lowercase().as_str() {
-                "up" | "upper" => up = Some(parse_count(value)?),
-                "lo" | "lower" => lo = Some(parse_count(value)?),
-                other => {
-                    return Err(format!(
-                        "--lipids-per-leaflet: unknown key '{other}' (use up or lo)"
-                    )
-                    .into());
-                }
-            },
-            None => up = Some(parse_count(token)?),
+            Some((k, v)) => handle(Some(k.trim()), v)?,
+            None => handle(None, token)?,
         }
     }
+    Ok(seen)
+}
+
+/// Parse the repeatable `--lipids-per-leaflet` occurrences into per-leaflet lipid
+/// counts `(upper, lower)`, or `None` if the flag was absent. Each occurrence is a
+/// comma-separated list of `up=<N>`, `lo=<N>`, or a bare number (sets `up`); an
+/// unspecified leaflet copies the other, so `1000` and `up=1000` both mean 1000
+/// lipids in each leaflet.
+fn parse_lipids_per_leaflet(specs: &[String]) -> Result<Option<(usize, usize)>, Box<dyn Error>> {
+    let (mut up, mut lo) = (None, None);
+    let seen = for_each_kv(specs, |key, val| match key {
+        None => {
+            up = Some(parse_count(val)?);
+            Ok(())
+        }
+        Some(k) if k.eq_ignore_ascii_case("up") || k.eq_ignore_ascii_case("upper") => {
+            up = Some(parse_count(val)?);
+            Ok(())
+        }
+        Some(k) if k.eq_ignore_ascii_case("lo") || k.eq_ignore_ascii_case("lower") => {
+            lo = Some(parse_count(val)?);
+            Ok(())
+        }
+        Some(other) => {
+            Err(format!("--lipids-per-leaflet: unknown key '{other}' (use up or lo)").into())
+        }
+    })?;
     if !seen {
         return Ok(None);
     }
-    let counts = match (up, lo) {
-        (Some(up), Some(lo)) => (up, lo),
-        (Some(n), None) | (None, Some(n)) => (n, n),
+    match (up, lo) {
+        (Some(u), Some(l)) => Ok(Some((u, l))),
+        (Some(n), None) | (None, Some(n)) => Ok(Some((n, n))),
         (None, None) => {
-            return Err(
-                "--lipids-per-leaflet needs a value, e.g. `1000` or `up=1000,lo=2000`".into(),
-            );
+            Err("--lipids-per-leaflet needs a value, e.g. `1000` or `up=1000,lo=2000`".into())
         }
-    };
-    Ok(Some(counts))
+    }
 }
 
 /// Parse the repeatable `--membrane` occurrences into a flat-membrane box
@@ -998,35 +1011,29 @@ fn parse_lipids_per_leaflet(specs: &[String]) -> Result<Option<(usize, usize)>, 
 /// unspecified side copies the other, so `10` and `x=10` both mean a 10 nm square.
 fn parse_membrane(specs: &[String]) -> Result<Option<(f64, f64)>, Box<dyn Error>> {
     let (mut x, mut y) = (None, None);
-    let mut seen = false;
-    for token in specs.iter().flat_map(|s| s.split(',')) {
-        let token = token.trim();
-        if token.is_empty() {
-            continue;
+    let seen = for_each_kv(specs, |key, val| match key {
+        None => {
+            x = Some(parse_dim(val)?);
+            Ok(())
         }
-        seen = true;
-        match token.split_once('=') {
-            Some((key, value)) => match key.trim().to_ascii_lowercase().as_str() {
-                "x" => x = Some(parse_dim(value)?),
-                "y" => y = Some(parse_dim(value)?),
-                other => {
-                    return Err(format!("--membrane: unknown key '{other}' (use x or y)").into());
-                }
-            },
-            None => x = Some(parse_dim(token)?),
+        Some(k) if k.eq_ignore_ascii_case("x") => {
+            x = Some(parse_dim(val)?);
+            Ok(())
         }
-    }
+        Some(k) if k.eq_ignore_ascii_case("y") => {
+            y = Some(parse_dim(val)?);
+            Ok(())
+        }
+        Some(other) => Err(format!("--membrane: unknown key '{other}' (use x or y)").into()),
+    })?;
     if !seen {
         return Ok(None);
     }
-    let dims = match (x, y) {
-        (Some(x), Some(y)) => (x, y),
-        (Some(s), None) | (None, Some(s)) => (s, s),
-        (None, None) => {
-            return Err("--membrane needs a value, e.g. `10` or `x=10,y=20`".into());
-        }
-    };
-    Ok(Some(dims))
+    match (x, y) {
+        (Some(x), Some(y)) => Ok(Some((x, y))),
+        (Some(s), None) | (None, Some(s)) => Ok(Some((s, s))),
+        (None, None) => Err("--membrane needs a value, e.g. `10` or `x=10,y=20`".into()),
+    }
 }
 
 /// Parse the repeatable `--vesicle` occurrences into a [`VesicleRadius`], or
@@ -1036,36 +1043,30 @@ fn parse_membrane(specs: &[String]) -> Result<Option<(f64, f64)>, Box<dyn Error>
 /// thickness; with both, [`build_vesicle`] checks the gap holds the bilayer.
 fn parse_vesicle(specs: &[String]) -> Result<Option<VesicleRadius>, Box<dyn Error>> {
     let (mut inner, mut outer) = (None, None);
-    let mut seen = false;
-    for token in specs.iter().flat_map(|s| s.split(',')) {
-        let token = token.trim();
-        if token.is_empty() {
-            continue;
+    let seen = for_each_kv(specs, |key, val| match key {
+        None => {
+            outer = Some(parse_dim(val)?);
+            Ok(())
         }
-        seen = true;
-        match token.split_once('=') {
-            Some((key, value)) => match key.trim().to_ascii_lowercase().as_str() {
-                "ri" => inner = Some(parse_dim(value)?),
-                "ro" => outer = Some(parse_dim(value)?),
-                other => {
-                    return Err(format!("--vesicle: unknown key '{other}' (use ro or ri)").into());
-                }
-            },
-            None => outer = Some(parse_dim(token)?),
+        Some(k) if k.eq_ignore_ascii_case("ri") => {
+            inner = Some(parse_dim(val)?);
+            Ok(())
         }
-    }
+        Some(k) if k.eq_ignore_ascii_case("ro") => {
+            outer = Some(parse_dim(val)?);
+            Ok(())
+        }
+        Some(other) => Err(format!("--vesicle: unknown key '{other}' (use ro or ri)").into()),
+    })?;
     if !seen {
         return Ok(None);
     }
-    let radius = match (inner, outer) {
-        (Some(inner), Some(outer)) => VesicleRadius::Both { inner, outer },
-        (Some(inner), None) => VesicleRadius::Inner(inner),
-        (None, Some(outer)) => VesicleRadius::Outer(outer),
-        (None, None) => {
-            return Err("--vesicle needs a value, e.g. `20` or `ri=15,ro=20`".into());
-        }
-    };
-    Ok(Some(radius))
+    match (inner, outer) {
+        (Some(inner), Some(outer)) => Ok(Some(VesicleRadius::Both { inner, outer })),
+        (Some(inner), None) => Ok(Some(VesicleRadius::Inner(inner))),
+        (None, Some(outer)) => Ok(Some(VesicleRadius::Outer(outer))),
+        (None, None) => Err("--vesicle needs a value, e.g. `20` or `ri=15,ro=20`".into()),
+    }
 }
 
 /// Combine the repeatable, comma-separated occurrences of a leaflet flag
@@ -1178,71 +1179,68 @@ fn balanced_counts(
     }
 }
 
-/// A short label for the build mode, shown in the closing summary.
-fn mode_label(geometry: Geometry) -> &'static str {
-    match geometry {
-        Geometry::Membrane => "membrane",
-        Geometry::Vesicle => "vesicle",
-    }
-}
-
 /// Per-leaflet lipid composition. Each lipid molecule is classified into one of
 /// the two leaflets and counted per species (in the membrane's species order): a
 /// flat membrane splits by centroid z about the mean bead z (`upper`/`lower`), a
 /// vesicle by centroid radius about the mean bead radius (`outer`/`inner`).
 fn leaflet_split(m: &Membrane, geometry: Geometry) -> Vec<report::Leaflet> {
-    use std::collections::HashMap;
     if m.particles.is_empty() {
         return Vec::new();
     }
     let vesicle = matches!(geometry, Geometry::Vesicle);
     let n = m.particles.len() as f64;
-    // The scalar each bead is classified by: distance from the lipid centre (a
-    // vesicle's radius) or its z (a flat membrane).
-    let center = {
+    let center = if vesicle {
         let mut c = [0.0; 3];
         for p in &m.particles {
-            for (acc, v) in c.iter_mut().zip(p.position) {
-                *acc += v / n;
-            }
+            c[0] += p.position[0];
+            c[1] += p.position[1];
+            c[2] += p.position[2];
         }
-        c
+        [c[0] / n, c[1] / n, c[2] / n]
+    } else {
+        [0.0; 3]
     };
     let scalar = |pos: [f64; 3]| {
         if vesicle {
-            let d = [pos[0] - center[0], pos[1] - center[1], pos[2] - center[2]];
-            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+            let dx = pos[0] - center[0];
+            let dy = pos[1] - center[1];
+            let dz = pos[2] - center[2];
+            (dx * dx + dy * dy + dz * dz).sqrt()
         } else {
             pos[2]
         }
     };
-    // Midplane threshold and each molecule's species + mean scalar.
+
+    // Particles are contiguous per molecule and grouped by species, so we count
+    // in one linear scan with no HashMaps or String clones.
     let threshold = m.particles.iter().map(|p| scalar(p.position)).sum::<f64>() / n;
-    let mut molecules: HashMap<usize, (String, f64, usize)> = HashMap::new();
-    for p in &m.particles {
-        let entry = molecules
-            .entry(p.molecule_id)
-            .or_insert_with(|| (p.residue.clone(), 0.0, 0));
-        entry.1 += scalar(p.position);
-        entry.2 += 1;
-    }
-    let mut far: HashMap<&str, usize> = HashMap::new();
-    let mut near: HashMap<&str, usize> = HashMap::new();
-    for (species, sum, count) in molecules.values() {
-        let side = if *sum / *count as f64 >= threshold {
-            &mut far
+    let n_species = m.lipid_counts.len();
+    let mut far = vec![0usize; n_species];
+    let mut near = vec![0usize; n_species];
+    let mut species_idx = 0usize;
+    for mol in m.particles.chunk_by(|a, b| a.molecule_id == b.molecule_id) {
+        let res = mol[0].residue.as_str();
+        if species_idx >= n_species || m.lipid_counts[species_idx].0 != res {
+            if let Some(idx) = m.lipid_counts.iter().position(|(s, _)| s == res) {
+                species_idx = idx;
+            } else {
+                continue;
+            }
+        }
+        let mean = mol.iter().map(|p| scalar(p.position)).sum::<f64>() / mol.len() as f64;
+        if mean >= threshold {
+            far[species_idx] += 1;
         } else {
-            &mut near
-        };
-        *side.entry(species.as_str()).or_insert(0) += 1;
+            near[species_idx] += 1;
+        }
     }
-    let in_species_order = |counts: &HashMap<&str, usize>| -> Vec<(String, usize)> {
+
+    let in_species_order = |counts: &[usize]| -> Vec<(String, usize)> {
         m.lipid_counts
             .iter()
-            .filter_map(|(species, _)| {
-                let c = counts.get(species.as_str()).copied().unwrap_or(0);
-                (c > 0).then(|| (species.clone(), c))
-            })
+            .zip(counts)
+            .filter(|&(_, &c)| c > 0)
+            .map(|((species, _), &c)| (species.clone(), c))
             .collect()
     };
     let (far_label, near_label) = if vesicle {
@@ -1258,7 +1256,7 @@ fn leaflet_split(m: &Membrane, geometry: Geometry) -> Vec<report::Leaflet> {
 
 #[allow(clippy::too_many_arguments)]
 fn write_outputs(
-    membrane: &Membrane,
+    membrane: &mut Membrane,
     force_field: &ForceField,
     args: &Args,
     geometry: Geometry,
@@ -1269,47 +1267,38 @@ fn write_outputs(
     fs::create_dir_all(&args.out)?;
     let named = |extension: &str| args.out.join(format!("{base}.{extension}"));
 
-    // The flat bilayer is built centred on the origin, which draws in a corner of
-    // the box, so centre it in the box for the viewer (a no-op for a vesicle,
-    // already centred).
-    let centered = membrane.centered_in_box();
+    // Centre the finished system in the box in place (a no-op for an already
+    // centred vesicle), then shift to the coordinate origin if `--center origin`.
+    // The periodic box is unchanged; only the coordinates move.
+    membrane.center_in_box();
+    let box_size = membrane.box_size;
+    if matches!(args.center, CenterArg::Origin) {
+        membrane.translate([-box_size[0] / 2.0, -box_size[1] / 2.0, -box_size[2] / 2.0]);
+    }
+    let membrane: &Membrane = membrane;
 
-    // The periodic box is fixed by the build; `--center` only moves the
-    // coordinates within it.
-    let box_size = centered.box_size;
-
-    // `--center origin` shifts the box-centred build to the coordinate origin
-    // (minus half the box). The box — and so the `.gro` box line — is unchanged;
-    // the VMD scripts translate the system back into the box, so the view matches
-    // the box-centred default. Box mode leaves the coordinates exactly as built.
-    let shifted = matches!(args.center, CenterArg::Origin).then(|| {
-        let mut m = centered.clone();
-        m.translate([-box_size[0] / 2.0, -box_size[1] / 2.0, -box_size[2] / 2.0]);
-        m
-    });
-    let membrane = shifted.as_ref().unwrap_or(&centered);
-
-    // The `.gro` is always written.
-    write(&named("gro"), &membrane.to_gro())?;
+    // Structure/coordinate formats: `.gro` is always written; optional formats
+    // (`--pdb`, `--psf`/`--vmd`, `--crd`, `--cif`) each parallelise internally
+    // over particles, so writing them one at a time keeps peak memory low while
+    // saturating all cores.
+    let formats: [StructureFormat; 5] = [
+        (true, "gro", Membrane::to_gro),
+        (args.pdb, "pdb", Membrane::to_pdb),
+        (args.psf || args.vmd, "psf", Membrane::to_psf),
+        (args.crd, "crd", Membrane::to_crd),
+        (args.cif, "cif", Membrane::to_cif),
+    ];
+    for (enabled, ext, render) in formats {
+        if enabled {
+            write(&named(ext), &render(membrane))?;
+        }
+    }
 
     // Topology files (`.top` plus the force-field `.itp`) with --top, or implied
     // by --inp, since a run needs them.
     if args.top || args.inp {
         write(&named("top"), &membrane.to_top())?;
         write(&args.out.join("isolf.itp"), &force_field.to_itp())?;
-    }
-
-    // Optional structure formats. --vmd also needs the .psf.
-    let formats: [StructureFormat; 4] = [
-        (args.pdb, "pdb", Membrane::to_pdb),
-        (args.psf || args.vmd, "psf", Membrane::to_psf),
-        (args.crd, "crd", Membrane::to_crd),
-        (args.cif, "cif", Membrane::to_cif),
-    ];
-    for (enabled, ext, to_membrane) in formats {
-        if enabled {
-            write(&named(ext), &to_membrane(membrane))?;
-        }
     }
 
     // The relaxation animation for --gif. A membrane records box (x, y) positions;
