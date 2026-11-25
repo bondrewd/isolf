@@ -71,8 +71,11 @@ pub struct VmdOptions<'a> {
 /// What a script visualizes.
 #[derive(Debug, Clone, Copy)]
 pub enum VmdSource<'a> {
-    /// The initial built coordinates from `<base>.gro` (a single frame).
+    /// The initial built coordinates from `./<base>.gro` (a single frame).
     Structure,
+    /// A single-frame `.gro` at an explicit path relative to the script
+    /// (e.g. `"./win_1/system.gro"` or `"./win_1.gro"` for umbrella campaigns).
+    StructureAt { gro: &'a str },
     /// Simulation stage `name`'s `<name>.dcd` trajectory, with `frames` frames
     /// (its `nsteps / crdout_period`) when known.
     Trajectory {
@@ -143,6 +146,12 @@ pub fn vmd_script(
         VmdSource::Structure => (
             "structure".to_string(),
             format!("mol addfile ./{base}.gro type gro waitfor all"),
+            base.to_string(),
+            None,
+        ),
+        VmdSource::StructureAt { gro } => (
+            "structure".to_string(),
+            format!("mol addfile {gro} type gro waitfor all"),
             base.to_string(),
             None,
         ),

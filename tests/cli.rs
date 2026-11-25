@@ -612,15 +612,18 @@ fn umbrella_setup_cv_params_peptide_and_membrane_lipid_protein() {
     assert!(min1.contains("function1             = DISTMASS"));
     assert!(min1.contains("direction1            = Z2"));
     assert!(min1.contains("cg_cutoffdist_ele"));
+    let vmd = fs::read_to_string(win_dir.join("system.vmd")).unwrap();
+    assert!(vmd.contains("mol addfile ./win_1/system.gro"));
     assert!(win_dir.join("win_4/system.pdb").exists());
 
     // 3. Fast BO parameter update via top-level `isolf params` (auto-discovers TRP.itp,
-    //    even without manifest.json!).
+    //    even without manifest.json, and filters out unrelated residues from master file!).
     fs::remove_file(win_dir.join("manifest.json")).unwrap();
     let param_file = out.join("trial.txt");
     fs::write(
         &param_file,
-        "[cg_ISOLF_parameters]\nTRP 2.345 0.540 1.250\n[cg_LJ_parameters]\nTRP PHO 1.750 0.560\n",
+        "[cg_ISOLF_parameters]\nTRP 2.345 0.540 1.250\nLEU 1.900 0.500 1.050\n\
+         [cg_LJ_parameters]\nTRP PHO 1.750 0.560\nARG PHO 2.000 0.550\n",
     )
     .unwrap();
     let upd = isolf_bin()
@@ -643,6 +646,8 @@ fn umbrella_setup_cv_params_peptide_and_membrane_lipid_protein() {
     let lp_itp = fs::read_to_string(win_dir.join("lipid_protein.itp")).unwrap();
     assert!(lp_itp.contains("   TRP    2.345    0.540    1.250"));
     assert!(lp_itp.contains("   TRP   PHO    1.750    0.560    1.400"));
+    assert!(!lp_itp.contains("   LEU "));
+    assert!(!lp_itp.contains("   ARG "));
     assert!(!lp_itp.contains("   TRP   PHO    1.5"));
 
     // 4. Mock GENESIS logs -> manifest-free `isolf umbrella cv`.
@@ -706,6 +711,7 @@ fn umbrella_setup_cv_params_peptide_and_membrane_lipid_protein() {
             "steps=1000,eneout=100,crdout=1000,rstout=1000",
             "--seed",
             "12",
+            "--vmd",
             "--no-color",
             "--ascii",
             "-o",
@@ -721,6 +727,9 @@ fn umbrella_setup_cv_params_peptide_and_membrane_lipid_protein() {
     let eq_reus = fs::read_to_string(pep_dir.join("equil_reus.inp")).unwrap();
     assert!(eq_reus.contains("group1                = ano:1-20"));
     assert!(eq_reus.contains("group2                = rnam:POPC"));
+    let reus_vmd = fs::read_to_string(pep_dir.join("system.vmd")).unwrap();
+    assert!(reus_vmd.contains("mol addfile ./win_1.gro"));
+    assert!(!reus_vmd.contains("mol addfile ./system.gro"));
     let pep_lp = fs::read_to_string(pep_dir.join("lipid_protein.itp")).unwrap();
     assert!(pep_lp.contains("   TRP "));
     assert!(pep_lp.contains("   LEU "));

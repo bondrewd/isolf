@@ -17,7 +17,7 @@ use isolf::vmd::Layout;
 use crate::report;
 
 use super::args::{ProteinArgs, ProteinCenterArg};
-use super::build::{ele_cutoff_note, write_control_files, write_vmd_scripts};
+use super::build::{VmdWriteParams, ele_cutoff_note, write_control_files, write_vmd_scripts};
 use super::parse::validate_padding;
 use super::{reproduce_command, write};
 
@@ -156,19 +156,19 @@ pub(crate) fn run_protein(args: ProteinArgs) -> Result<(), Box<dyn Error>> {
     if want_vmd {
         let ff = ForceField::isolf();
         let particles = protein.to_particles(1, 1);
-        write_vmd_scripts(
-            &args.out,
-            &base,
-            Layout::Protein,
-            false,
+        write_vmd_scripts(&VmdWriteParams {
+            out: &args.out,
+            base: &base,
+            layout: Layout::Protein,
+            is_npt: false,
             want_inp,
-            matches!(args.center, ProteinCenterArg::Origin),
-            &particles,
-            &ff,
-            &args.vmd_opts,
-            None,
-            &controls,
-        )?;
+            recenter_to_box: matches!(args.center, ProteinCenterArg::Origin),
+            particles: &particles,
+            force_field: &ff,
+            vmd: &args.vmd_opts,
+            color_by: None,
+            controls: &controls,
+        })?;
     }
 
     let log_path = named("log");

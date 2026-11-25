@@ -213,16 +213,18 @@ pub(crate) fn run_membrane(args: MembraneArgs) -> Result<(), Box<dyn Error>> {
     let gif_bounds = [0.0, 0.0, system.box_size[0], system.box_size[1]];
     finish_build(
         system,
-        gif_frames,
-        gif_bounds,
-        &force_field,
-        lp_params.as_ref(),
-        &args.common,
-        Geometry::Membrane,
-        args.center,
-        &controls,
-        &notes,
-        seed,
+        &BuildContext {
+            gif_frames: &gif_frames,
+            gif_bounds,
+            force_field: &force_field,
+            lp_base: lp_params.as_ref(),
+            common: &args.common,
+            geometry: Geometry::Membrane,
+            center: args.center,
+            controls: &controls,
+            notes: &notes,
+            seed,
+        },
         &mut rng,
     )
 }
@@ -298,16 +300,18 @@ pub(crate) fn run_vesicle(args: VesicleArgs) -> Result<(), Box<dyn Error>> {
     notes.extend(system.warnings.iter().cloned());
     finish_build(
         system,
-        gif_frames,
-        [-2.0, -2.0, 2.0, 2.0],
-        &force_field,
-        lp_params.as_ref(),
-        &args.common,
-        Geometry::Vesicle,
-        args.center,
-        &controls,
-        &notes,
-        seed,
+        &BuildContext {
+            gif_frames: &gif_frames,
+            gif_bounds: [-2.0, -2.0, 2.0, 2.0],
+            force_field: &force_field,
+            lp_base: lp_params.as_ref(),
+            common: &args.common,
+            geometry: Geometry::Vesicle,
+            center: args.center,
+            controls: &controls,
+            notes: &notes,
+            seed,
+        },
         &mut rng,
     )
 }
@@ -399,36 +403,41 @@ pub(crate) fn run_tubule(args: TubuleArgs) -> Result<(), Box<dyn Error>> {
     let gif_bounds = [0.0, 0.0, TAU * outer_radius, system.box_size[2]];
     finish_build(
         system,
-        gif_frames,
-        gif_bounds,
-        &force_field,
-        lp_params.as_ref(),
-        &args.common,
-        Geometry::Tubule,
-        args.center,
-        &controls,
-        &notes,
-        seed,
+        &BuildContext {
+            gif_frames: &gif_frames,
+            gif_bounds,
+            force_field: &force_field,
+            lp_base: lp_params.as_ref(),
+            common: &args.common,
+            geometry: Geometry::Tubule,
+            center: args.center,
+            controls: &controls,
+            notes: &notes,
+            seed,
+        },
         &mut rng,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn finish_build(
-    mut system: EmbeddedSystem,
-    gif_frames: Vec<RelaxFrame>,
+struct BuildContext<'a> {
+    gif_frames: &'a [RelaxFrame],
     gif_bounds: [f64; 4],
-    force_field: &ForceField,
-    lp_base: Option<&LipidProteinParams>,
-    common: &CommonBuildArgs,
+    force_field: &'a ForceField,
+    lp_base: Option<&'a LipidProteinParams>,
+    common: &'a CommonBuildArgs,
     geometry: Geometry,
     center: CenterArg,
-    controls: &ControlSpecs,
-    notes: &[String],
+    controls: &'a ControlSpecs,
+    notes: &'a [String],
     seed: u64,
+}
+
+fn finish_build(
+    mut system: EmbeddedSystem,
+    ctx: &BuildContext<'_>,
     rng: &mut StdRng,
 ) -> Result<(), Box<dyn Error>> {
-    let identity = geometry.label();
+    let identity = ctx.geometry.label();
     let total_removed = system.carved_lipids + system.pruned_lipids;
     let detail = if system.has_proteins() {
         let prot_word = if system.total_proteins() == 1 {
@@ -458,38 +467,27 @@ fn finish_build(
         )
     };
     report::ok(identity, &detail);
-    for note in notes {
+    for note in ctx.notes {
         report::warn(note);
     }
-    if lp_base.is_some() && !system.has_proteins() {
+    if ctx.lp_base.is_some() && !system.has_proteins() {
         report::warn("--lipid-protein has no effect without embedded proteins (-p)");
     }
-    if common.want_inp()
-        && let Some(note) = ele_cutoff_note(system.box_size, controls.ele_cutoff)
+    if ctx.common.want_inp()
+        && let Some(note) = ele_cutoff_note(system.box_size, ctx.controls.ele_cutoff)
     {
         report::warn(&note);
     }
 
-    let base = common
+    let base = ctx
+        .common
         .name
         .clone()
-        .unwrap_or_else(|| geometry.label().to_string());
+        .unwrap_or_else(|| ctx.geometry.label().to_string());
 
-    write_outputs(
-        &mut system,
-        force_field,
-        lp_base,
-        common,
-        geometry,
-        center,
-        controls,
-        &base,
-        &gif_frames,
-        gif_bounds,
-        rng,
-    )?;
+    write_outputs(&mut system, ctx, &base, rng)?;
 
-    let out_dir = common.out.display().to_string();
+    let out_dir = ctx.common.out.display().to_string();
     let box_size = system.box_size;
     let beads = system.particles.len();
 
@@ -497,11 +495,11 @@ fn finish_build(
         .iter()
         .filter_map(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
         .collect();
-    let command = reproduce_command(seed, common.general.seed.is_some());
-    let log_path = common.out.join(format!("{base}.log"));
+    let command = reproduce_command(ctx.seed, ctx.common.general.seed.is_some());
+    let log_path = ctx.common.out.join(format!("{base}.log"));
     runlog::Run {
         command: &command,
-        seed,
+        seed: ctx.seed,
         duration_secs: report::elapsed_secs(),
         identity,
         box_nm: box_size,
@@ -513,8 +511,8 @@ fn finish_build(
     report::record(&log_path);
 
     report::write_section(&out_dir);
-    let next = common.want_inp().then(|| {
-        let equil = if geometry.is_npt() {
+    let next = ctx.common.want_inp().then(|| {
+        let equil = if ctx.geometry.is_npt() {
             "npt.inp"
         } else {
             "nvt.inp"
@@ -526,7 +524,7 @@ fn finish_build(
         };
         format!("run in GENESIS: {cd}atdyn min.inp (then {equil}, pro.inp)")
     });
-    let leaflets = leaflet_split(&system, geometry);
+    let leaflets = leaflet_split(&system, ctx.geometry);
     report::summary(&report::Summary {
         identity,
         box_nm: box_size,
@@ -686,26 +684,19 @@ fn leaflet_split(sys: &EmbeddedSystem, geometry: Geometry) -> Vec<report::Leafle
     ]
 }
 
-#[allow(clippy::too_many_arguments)]
 fn write_outputs(
     system: &mut EmbeddedSystem,
-    force_field: &ForceField,
-    lp_base: Option<&LipidProteinParams>,
-    common: &CommonBuildArgs,
-    geometry: Geometry,
-    center: CenterArg,
-    controls: &ControlSpecs,
+    ctx: &BuildContext<'_>,
     base: &str,
-    gif_frames: &[RelaxFrame],
-    gif_bounds: [f64; 4],
     rng: &mut StdRng,
 ) -> Result<(), Box<dyn Error>> {
+    let common = ctx.common;
     fs::create_dir_all(&common.out)?;
     let named = |extension: &str| common.out.join(format!("{base}.{extension}"));
 
     system.center_in_box();
     let box_size = system.box_size;
-    if matches!(center, CenterArg::Origin) {
+    if matches!(ctx.center, CenterArg::Origin) {
         system.translate([-box_size[0] / 2.0, -box_size[1] / 2.0, -box_size[2] / 2.0]);
     }
     let system: &EmbeddedSystem = system;
@@ -731,16 +722,16 @@ fn write_outputs(
         }
     }
 
-    let include_lp = lp_base.is_some() && system.has_proteins();
+    let include_lp = ctx.lp_base.is_some() && system.has_proteins();
     if common.top || want_inp || include_lp {
         write(&named("top"), &system.to_top_with_lipid_protein(include_lp))?;
-        write(&common.out.join("isolf.itp"), &force_field.to_itp())?;
+        write(&common.out.join("isolf.itp"), &ctx.force_field.to_itp())?;
         if system.has_proteins() {
             write(&common.out.join("aicg2p.itp"), &render_aicg2p_itp())?;
-            if let Some(lp) = lp_base {
+            if let Some(lp) = ctx.lp_base {
                 let refs: Vec<_> = system.protein_templates.iter().collect();
                 let resolved = LipidProteinParams::for_proteins(
-                    force_field,
+                    ctx.force_field,
                     &refs,
                     Some(lp),
                     ProbeParamOverrides {
@@ -762,7 +753,7 @@ fn write_outputs(
         }
     }
 
-    if want_gif && !gif_frames.is_empty() {
+    if want_gif && !ctx.gif_frames.is_empty() {
         let opts = anim::GifOptions {
             mode: match common.gif_mode.unwrap_or(GifModeArg::Point) {
                 GifModeArg::Point => anim::GifMode::Point,
@@ -772,7 +763,7 @@ fn write_outputs(
             fps: common.gif_fps.unwrap_or(14),
         };
         let path = named("gif");
-        anim::write_gif(&path, gif_frames, gif_bounds, &opts)?;
+        anim::write_gif(&path, ctx.gif_frames, ctx.gif_bounds, &opts)?;
         report::record(&path);
     }
 
@@ -780,26 +771,26 @@ fn write_outputs(
         write_control_files(
             &common.out,
             base,
-            geometry.is_npt(),
+            ctx.geometry.is_npt(),
             box_size,
-            controls,
+            ctx.controls,
             rng,
         )?;
     }
     if want_vmd {
-        write_vmd_scripts(
-            &common.out,
+        write_vmd_scripts(&VmdWriteParams {
+            out: &common.out,
             base,
-            geometry.layout(),
-            geometry.is_npt(),
+            layout: ctx.geometry.layout(),
+            is_npt: ctx.geometry.is_npt(),
             want_inp,
-            matches!(center, CenterArg::Origin),
-            &system.particles,
-            force_field,
-            &common.vmd_opts,
-            common.vmd_color_by,
-            controls,
-        )?;
+            recenter_to_box: matches!(ctx.center, CenterArg::Origin),
+            particles: &system.particles,
+            force_field: ctx.force_field,
+            vmd: &common.vmd_opts,
+            color_by: common.vmd_color_by,
+            controls: ctx.controls,
+        })?;
     }
     Ok(())
 }
@@ -860,61 +851,79 @@ pub(crate) fn write_control_files(
     Ok(())
 }
 
+/// Inputs for [`write_vmd_scripts`].
+pub(crate) struct VmdWriteParams<'a> {
+    pub(crate) out: &'a Path,
+    pub(crate) base: &'a str,
+    pub(crate) layout: Layout,
+    pub(crate) is_npt: bool,
+    pub(crate) want_inp: bool,
+    pub(crate) recenter_to_box: bool,
+    pub(crate) particles: &'a [Particle],
+    pub(crate) force_field: &'a ForceField,
+    pub(crate) vmd: &'a VmdArgs,
+    pub(crate) color_by: Option<LipidColorScope>,
+    pub(crate) controls: &'a ControlSpecs,
+}
+
 /// Write VMD visualization scripts for the built structure (and per MD stage
 /// when `want_inp` is enabled).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn write_vmd_scripts(
-    out: &Path,
-    base: &str,
-    layout: Layout,
-    is_npt: bool,
-    want_inp: bool,
-    recenter_to_box: bool,
-    particles: &[Particle],
-    force_field: &ForceField,
-    vmd: &VmdArgs,
-    color_by: Option<LipidColorScope>,
-    controls: &ControlSpecs,
-) -> Result<(), Box<dyn Error>> {
-    let background = vmd.vmd_background.as_deref().unwrap_or("white");
-    let material = vmd.vmd_material.as_deref().unwrap_or("AOChalky");
+pub(crate) fn write_vmd_scripts(p: &VmdWriteParams<'_>) -> Result<(), Box<dyn Error>> {
+    let background = p.vmd.vmd_background.as_deref().unwrap_or("white");
+    let material = p.vmd.vmd_material.as_deref().unwrap_or("AOChalky");
     let options = VmdOptions {
-        surface: vmd.vmd_surface,
-        cutaway: vmd.vmd_cutaway,
-        render: vmd.vmd_render,
+        surface: p.vmd.vmd_surface,
+        cutaway: p.vmd.vmd_cutaway,
+        render: p.vmd.vmd_render,
         background,
         material,
-        smooth: vmd.vmd_smooth.unwrap_or(5),
-        lipid_coloring: match color_by.unwrap_or(LipidColorScope::Head) {
+        smooth: p.vmd.vmd_smooth.unwrap_or(5),
+        lipid_coloring: match p.color_by.unwrap_or(LipidColorScope::Head) {
             LipidColorScope::Head => isolf::vmd::LipidColoring::Head,
             LipidColorScope::Bead => isolf::vmd::LipidColoring::Role,
             LipidColorScope::Whole => isolf::vmd::LipidColoring::Whole,
         },
-        recenter_to_box,
+        recenter_to_box: p.recenter_to_box,
     };
-    let script =
-        |source| isolf::vmd::vmd_script(force_field, particles, base, layout, source, &options);
+    let script = |source| {
+        isolf::vmd::vmd_script(
+            p.force_field,
+            p.particles,
+            p.base,
+            p.layout,
+            source,
+            &options,
+        )
+    };
 
     write(
-        &out.join(format!("{base}.vmd")),
+        &p.out.join(format!("{}.vmd", p.base)),
         &script(VmdSource::Structure),
     )?;
 
-    if want_inp {
-        let equil_name = if is_npt { "npt" } else { "nvt" };
+    if p.want_inp {
+        let equil_name = if p.is_npt { "npt" } else { "nvt" };
         let stages = [
-            ("min", controls.min.num_steps, controls.min.crdout_period),
+            (
+                "min",
+                p.controls.min.num_steps,
+                p.controls.min.crdout_period,
+            ),
             (
                 equil_name,
-                controls.equil.num_steps,
-                controls.equil.crdout_period,
+                p.controls.equil.num_steps,
+                p.controls.equil.crdout_period,
             ),
-            ("pro", controls.prod.num_steps, controls.prod.crdout_period),
+            (
+                "pro",
+                p.controls.prod.num_steps,
+                p.controls.prod.crdout_period,
+            ),
         ];
         for (name, num_steps, crdout_period) in stages {
             let frames = (crdout_period > 0).then(|| num_steps / crdout_period);
             write(
-                &out.join(format!("{name}.vmd")),
+                &p.out.join(format!("{name}.vmd")),
                 &script(VmdSource::Trajectory { name, frames }),
             )?;
         }

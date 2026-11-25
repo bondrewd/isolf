@@ -667,26 +667,34 @@ struct BeadTemplate<'a> {
 }
 
 /// Place `grid.count` lipids of `composition` in the `box_x` by `box_y` box
+/// Shared mutable particle/radius/range accumulators used while laying out
+/// leaflets or shells across `membrane`, `vesicle`, and `tubule`.
+#[derive(Default)]
+pub(crate) struct LipidBuffers {
+    pub(crate) molecule_id: usize,
+    pub(crate) atom_id: usize,
+    pub(crate) particles: Vec<Particle>,
+    pub(crate) radii: Vec<f64>,
+    pub(crate) ranges: Vec<std::ops::Range<usize>>,
+}
+
+/// Lay out one leaflet's lipids on `[0, box_x) × [0, box_y)`
 /// (uniformly or phase-separated per `options.phase`), append them to
-/// `particles` (along with their packing radii and molecule bead ranges), and
+/// `buf` (along with their packing radii and molecule bead ranges), and
 /// return the per-component molecule counts.
 #[allow(clippy::too_many_arguments)]
 fn place_leaflet(
     force_field: &ForceField,
     composition: &Composition,
-    box_x: f64,
-    box_y: f64,
+    box_xy: [f64; 2],
     grid: LeafletGrid,
     spacing: f64,
     leaflet: Leaflet,
     options: &BuildOptions,
     rng: &mut impl Rng,
-    molecule_id: &mut usize,
-    atom_id: &mut usize,
-    particles: &mut Vec<Particle>,
-    radii: &mut Vec<f64>,
-    ranges: &mut Vec<std::ops::Range<usize>>,
+    buf: &mut LipidBuffers,
 ) -> Result<Vec<usize>, BuildError> {
+    let [box_x, box_y] = box_xy;
     let counts = composition.partition(grid.count);
     if grid.count == 0 {
         return Ok(counts);
@@ -743,36 +751,36 @@ fn place_leaflet(
         ));
     }
 
-    particles.reserve(extra_beads);
-    radii.reserve(extra_beads);
-    ranges.reserve(grid.count);
+    buf.particles.reserve(extra_beads);
+    buf.radii.reserve(extra_beads);
+    buf.ranges.reserve(grid.count);
 
-    let start = particles.len();
+    let start = buf.particles.len();
     for (lipid_name, beads, count, domain) in &templates {
         for _ in 0..*count {
-            *molecule_id += 1;
-            let mol_start = particles.len();
+            buf.molecule_id += 1;
+            let mol_start = buf.particles.len();
             // Initial lateral placement (uniform or phase-separated); Lloyd's
             // relaxation equalises the density while preserving domain boundaries.
             let [x, y] = layout.sample(*domain, rng);
             for b in beads {
-                *atom_id += 1;
-                particles.push(Particle {
+                buf.atom_id += 1;
+                buf.particles.push(Particle {
                     residue: (*lipid_name).to_string(),
                     bead: b.name.to_string(),
-                    molecule_id: *molecule_id,
-                    atom_id: *atom_id,
+                    molecule_id: buf.molecule_id,
+                    atom_id: buf.atom_id,
                     position: [x, y, b.z],
                     charge: b.charge,
                     mass: b.mass,
                 });
-                radii.push(b.packing_radius);
+                buf.radii.push(b.packing_radius);
             }
-            ranges.push(mol_start..particles.len());
+            buf.ranges.push(mol_start..buf.particles.len());
         }
     }
 
-    center_leaflet(&mut particles[start..], spacing, leaflet);
+    center_leaflet(&mut buf.particles[start..], spacing, leaflet);
     Ok(counts)
 }
 
@@ -801,45 +809,30 @@ pub(crate) fn build_system(
         )?)
     };
 
-    let mut molecule_id = 0;
-    let mut atom_id = 0;
-    let mut particles = Vec::new();
-    let mut radii = Vec::new();
-    let mut ranges = Vec::new();
-
+    let mut buf = LipidBuffers::default();
     let upper_counts = place_leaflet(
         force_field,
         upper,
-        plan.box_x,
-        plan.box_y,
+        [plan.box_x, plan.box_y],
         plan.upper,
         upper_spacing,
         Leaflet::Upper,
         options,
         rng,
-        &mut molecule_id,
-        &mut atom_id,
-        &mut particles,
-        &mut radii,
-        &mut ranges,
+        &mut buf,
     )?;
     // The lipids placed so far form the upper leaflet (the lower follows).
-    let mut upper_lipids = molecule_id;
+    let mut upper_lipids = buf.molecule_id;
     let lower_counts = place_leaflet(
         force_field,
         lower,
-        plan.box_x,
-        plan.box_y,
+        [plan.box_x, plan.box_y],
         plan.lower,
         lower_spacing,
         Leaflet::Lower,
         options,
         rng,
-        &mut molecule_id,
-        &mut atom_id,
-        &mut particles,
-        &mut radii,
-        &mut ranges,
+        &mut buf,
     )?;
 
     let (bx, by) = (plan.box_x, plan.box_y);
@@ -849,9 +842,9 @@ pub(crate) fn build_system(
     };
     let carved = match &placed {
         Some(p) => crate::embed::carve_lipids(
-            &mut particles,
-            &mut radii,
-            &mut ranges,
+            &mut buf.particles,
+            &mut buf.radii,
+            &mut buf.ranges,
             &mut upper_lipids,
             &p.obstacles,
             0.0,
@@ -863,22 +856,13 @@ pub(crate) fn build_system(
     // Relax the random placement to a uniform, clash-free start: an independent
     // centroidal-Voronoi (Lloyd) pass per leaflet, then a shared de-clash.
     let obstacles: &[pack::Obstacle] = placed.as_ref().map_or(&[], |p| &p.obstacles);
-    relax_membrane(
-        &mut particles,
-        &radii,
-        &ranges,
-        upper_lipids,
-        obstacles,
-        bx,
-        by,
-        frames,
-    );
+    relax_membrane(&mut buf, upper_lipids, obstacles, [bx, by], frames);
 
     let pruned = match &placed {
         Some(p) => crate::embed::prune_clashing_lipids(
-            &mut particles,
-            &mut radii,
-            &mut ranges,
+            &mut buf.particles,
+            &mut buf.radii,
+            &mut buf.ranges,
             &mut upper_lipids,
             &p.raw_obstacles,
             metric,
@@ -887,7 +871,7 @@ pub(crate) fn build_system(
     };
 
     // Centre the bilayer on the origin in x/y (z is already on the midplane).
-    for particle in &mut particles {
+    for particle in &mut buf.particles {
         particle.position[0] -= bx / 2.0;
         particle.position[1] -= by / 2.0;
     }
@@ -896,13 +880,13 @@ pub(crate) fn build_system(
     }
 
     let lipid_counts = if carved + pruned > 0 {
-        crate::embed::count_remaining_lipids(&particles, upper, lower)
+        crate::embed::count_remaining_lipids(&buf.particles, upper, lower)
     } else {
         aggregate_counts(upper, &upper_counts, lower, &lower_counts)
     };
     // Reorder into one canonical layout (grouped by species) shared by every
     // output file, so any coordinate file matches any topology file.
-    let particles = canonicalize(particles, &lipid_counts);
+    let particles = canonicalize(buf.particles, &lipid_counts);
 
     let Some(placed) = placed else {
         let box_size = periodic_box(&particles, bx, by, options.padding);
@@ -944,17 +928,17 @@ pub(crate) fn build_system(
 
 /// Relax the randomly-placed leaflets to a uniform, clash-free configuration: an
 /// independent centroidal-Voronoi (Lloyd) pass per leaflet plus a shared de-clash.
-#[allow(clippy::too_many_arguments)]
 fn relax_membrane(
-    particles: &mut [Particle],
-    radii: &[f64],
-    ranges: &[std::ops::Range<usize>],
+    buf: &mut LipidBuffers,
     upper_lipids: usize,
     obstacles: &[pack::Obstacle],
-    box_x: f64,
-    box_y: f64,
+    box_xy: [f64; 2],
     frames: Option<&mut Vec<RelaxFrame>>,
 ) {
+    let [box_x, box_y] = box_xy;
+    let particles = &mut buf.particles;
+    let radii = &buf.radii;
+    let ranges = &buf.ranges;
     if ranges.len() < 2 {
         return;
     }

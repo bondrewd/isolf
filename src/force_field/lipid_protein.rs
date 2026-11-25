@@ -248,6 +248,21 @@ impl LipidProteinParams {
 
         let mut out = base.cloned().unwrap_or_default();
 
+        // Filter inherited entries from a master parameter file down to the
+        // amino-acid types actually present in this system so unused residues
+        // (e.g. an `ARG PHO` LJ pair in a `TRP`-only run) do not leak into
+        // `lipid_protein.itp` or activate unused nonbonded kernels in GENESIS.
+        if !unique_aas.is_empty() {
+            let active = |name: &str| unique_aas.contains(&name);
+            let active_pair = |a: &str, b: &str| {
+                (active(a) && (active(b) || force_field.bead_type(b).is_some()))
+                    || (active(b) && force_field.bead_type(a).is_some())
+            };
+            out.isolf.retain(|e| active(&e.name));
+            out.wca.retain(|p| active_pair(&p.first, &p.second));
+            out.lj.retain(|p| active_pair(&p.first, &p.second));
+        }
+
         // Ensure every requested amino acid has an entry in `[ cg_ISOLF_parameters ]`
         // (unless the user explicitly omitted it while supplying WCA/LJ pairs for it).
         for &aa in &unique_aas {
@@ -527,5 +542,36 @@ TRP PHO 1.900 0.560
         assert_eq!(resolved.isolf[1].name, "ARG");
         // 7 non-iSoLF head beads × 2 amino acids = 14 WCA pairs.
         assert_eq!(resolved.wca.len(), 14);
+    }
+
+    #[test]
+    fn filters_master_table_to_active_probe_residues_only() {
+        let ff = ForceField::isolf();
+        let master = LipidProteinParams::parse(
+            "\
+[cg_ISOLF_parameters]
+TRP 2.100 0.540 1.150
+LEU 1.900 0.500 1.050
+[cg_LJ_parameters]
+ARG PHO 2.000 0.550
+TRP PHO 1.800 0.560
+",
+        )
+        .unwrap();
+        let trp_only = LipidProteinParams::resolve(
+            &ff,
+            &["TRP"],
+            Some(&master),
+            ProbeParamOverrides {
+                auto_head_wca: true,
+                ..ProbeParamOverrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(trp_only.isolf.len(), 1);
+        assert_eq!(trp_only.isolf[0].name, "TRP");
+        assert_eq!(trp_only.lj.len(), 1);
+        assert_eq!(trp_only.lj[0].first, "TRP");
+        assert!(trp_only.wca.iter().all(|p| p.first == "TRP"));
     }
 }

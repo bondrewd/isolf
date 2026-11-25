@@ -180,11 +180,27 @@ pub fn parse_bilayer(content: &str, force_field: &ForceField) -> Result<Membrane
     }
     let box_size = [box_vals[0], box_vals[1], box_vals[2]];
 
-    // Preserve contiguous molecule runs in exact coordinate order so `[ molecules ]`
-    // in the generated topology matches interleaved `.gro` bilayers atom-for-atom.
+    // Validate each molecule's exact bead sequence against the force field and
+    // preserve contiguous molecule runs in exact coordinate order so
+    // `[ molecules ]` matches interleaved `.gro` bilayers atom-for-atom.
     let mut lipid_counts: Vec<(String, usize)> = Vec::new();
     for mol in particles.chunk_by(|a, b| a.molecule_id == b.molecule_id) {
         let res = &mol[0].residue;
+        let spec = force_field.lipid(res).ok_or_else(|| {
+            BuildError::StructureParse(format!(
+                ".gro molecule {}: unknown iSoLF lipid residue '{res}'",
+                mol[0].molecule_id
+            ))
+        })?;
+        if mol.len() != spec.beads.len() || mol.iter().zip(&spec.beads).any(|(p, b)| p.bead != *b) {
+            let got: Vec<&str> = mol.iter().map(|p| p.bead.as_str()).collect();
+            return Err(BuildError::StructureParse(format!(
+                ".gro molecule {} ({res}): bead sequence [{}] does not match iSoLF {res} [{}]",
+                mol[0].molecule_id,
+                got.join(", "),
+                spec.beads.join(", ")
+            )));
+        }
         if let Some((last_res, count)) = lipid_counts.last_mut()
             && last_res == res
         {
@@ -323,5 +339,9 @@ mod tests {
                 ("POPC".to_string(), 1),
             ]
         );
+
+        // Truncated or reordered lipid beads must be rejected so `.top` never mismatches.
+        let truncated = render(&parts[..5], "truncated", [8.0, 8.0, 20.0]);
+        assert!(parse_bilayer(&truncated, &ff).is_err());
     }
 }

@@ -188,11 +188,7 @@ fn place_cylinder_shell(
     shell: Shell,
     options: &BuildOptions,
     rng: &mut impl Rng,
-    molecule_id: &mut usize,
-    atom_id: &mut usize,
-    particles: &mut Vec<Particle>,
-    radii: &mut Vec<f64>,
-    ranges: &mut Vec<std::ops::Range<usize>>,
+    buf: &mut crate::membrane::LipidBuffers,
 ) -> Result<Vec<usize>, BuildError> {
     let counts = composition.partition(count);
     if count == 0 {
@@ -246,31 +242,31 @@ fn place_cylinder_shell(
         templates.push((lipid.name.as_str(), beads, n, composition.domain_of(idx)));
     }
 
-    particles.reserve(extra_beads);
-    radii.reserve(extra_beads);
-    ranges.reserve(count);
+    buf.particles.reserve(extra_beads);
+    buf.radii.reserve(extra_beads);
+    buf.ranges.reserve(count);
 
     let inv_r = 1.0 / radius;
     for (lipid_name, beads, n, domain) in &templates {
         for _ in 0..*n {
-            *molecule_id += 1;
-            let mol_start = particles.len();
+            buf.molecule_id += 1;
+            let mol_start = buf.particles.len();
             let [s, z] = layout.sample(*domain, rng);
             let (sin_t, cos_t) = (s * inv_r).sin_cos();
             for b in beads {
-                *atom_id += 1;
-                particles.push(Particle {
+                buf.atom_id += 1;
+                buf.particles.push(Particle {
                     residue: (*lipid_name).to_string(),
                     bead: b.name.to_string(),
-                    molecule_id: *molecule_id,
-                    atom_id: *atom_id,
+                    molecule_id: buf.molecule_id,
+                    atom_id: buf.atom_id,
                     position: [cos_t * b.radius, sin_t * b.radius, z],
                     charge: b.charge,
                     mass: b.mass,
                 });
-                radii.push(b.packing_radius);
+                buf.radii.push(b.packing_radius);
             }
-            ranges.push(mol_start..particles.len());
+            buf.ranges.push(mol_start..buf.particles.len());
         }
     }
 
@@ -352,12 +348,7 @@ pub(crate) fn build_system(
     let (inner_count, inner_cvt_radius) =
         cylinder_shell_plan(force_field, inner, inner_radius, length, Shell::Inner)?;
 
-    let mut molecule_id = 0;
-    let mut atom_id = 0;
-    let mut particles = Vec::new();
-    let mut radii = Vec::new();
-    let mut ranges = Vec::new();
-
+    let mut buf = crate::membrane::LipidBuffers::default();
     let outer_counts = place_cylinder_shell(
         force_field,
         outer,
@@ -367,13 +358,9 @@ pub(crate) fn build_system(
         Shell::Outer,
         options,
         rng,
-        &mut molecule_id,
-        &mut atom_id,
-        &mut particles,
-        &mut radii,
-        &mut ranges,
+        &mut buf,
     )?;
-    let mut outer_lipids = molecule_id;
+    let mut outer_lipids = buf.molecule_id;
     let inner_counts = place_cylinder_shell(
         force_field,
         inner,
@@ -383,19 +370,15 @@ pub(crate) fn build_system(
         Shell::Inner,
         options,
         rng,
-        &mut molecule_id,
-        &mut atom_id,
-        &mut particles,
-        &mut radii,
-        &mut ranges,
+        &mut buf,
     )?;
 
     let metric = crate::embed::CarveMetric::Cylinder { length };
     let carved = match &placed {
         Some(p) => crate::embed::carve_lipids(
-            &mut particles,
-            &mut radii,
-            &mut ranges,
+            &mut buf.particles,
+            &mut buf.radii,
+            &mut buf.ranges,
             &mut outer_lipids,
             &p.obstacles,
             0.0,
@@ -406,23 +389,19 @@ pub(crate) fn build_system(
 
     let obstacles: &[pack::Obstacle] = placed.as_ref().map_or(&[], |p| &p.obstacles);
     relax_tubule(
-        &mut particles,
-        &radii,
-        &ranges,
+        &mut buf,
         outer_lipids,
         obstacles,
-        outer_radius,
-        outer_cvt_radius,
-        inner_cvt_radius,
+        [outer_radius, outer_cvt_radius, inner_cvt_radius],
         length,
         frames,
     );
 
     let pruned = match &placed {
         Some(p) => crate::embed::prune_clashing_lipids(
-            &mut particles,
-            &mut radii,
-            &mut ranges,
+            &mut buf.particles,
+            &mut buf.radii,
+            &mut buf.ranges,
             &mut outer_lipids,
             &p.raw_obstacles,
             metric,
@@ -431,11 +410,11 @@ pub(crate) fn build_system(
     };
 
     let lipid_counts = if carved + pruned > 0 {
-        crate::embed::count_remaining_lipids(&particles, outer, inner)
+        crate::embed::count_remaining_lipids(&buf.particles, outer, inner)
     } else {
         aggregate_counts(outer, &outer_counts, inner, &inner_counts)
     };
-    let mut particles = canonicalize(particles, &lipid_counts);
+    let mut particles = canonicalize(buf.particles, &lipid_counts);
 
     let mut max_r = outer_radius;
     if let Some(p) = &placed {
@@ -471,19 +450,18 @@ pub(crate) fn build_system(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn relax_tubule(
-    particles: &mut [Particle],
-    radii: &[f64],
-    ranges: &[std::ops::Range<usize>],
+    buf: &mut crate::membrane::LipidBuffers,
     outer_lipids: usize,
     obstacles: &[pack::Obstacle],
-    outer_radius: f64,
-    outer_cvt_radius: f64,
-    inner_cvt_radius: f64,
+    radii_spec: [f64; 3],
     length: f64,
     frames: Option<&mut Vec<RelaxFrame>>,
 ) {
+    let [outer_radius, outer_cvt_radius, inner_cvt_radius] = radii_spec;
+    let particles = &mut buf.particles;
+    let radii = &buf.radii;
+    let ranges = &buf.ranges;
     if ranges.len() < 2 {
         return;
     }

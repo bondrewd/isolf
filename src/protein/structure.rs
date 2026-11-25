@@ -329,25 +329,61 @@ fn tokenize_cif_line(line: &str) -> Vec<&str> {
 /// Returns [`BuildError::StructureParse`] if required `_atom_site` columns are
 /// missing or malformed, or [`BuildError::EmptyProtein`] if no protein residues
 /// are present.
+struct AtomSiteCols {
+    group: Option<usize>,
+    atom: usize,
+    alt: Option<usize>,
+    comp: usize,
+    asym: Option<usize>,
+    seq: usize,
+    ins: Option<usize>,
+    x: usize,
+    y: usize,
+    z: usize,
+    model: Option<usize>,
+}
+
+impl AtomSiteCols {
+    fn from_headers(headers: &[String]) -> Result<Self, BuildError> {
+        let find = |k: &str| headers.iter().position(|h| h == k);
+        let req = |opt: Option<usize>, label: &str| {
+            opt.ok_or_else(|| {
+                BuildError::StructureParse(format!(
+                    "mmCIF _atom_site loop is missing required column {label}"
+                ))
+            })
+        };
+        Ok(Self {
+            group: find("_atom_site.group_PDB"),
+            atom: req(
+                find("_atom_site.label_atom_id").or_else(|| find("_atom_site.auth_atom_id")),
+                "label_atom_id/auth_atom_id",
+            )?,
+            alt: find("_atom_site.label_alt_id"),
+            comp: req(
+                find("_atom_site.label_comp_id").or_else(|| find("_atom_site.auth_comp_id")),
+                "label_comp_id/auth_comp_id",
+            )?,
+            asym: find("_atom_site.label_asym_id").or_else(|| find("_atom_site.auth_asym_id")),
+            seq: req(
+                find("_atom_site.label_seq_id").or_else(|| find("_atom_site.auth_seq_id")),
+                "label_seq_id/auth_seq_id",
+            )?,
+            ins: find("_atom_site.pdbx_PDB_ins_code"),
+            x: req(find("_atom_site.Cartn_x"), "Cartn_x")?,
+            y: req(find("_atom_site.Cartn_y"), "Cartn_y")?,
+            z: req(find("_atom_site.Cartn_z"), "Cartn_z")?,
+            model: find("_atom_site.pdbx_PDB_model_num"),
+        })
+    }
+}
+
 pub fn parse_cif(content: &str) -> Result<AllAtomStructure, BuildError> {
     let mut in_loop = false;
     let mut reading_headers = false;
     let mut headers: Vec<String> = Vec::new();
     let mut in_multiline = false;
-    let mut is_atom_site = false;
-
-    // Column indices resolved once headers of the `_atom_site` loop are complete.
-    let mut col_group: Option<usize> = None;
-    let mut col_atom: Option<usize> = None;
-    let mut col_alt: Option<usize> = None;
-    let mut col_comp: Option<usize> = None;
-    let mut col_asym: Option<usize> = None;
-    let mut col_seq: Option<usize> = None;
-    let mut col_ins: Option<usize> = None;
-    let mut col_x: Option<usize> = None;
-    let mut col_y: Option<usize> = None;
-    let mut col_z: Option<usize> = None;
-    let mut col_model: Option<usize> = None;
+    let mut cols: Option<AtomSiteCols> = None;
 
     let mut atoms = Vec::new();
     let mut residues = Vec::new();
@@ -362,22 +398,6 @@ pub fn parse_cif(content: &str) -> Result<AllAtomStructure, BuildError> {
     let mut cur_chain_res: Vec<usize> = Vec::new();
     let mut found_atom_site = false;
 
-    let resolve_cols = |hdrs: &[String]| {
-        let find = |k: &str| hdrs.iter().position(|h| h == k);
-        let group = find("_atom_site.group_PDB");
-        let atom = find("_atom_site.label_atom_id").or_else(|| find("_atom_site.auth_atom_id"));
-        let alt = find("_atom_site.label_alt_id");
-        let comp = find("_atom_site.label_comp_id").or_else(|| find("_atom_site.auth_comp_id"));
-        let asym = find("_atom_site.label_asym_id").or_else(|| find("_atom_site.auth_asym_id"));
-        let seq = find("_atom_site.label_seq_id").or_else(|| find("_atom_site.auth_seq_id"));
-        let ins = find("_atom_site.pdbx_PDB_ins_code");
-        let x = find("_atom_site.Cartn_x");
-        let y = find("_atom_site.Cartn_y");
-        let z = find("_atom_site.Cartn_z");
-        let model = find("_atom_site.pdbx_PDB_model_num");
-        (group, atom, alt, comp, asym, seq, ins, x, y, z, model)
-    };
-
     for (line_no, line) in content.lines().enumerate() {
         if line.starts_with(';') {
             in_multiline = !in_multiline;
@@ -388,8 +408,8 @@ pub fn parse_cif(content: &str) -> Result<AllAtomStructure, BuildError> {
         }
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
-            if is_atom_site && !reading_headers {
-                is_atom_site = false;
+            if cols.is_some() && !reading_headers {
+                cols = None;
                 in_loop = false;
             }
             continue;
@@ -397,14 +417,14 @@ pub fn parse_cif(content: &str) -> Result<AllAtomStructure, BuildError> {
         if trimmed == "loop_" {
             in_loop = true;
             reading_headers = true;
-            is_atom_site = false;
+            cols = None;
             headers.clear();
             continue;
         }
         if trimmed.starts_with("data_") || trimmed.starts_with("save_") || trimmed == "stop_" {
             in_loop = false;
             reading_headers = false;
-            is_atom_site = false;
+            cols = None;
             continue;
         }
 
@@ -414,32 +434,17 @@ pub fn parse_cif(content: &str) -> Result<AllAtomStructure, BuildError> {
                 continue;
             }
             reading_headers = false;
-            is_atom_site = headers.iter().any(|h| h.starts_with("_atom_site."));
-            if is_atom_site {
+            if headers.iter().any(|h| h.starts_with("_atom_site.")) {
                 found_atom_site = true;
-                (
-                    col_group, col_atom, col_alt, col_comp, col_asym, col_seq, col_ins, col_x,
-                    col_y, col_z, col_model,
-                ) = resolve_cols(&headers);
-                if col_atom.is_none()
-                    || col_comp.is_none()
-                    || col_seq.is_none()
-                    || col_x.is_none()
-                    || col_y.is_none()
-                    || col_z.is_none()
-                {
-                    return Err(BuildError::StructureParse(
-                        "mmCIF _atom_site loop is missing required columns".to_string(),
-                    ));
-                }
+                cols = Some(AtomSiteCols::from_headers(&headers)?);
             }
         }
 
-        if !is_atom_site {
+        let Some(c) = cols.as_ref() else {
             continue;
-        }
+        };
         if trimmed.starts_with('_') {
-            is_atom_site = false;
+            cols = None;
             in_loop = false;
             continue;
         }
@@ -448,12 +453,12 @@ pub fn parse_cif(content: &str) -> Result<AllAtomStructure, BuildError> {
         if tokens.len() < headers.len() {
             continue;
         }
-        if let Some(g) = col_group
+        if let Some(g) = c.group
             && tokens[g] != "ATOM"
         {
             continue;
         }
-        if let Some(m) = col_model {
+        if let Some(m) = c.model {
             let mv = tokens[m];
             match &first_model {
                 None => first_model = Some(mv.to_string()),
@@ -461,22 +466,22 @@ pub fn parse_cif(content: &str) -> Result<AllAtomStructure, BuildError> {
                 _ => {}
             }
         }
-        if let Some(a) = col_alt {
+        if let Some(a) = c.alt {
             let av = tokens[a];
             if !matches!(av, "." | "?" | "A" | "1") {
                 continue;
             }
         }
 
-        let atom_name = tokens[col_atom.unwrap()];
-        let res_name = tokens[col_comp.unwrap()];
-        let asym = col_asym.map_or("A", |i| tokens[i]);
-        let seq_str = tokens[col_seq.unwrap()];
+        let atom_name = tokens[c.atom];
+        let res_name = tokens[c.comp];
+        let asym = c.asym.map_or("A", |i| tokens[i]);
+        let seq_str = tokens[c.seq];
         let seq_id: i32 = match seq_str.parse() {
             Ok(v) => v,
             Err(_) => continue, // skip `.` or `?` non-polymer records
         };
-        let ins = col_ins.map_or(".", |i| tokens[i]);
+        let ins = c.ins.map_or(".", |i| tokens[i]);
 
         let parse_f = |idx: usize, axis: &str| -> Result<f64, BuildError> {
             let tok = tokens[idx];
@@ -490,9 +495,9 @@ pub fn parse_cif(content: &str) -> Result<AllAtomStructure, BuildError> {
                     ))
                 })
         };
-        let x = parse_f(col_x.unwrap(), "x")?;
-        let y = parse_f(col_y.unwrap(), "y")?;
-        let z = parse_f(col_z.unwrap(), "z")?;
+        let x = parse_f(c.x, "x")?;
+        let y = parse_f(c.y, "y")?;
+        let z = parse_f(c.z, "z")?;
 
         let chain_break = cur_asym.as_deref().is_some_and(|prev| prev != asym)
             || cur_seq.is_some_and(|prev| seq_id > prev + 1);

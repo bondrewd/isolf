@@ -1475,7 +1475,6 @@ pub(crate) fn count_remaining_lipids(
 
 /// Combine placed proteins and canonicalized lipids into a single
 /// [`EmbeddedSystem`] with continuous 1-based residue/molecule and atom IDs.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_system(
     name: &str,
     placed: PlacedProteins,

@@ -156,11 +156,7 @@ fn place_shell(
     shell: Shell,
     options: &BuildOptions,
     rng: &mut impl Rng,
-    molecule_id: &mut usize,
-    atom_id: &mut usize,
-    particles: &mut Vec<Particle>,
-    radii: &mut Vec<f64>,
-    ranges: &mut Vec<std::ops::Range<usize>>,
+    buf: &mut crate::membrane::LipidBuffers,
 ) -> Result<Vec<usize>, BuildError> {
     let counts = composition.partition(count);
     if count == 0 {
@@ -207,26 +203,26 @@ fn place_shell(
         templates.push((lipid.name.as_str(), beads, n, composition.domain_of(idx)));
     }
 
-    particles.reserve(extra_beads);
-    radii.reserve(extra_beads);
-    ranges.reserve(count);
+    buf.particles.reserve(extra_beads);
+    buf.radii.reserve(extra_beads);
+    buf.ranges.reserve(count);
 
     for (lipid_name, beads, n, domain) in &templates {
         let (z_lo, z_hi) = z_ranges.get(*domain).copied().unwrap_or((-1.0, 1.0));
         for _ in 0..*n {
-            *molecule_id += 1;
-            let mol_start = particles.len();
+            buf.molecule_id += 1;
+            let mol_start = buf.particles.len();
             let mut direction = random_sphere_direction_in_band(rng, z_lo, z_hi);
             if flip_z {
                 direction[2] = -direction[2];
             }
             for b in beads {
-                *atom_id += 1;
-                particles.push(Particle {
+                buf.atom_id += 1;
+                buf.particles.push(Particle {
                     residue: (*lipid_name).to_string(),
                     bead: b.name.to_string(),
-                    molecule_id: *molecule_id,
-                    atom_id: *atom_id,
+                    molecule_id: buf.molecule_id,
+                    atom_id: buf.atom_id,
                     position: [
                         direction[0] * b.radius,
                         direction[1] * b.radius,
@@ -235,9 +231,9 @@ fn place_shell(
                     charge: b.charge,
                     mass: b.mass,
                 });
-                radii.push(b.packing_radius);
+                buf.radii.push(b.packing_radius);
             }
-            ranges.push(mol_start..particles.len());
+            buf.ranges.push(mol_start..buf.particles.len());
         }
     }
 
@@ -345,12 +341,7 @@ pub(crate) fn build_system(
     let outer_count = shell_count(outer_radius, outer_spacing);
     let inner_count = shell_count(inner_radius, inner_spacing);
 
-    let mut molecule_id = 0;
-    let mut atom_id = 0;
-    let mut particles = Vec::new();
-    let mut radii = Vec::new();
-    let mut ranges = Vec::new();
-
+    let mut buf = crate::membrane::LipidBuffers::default();
     let outer_counts = place_shell(
         force_field,
         outer,
@@ -359,14 +350,10 @@ pub(crate) fn build_system(
         Shell::Outer,
         options,
         rng,
-        &mut molecule_id,
-        &mut atom_id,
-        &mut particles,
-        &mut radii,
-        &mut ranges,
+        &mut buf,
     )?;
     // The lipids placed so far form the outer shell (the inner follows).
-    let mut outer_lipids = molecule_id;
+    let mut outer_lipids = buf.molecule_id;
     let inner_counts = place_shell(
         force_field,
         inner,
@@ -375,18 +362,14 @@ pub(crate) fn build_system(
         Shell::Inner,
         options,
         rng,
-        &mut molecule_id,
-        &mut atom_id,
-        &mut particles,
-        &mut radii,
-        &mut ranges,
+        &mut buf,
     )?;
 
     let carved = match &placed {
         Some(p) => crate::embed::carve_lipids(
-            &mut particles,
-            &mut radii,
-            &mut ranges,
+            &mut buf.particles,
+            &mut buf.radii,
+            &mut buf.ranges,
             &mut outer_lipids,
             &p.obstacles,
             0.0,
@@ -399,21 +382,18 @@ pub(crate) fn build_system(
     // spherical centroidal-Voronoi (Lloyd) pass per shell, then a shared de-clash.
     let obstacles: &[pack::Obstacle] = placed.as_ref().map_or(&[], |p| &p.obstacles);
     relax_vesicle(
-        &mut particles,
-        &radii,
-        &ranges,
+        &mut buf,
         outer_lipids,
         obstacles,
-        outer_radius,
-        inner_radius,
+        [outer_radius, inner_radius],
         frames,
     );
 
     let pruned = match &placed {
         Some(p) => crate::embed::prune_clashing_lipids(
-            &mut particles,
-            &mut radii,
-            &mut ranges,
+            &mut buf.particles,
+            &mut buf.radii,
+            &mut buf.ranges,
             &mut outer_lipids,
             &p.raw_obstacles,
             crate::embed::CarveMetric::Sphere,
@@ -422,11 +402,11 @@ pub(crate) fn build_system(
     };
 
     let lipid_counts = if carved + pruned > 0 {
-        crate::embed::count_remaining_lipids(&particles, outer, inner)
+        crate::embed::count_remaining_lipids(&buf.particles, outer, inner)
     } else {
         aggregate_counts(outer, &outer_counts, inner, &inner_counts)
     };
-    let mut particles = canonicalize(particles, &lipid_counts);
+    let mut particles = canonicalize(buf.particles, &lipid_counts);
 
     let mut max_r = outer_radius;
     if let Some(p) = &placed {
@@ -467,17 +447,17 @@ pub(crate) fn build_system(
 /// Relax the randomly-placed shells to a uniform, clash-free configuration: an
 /// independent spherical centroidal-Voronoi (Lloyd) pass per shell plus a shared
 /// de-clash. Placement is about the origin, so the sphere centre is `[0, 0, 0]`.
-#[allow(clippy::too_many_arguments)]
 fn relax_vesicle(
-    particles: &mut [Particle],
-    radii: &[f64],
-    ranges: &[std::ops::Range<usize>],
+    buf: &mut crate::membrane::LipidBuffers,
     outer_lipids: usize,
     obstacles: &[pack::Obstacle],
-    outer_radius: f64,
-    inner_radius: f64,
+    shell_radii: [f64; 2],
     frames: Option<&mut Vec<RelaxFrame>>,
 ) {
+    let [outer_radius, inner_radius] = shell_radii;
+    let particles = &mut buf.particles;
+    let radii = &buf.radii;
+    let ranges = &buf.ranges;
     if ranges.len() < 2 {
         return;
     }

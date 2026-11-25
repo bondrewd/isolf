@@ -229,7 +229,32 @@ pub fn center_bilayer_at_origin(bilayer: &mut Membrane, min_box_z: f64) {
         }
     }
 
-    // 2. Shift exact unwrapped mass-weighted COM to (0, 0, 0).
+    // 2. Unwrap every lipid molecule's beads relative to its first bead in
+    //    (x, y, z) so molecules that straddled a periodic wall in a
+    //    pre-equilibrated `.gro` become whole before COM/de-clash calculations.
+    let [bx, by, bz] = bilayer.box_size;
+    for mol in bilayer
+        .particles
+        .chunk_by_mut(|a, b| a.molecule_id == b.molecule_id)
+    {
+        if mol.len() <= 1 {
+            continue;
+        }
+        let anchor = mol[0].position;
+        for p in &mut mol[1..] {
+            if bx > 0.0 {
+                p.position[0] = anchor[0] + pbc_delta(p.position[0] - anchor[0], bx);
+            }
+            if by > 0.0 {
+                p.position[1] = anchor[1] + pbc_delta(p.position[1] - anchor[1], by);
+            }
+            if bz > 0.0 {
+                p.position[2] = anchor[2] + pbc_delta(p.position[2] - anchor[2], bz);
+            }
+        }
+    }
+
+    // 3. Shift exact unwrapped mass-weighted COM to (0, 0, 0).
     let mut mass_sum = 0.0;
     let mut com = [0.0; 3];
     for p in &bilayer.particles {
@@ -473,6 +498,18 @@ fn declash_lipids_around_probe(
         .collect();
 
     let mut disp = vec![[0.0_f64; 2]; n_mols];
+    // 2D periodic cell grid for O(N) lipid–lipid neighbor repulsion.
+    const MIN_LIPID_SEP: f64 = 0.72;
+    let nx = ((bx / MIN_LIPID_SEP).floor() as usize).max(1);
+    let ny = ((by / MIN_LIPID_SEP).floor() as usize).max(1);
+    let inv_cx = nx as f64 / bx;
+    let inv_cy = ny as f64 / by;
+    let ncells = nx * ny;
+    let mut cell_of = vec![(0usize, 0usize); n_mols];
+    let mut cell_counts = vec![0u32; ncells];
+    let mut cell_offsets = vec![0u32; ncells + 1];
+    let mut cell_sorted = vec![0u32; n_mols];
+
     for _iter in 0..MAX_ITERS {
         disp.fill([0.0, 0.0]);
         let mut max_probe_overlap = 0.0_f64;
@@ -512,25 +549,71 @@ fn declash_lipids_around_probe(
             break;
         }
 
-        // 2. Soft lateral separation between same-leaflet lipid neighbors so
-        //    pushed lipids spread smoothly instead of piling up.
+        // 2. Soft lateral separation between same-leaflet lipid neighbors using
+        //    an O(N) periodic 2D cell list so pushed lipids spread smoothly.
+        cell_counts.fill(0);
+        for (i, &[x, y]) in mol_xy.iter().enumerate() {
+            let cx = ((x.rem_euclid(bx) * inv_cx) as usize).min(nx - 1);
+            let cy = ((y.rem_euclid(by) * inv_cy) as usize).min(ny - 1);
+            cell_of[i] = (cx, cy);
+            cell_counts[cy * nx + cx] += 1;
+        }
+        let mut acc = 0u32;
+        for c in 0..ncells {
+            cell_offsets[c] = acc;
+            acc += cell_counts[c];
+            cell_counts[c] = cell_offsets[c];
+        }
+        cell_offsets[ncells] = acc;
+        for (i, &(cx, cy)) in cell_of.iter().enumerate() {
+            let c = cy * nx + cx;
+            let slot = cell_counts[c] as usize;
+            cell_counts[c] += 1;
+            cell_sorted[slot] = i as u32;
+        }
+
+        let x_offsets: &[isize] = if nx >= 3 {
+            &[-1, 0, 1]
+        } else if nx == 2 {
+            &[0, 1]
+        } else {
+            &[0]
+        };
+        let y_offsets: &[isize] = if ny >= 3 {
+            &[-1, 0, 1]
+        } else if ny == 2 {
+            &[0, 1]
+        } else {
+            &[0]
+        };
         for i in 0..n_mols {
-            for j in (i + 1)..n_mols {
-                if (mol_z_mean[i] - mol_z_mean[j]).abs() > 1.5 {
-                    continue;
-                }
-                let dx = pbc_delta(mol_xy[i][0] - mol_xy[j][0], bx);
-                let dy = pbc_delta(mol_xy[i][1] - mol_xy[j][1], by);
-                let d_xy = dx.hypot(dy);
-                const MIN_LIPID_SEP: f64 = 0.72;
-                if d_xy < MIN_LIPID_SEP && d_xy > 1e-6 {
-                    let push = 0.25 * (MIN_LIPID_SEP - d_xy);
-                    let ux = dx / d_xy;
-                    let uy = dy / d_xy;
-                    disp[i][0] += push * ux;
-                    disp[i][1] += push * uy;
-                    disp[j][0] -= push * ux;
-                    disp[j][1] -= push * uy;
+            let (cx, cy) = cell_of[i];
+            for &dy_c in y_offsets {
+                let ny_c = (cy as isize + dy_c).rem_euclid(ny as isize) as usize;
+                let row = ny_c * nx;
+                for &dx_c in x_offsets {
+                    let nx_c = (cx as isize + dx_c).rem_euclid(nx as isize) as usize;
+                    let c = row + nx_c;
+                    let start = cell_offsets[c] as usize;
+                    let end = cell_offsets[c + 1] as usize;
+                    for &j_u32 in &cell_sorted[start..end] {
+                        let j = j_u32 as usize;
+                        if j <= i || (mol_z_mean[i] - mol_z_mean[j]).abs() > 1.5 {
+                            continue;
+                        }
+                        let dx = pbc_delta(mol_xy[i][0] - mol_xy[j][0], bx);
+                        let dy = pbc_delta(mol_xy[i][1] - mol_xy[j][1], by);
+                        let d_xy = dx.hypot(dy);
+                        if d_xy < MIN_LIPID_SEP && d_xy > 1e-6 {
+                            let push = 0.25 * (MIN_LIPID_SEP - d_xy);
+                            let ux = dx / d_xy;
+                            let uy = dy / d_xy;
+                            disp[i][0] += push * ux;
+                            disp[i][1] += push * uy;
+                            disp[j][0] -= push * ux;
+                            disp[j][1] -= push * uy;
+                        }
+                    }
                 }
             }
         }
@@ -919,9 +1002,14 @@ mod tests {
         )
         .unwrap();
         mem.box_size[2] = 20.0;
-        // Shift bilayer so it wraps across the z = 0 / z = 20 periodic boundary.
+        // Shift bilayer so it wraps across the z = 0 / z = 20 periodic boundary,
+        // and split molecule 1 across the x = 0 / Lx periodic wall.
+        let bx = mem.box_size[0];
         for p in &mut mem.particles {
             p.position[2] = (p.position[2] + 20.0) % 20.0;
+        }
+        for (k, p) in mem.particles.iter_mut().take(6).enumerate() {
+            p.position[0] = if k < 3 { 0.05 } else { bx - 0.05 };
         }
         center_bilayer_at_origin(&mut mem, 20.0);
         let z_min = mem
@@ -938,6 +1026,19 @@ mod tests {
         assert!(
             z_max - z_min < 6.0,
             "expected contiguous slab, got [{z_min}, {z_max}]"
+        );
+        // Molecule 1 must be unwrapped whole across x (span << bx/2).
+        let x_span = mem.particles[..6]
+            .iter()
+            .map(|p| p.position[0])
+            .fold(f64::NEG_INFINITY, f64::max)
+            - mem.particles[..6]
+                .iter()
+                .map(|p| p.position[0])
+                .fold(f64::INFINITY, f64::min);
+        assert!(
+            x_span < 0.5,
+            "expected unwrapped molecule in x, got span {x_span}"
         );
         let (msum, zsum) = mem.particles.iter().fold((0.0, 0.0), |(m, z), p| {
             (m + p.mass, z + p.mass * p.position[2])
@@ -989,6 +1090,23 @@ mod tests {
             (m + p.mass, z + p.mass * p.position[2])
         });
         assert!((lz / lm).abs() < 1e-10);
+        // Verify rigid-molecule lateral de-clash eliminated severe probe–lipid overlaps.
+        let [bx, by, _] = mem.box_size;
+        let mut min_clear = f64::INFINITY;
+        for (pi, pb) in sys.particles[..n_p].iter().enumerate() {
+            let pr = helix.beads[pi].radius;
+            for lp in &sys.particles[n_p..] {
+                let dx = pbc_delta(pb.position[0] - lp.position[0], bx);
+                let dy = pbc_delta(pb.position[1] - lp.position[1], by);
+                let dz = pb.position[2] - lp.position[2];
+                let lr = lipid_bead_radius(&lp.bead, &ff);
+                min_clear = min_clear.min((dx * dx + dy * dy + dz * dz).sqrt() - (pr + lr));
+            }
+        }
+        assert!(
+            min_clear > -0.05,
+            "expected no severe probe-lipid clash after declash, got min clearance {min_clear:.4} nm"
+        );
         let top = sys.to_top_with_lipid_protein(true);
         assert!(top.contains("#include \"./lipid_protein.itp\""));
         assert!(top.contains("#include \"./helix.itp\""));
