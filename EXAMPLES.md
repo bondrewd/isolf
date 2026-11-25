@@ -1,6 +1,6 @@
 # iSoLF examples
 
-Common builds and the flags behind them. Run `isolf membrane --help`, `isolf vesicle --help`, `isolf tubule --help`, or `isolf protein --help` for every option and default. Each command writes its files into `-o`/`--out`. Add `--top` for the topology, or `--inp` for a full GENESIS setup (which implies `--top`).
+Common builds and the flags behind them. Run `isolf <command> --help` (for `membrane`, `vesicle`, `tubule`, `protein`, `umbrella`, or `params`) for every option and default. Each command writes its files into `-o`/`--out`. Add `--top` for the topology, or `--inp` for a full GENESIS setup (which implies `--top`).
 
 - [Lipids and compositions](#lipids-and-compositions)
 - [Membranes](#membranes)
@@ -184,9 +184,9 @@ isolf umbrella cv --discard 50000 -o us_trp
 (cd us_trp && mbar_analysis mbar.inp)
 ```
 
-Pass `--lipid-protein FILE` on `membrane`, `vesicle`, or `tubule` with `-p` to attach the same `lipid_protein.itp` layer to regular membrane+protein simulations.
+Pass `--lipid-protein FILE` on `membrane`, `vesicle`, or `tubule` with `-p` to attach the same `lipid_protein.itp` layer to regular membrane+protein simulations. Single-bead probes also accept inline options such as `--probe TRP,charge=0` or `--probe HIS,charge=1.0,name=HIP`; `--probe` accepts orientation and CG model keys (`tilt`, `rot`, `charge`, `model`, `scale`, `safe-dihedral`, `idr`, `idr-local`, `idr-nonlocal`, `charges`, `contact-scale`, `name`).
 
-Example `--params` / `--lipid-protein` file:
+Example `--params` / `--lipid-protein` file (entries for residues absent from the target system are filtered out automatically):
 
 ```ini
 [cg_ISOLF_parameters]
@@ -236,6 +236,8 @@ isolf membrane --lipids "POPC=4,POPS=1" --count 256 \
 | `--equil` | `steps=20000`, `dt=0.01`, `temp=--temperature`, `eneout=100`, `crdout=100`, `rstout=1000`, `stoptr=10`, `nbupdate=10`, `seed=random` |
 | `--prod` | `steps=500000`, `dt=0.02`, `temp=--temperature`, `eneout=500`, `crdout=500`, `rstout=1000`, `stoptr=10`, `nbupdate=10`, `seed=random` |
 
+For small boxes (`< 12 nm` on any axis), GENESIS `RESIDCG`'s built-in 52 Å / 57 Å Debye–Hückel electrostatic cutoff exceeds half the box length. `isolf` automatically scales `cg_cutoffdist_ele` and `cg_pairlistdist_ele` to fit safely (and prints a note); pass `--ele-cutoff <ANGSTROM>` on any build or `umbrella setup` command to set an explicit value instead.
+
 Placement is random, then relaxed deterministically: pass `--seed` and the same command reproduces byte-identical coordinates. Without `--seed`, `isolf` picks a random one and records it in `<name>.log`.
 
 ## Viewing in VMD
@@ -284,7 +286,9 @@ Files go in `-o`/`--out`. The base name defaults to the subcommand (`membrane`, 
 | `<name>.log` | always | reproducible run log |
 | `<name>.top` | `--top` or `--inp` (always on `protein`) | system topology |
 | `isolf.itp` | `--top` or `--inp` (lipid systems) | iSoLF lipid force field |
-| `aicg2p.itp`, `<prot>.itp` | `--top`/`--inp` with `-p`, or `protein` | AICG2+ force field and per-protein topology |
+| `aicg2p.itp`, `<prot>.itp` | `--top`/`--inp` with `-p`, `protein`, or `umbrella setup` | AICG2+ force field and per-protein / probe topology |
+| `lipid_protein.itp` | `--lipid-protein`, `umbrella setup`, or `params` | tunable lipid–protein `[ cg_ISOLF_parameters ]`, head WCA, and optional LJ |
+| `mbar.inp`, `manifest.json`, `cv/{}.dat` | `umbrella setup` / `umbrella cv` | GENESIS `mbar_analysis` input, campaign metadata, and extracted CV series |
 | `<name>.pdb` | `--pdb` | coordinates in PDB format |
 | `<name>.psf` | `--psf` or `--vmd` | CHARMM structure file |
 | `<name>.crd`, `<name>.cif` | `--crd`, `--cif` | CHARMM / mmCIF coordinate formats |

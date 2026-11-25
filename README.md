@@ -78,7 +78,7 @@ Lipids are `NAME=WEIGHT` recipes like `"POPC=3,POPS=1"` (repeat or comma-separat
 
 While it runs, `isolf` prints each phase and a closing summary: the composition, the box, the particle count, the time, and the command to run next. Use `-q` for the summary alone, `-v` for full file paths, `--ascii` for plain glyphs.
 
-> 🧪 More recipes are in **[EXAMPLES.md](EXAMPLES.md)**: asymmetric leaflets, rectangular membranes, vesicles, tubules, phase-separated domains, standalone & embedded proteins, MD stage overrides, and output formats.
+> 🧪 More recipes are in **[EXAMPLES.md](EXAMPLES.md)**: asymmetric leaflets, rectangular membranes, vesicles, tubules, phase-separated domains, standalone & embedded proteins, umbrella sampling / REUS + MBAR, MD stage overrides, and output formats.
 
 ## 📦 Output
 
@@ -86,7 +86,7 @@ Everything lands in the `-o`/`--out` folder. The `.gro` structure and a `.log` r
 
 | Flag | Adds |
 | --- | --- |
-| `--top` | the topology (`.top`) and force-field includes (`isolf.itp`, plus `aicg2p.itp` and `<prot>.itp` when proteins are embedded) |
+| `--top` | the topology (`.top`) and force-field includes (`isolf.itp`, plus `aicg2p.itp`, `<prot>.itp`, and `lipid_protein.itp` when proteins / `--lipid-protein` are used) |
 | `--inp` | GENESIS control files for a 3-step run (implies `--top`; also enabled by `--min`/`--equil`/`--prod`) |
 | `--vmd` | a VMD script and `.psf` (also enabled by any `--vmd-*` flag) |
 | `--gif` | a GIF animating the leaflet relaxation (also enabled by any `--gif-*` flag) |

@@ -1,24 +1,31 @@
 //! Build coarse-grained starting structures for GENESIS molecular dynamics:
 //! iSoLF (Implicit Solvent Lipid Force Field) membranes, vesicles, and tubules,
-//! plus AICG2+ / Clementi Gō coarse-grained proteins (standalone or embedded).
+//! AICG2+ / Clementi Gō coarse-grained proteins (standalone or embedded), and
+//! 1D bilayer umbrella-sampling / REUS campaigns.
 //!
 //! Where to start, by area:
 //!
-//! - **Lipids.** [`force_field`] is the typed iSoLF force field; [`itp`] renders
-//!   it to a GENESIS/GROMACS `.itp`. [`membrane`] lays out a flat bilayer from
-//!   per-leaflet [`composition`]s, [`vesicle`] wraps one into a sphere, and
-//!   [`tubule`] wraps one into a periodic cylinder.
-//! - **Proteins.** [`protein`] reads all-atom PDB/mmCIF files and builds
-//!   AICG2+ or Clementi Gō coarse-grained topologies; [`embed`] embeds one or
-//!   more proteins into membranes, vesicles, or tubules with lipid carving and
-//!   obstacle-aware relaxation.
+//! - **Lipids & force fields.** [`force_field`] is the typed iSoLF force field,
+//!   including [`force_field::lipid_protein`] for tunable `lipid_protein.itp`
+//!   non-bonded tables; [`itp`] renders `isolf.itp`. [`membrane`] lays out a
+//!   flat bilayer from per-leaflet [`composition`]s, [`vesicle`] wraps one into
+//!   a sphere, and [`tubule`] wraps one into a periodic cylinder.
+//! - **Proteins.** [`protein`] reads all-atom PDB/mmCIF files (or builds
+//!   single-bead canonical amino acids) and constructs AICG2+ or Clementi Gō
+//!   coarse-grained topologies; [`embed`] embeds one or more proteins into
+//!   membranes, vesicles, or tubules with lipid carving and obstacle-aware
+//!   relaxation.
+//! - **Umbrella sampling.** [`umbrella`] places amino-acid or peptide/protein
+//!   probes across bilayer `z` windows without carving lipids, extracts
+//!   `RESTR_CVS` from GENESIS logs (with REUS `.rem` demuxing), and writes
+//!   campaign manifests for MBAR and parameter-optimization workflows.
 //! - **Packing.** [`pack`] is a Lloyd density-equalization / de-clash relaxation
 //!   engine for lipid coordinates (lateral for a bilayer, over a shell for a
 //!   vesicle or tubule), with pinned-site obstacle support.
 //! - **Output.** Coordinates and topology in `.gro` ([`gro`]), `.top` ([`top`]),
 //!   `.pdb` ([`pdb`]), `.psf` ([`psf`]), `.crd` ([`crd`]), and `.cif` ([`cif`]);
-//!   GENESIS run-control files ([`inp`]); VMD visualization scripts ([`vmd`]).
-//!   Typed errors live in [`error`].
+//!   GENESIS run-control and MBAR files ([`inp`]); VMD visualization scripts
+//!   ([`vmd`]). Typed errors live in [`error`].
 //!
 //! ```
 //! use isolf::composition::Composition;
