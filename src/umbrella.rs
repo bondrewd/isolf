@@ -29,11 +29,6 @@ use crate::force_field::{ForceField, POTENTIAL_MINIMUM_FACTOR};
 use crate::membrane::{Membrane, Particle, molecule_ranges};
 use crate::protein::Protein;
 
-pub use crate::force_field::lipid_protein::{
-    DEFAULT_PROBE_EPSILON, DEFAULT_PROBE_OMEGA, IsolfBeadParam, LipidProteinParams, LjPairParam,
-    ProbeParamOverrides, WcaPairParam,
-};
-
 /// Default harmonic umbrella force constant `k` in kcal·mol⁻¹·Å⁻²
 /// (`U = k * (dz - z0)^2`, matching GENESIS `atdyn` & `mbar_analysis`).
 pub const DEFAULT_UMBRELLA_K: f64 = 0.5;

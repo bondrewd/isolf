@@ -229,11 +229,25 @@ pub(crate) fn parse_usize(value: &str, what: &str) -> Result<usize, Box<dyn Erro
         .map_err(|_| format!("'{value}' is not a non-negative {what}").into())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpecTarget {
+    /// `-p` on membrane/vesicle/tubule: accepts all placement and CG model keys.
+    Embed,
+    /// `--probe` on `umbrella setup` / `params`: accepts orientation (`tilt`,
+    /// `rot`), `charge`, `name`, and CG model keys; rejects placement-only keys.
+    Probe,
+}
+
+fn looks_like_structure_path(tok: &str) -> bool {
+    Path::new(tok).exists() || tok.contains('/') || tok.contains('\\') || tok.contains('.')
+}
+
 /// Parse repeatable `-p, --protein <SPEC>[,KEY=VAL,...]` flags into [`ProteinSpec`]s.
 pub(crate) fn parse_protein_specs(specs: &[String]) -> Result<Vec<ProteinSpec>, Box<dyn Error>> {
     let mut out = Vec::with_capacity(specs.len());
     for raw in specs {
-        out.push(parse_single_protein_spec("--protein", raw, None)?);
+        let (ps, _) = parse_single_protein_spec(SpecTarget::Embed, raw, None)?;
+        out.push(ps);
     }
     Ok(out)
 }
@@ -242,8 +256,8 @@ pub(crate) fn parse_protein_specs(specs: &[String]) -> Result<Vec<ProteinSpec>, 
 /// - `all` or `aa:all` → all 20 canonical single-bead amino acids
 /// - Bare or `aa:`-prefixed comma-separated AA list (`TRP`, `TRP,ARG`, `aa:TRP,ARG`)
 ///   when no `KEY=VAL` options are present and the first token is not a file path
-/// - Single-bead AA with options (`aa:TRP,charge=0,name=TRP_NEUT`)
-/// - PDB/mmCIF peptide or protein with optional `-p`-style keys
+/// - Single-bead AA with options (`TRP,charge=0`, `aa:HIS,charge=1.0,name=HIP`)
+/// - PDB/mmCIF peptide or protein with optional orientation / CG model keys
 ///   (`walp23.pdb,tilt=90,rot=0,idr=1-3,charges=respac.dat`)
 pub(crate) fn parse_umbrella_probes(
     spec: &str,
@@ -270,15 +284,11 @@ pub(crate) fn parse_umbrella_probes(
     }
 
     // Check for a comma-separated list of bare amino acids (e.g. "TRP", "TRP,ARG",
-    // "aa:TRP,ARG") without KEY=VAL options and not referencing an existing file.
+    // "aa:TRP,ARG") without KEY=VAL options and not referencing a file path.
     let has_kv = trimmed.contains('=');
     let first_tok = trimmed.split(',').next().unwrap_or("").trim();
-    let looks_like_file = Path::new(first_tok).exists()
-        || first_tok.contains('/')
-        || first_tok.contains('\\')
-        || first_tok.contains('.');
 
-    if !has_kv && !looks_like_file {
+    if !has_kv && !looks_like_structure_path(first_tok) {
         let list_body = trimmed
             .strip_prefix("aa:")
             .or_else(|| trimmed.strip_prefix("AA:"))
@@ -306,9 +316,10 @@ pub(crate) fn parse_umbrella_probes(
         }
     }
 
-    // Otherwise parse as a single `-p`-style spec (`aa:TRP,charge=0` or `peptide.pdb,tilt=90,...`).
-    let is_aa_spec = first_tok.starts_with("aa:") || first_tok.starts_with("AA:");
-    let mut ps = parse_single_protein_spec("--probe", trimmed, charge_override)?;
+    // Otherwise parse as a single spec (`TRP,charge=0`, `aa:TRP,charge=0`, or
+    // `peptide.pdb,tilt=90,...`), rejecting placement-only keys that umbrella
+    // setup controls automatically.
+    let (mut ps, is_aa) = parse_single_protein_spec(SpecTarget::Probe, trimmed, charge_override)?;
 
     // Apply requested tilt (about x) and axial rotation (about z) around COM.
     let com = ps.protein.center_of_mass();
@@ -322,7 +333,7 @@ pub(crate) fn parse_umbrella_probes(
     }
 
     Ok(vec![UmbrellaProbe {
-        kind: if is_aa_spec {
+        kind: if is_aa {
             ProbeKind::AminoAcid
         } else {
             ProbeKind::Protein
@@ -332,10 +343,14 @@ pub(crate) fn parse_umbrella_probes(
 }
 
 fn parse_single_protein_spec(
-    flag: &str,
+    target: SpecTarget,
     raw: &str,
     default_charge: Option<f64>,
-) -> Result<ProteinSpec, Box<dyn Error>> {
+) -> Result<(ProteinSpec, bool), Box<dyn Error>> {
+    let flag = match target {
+        SpecTarget::Embed => "--protein",
+        SpecTarget::Probe => "--probe",
+    };
     let mut tokens = raw.split(',').map(str::trim).filter(|t| !t.is_empty());
     let path_str = tokens
         .next()
@@ -358,6 +373,27 @@ fn parse_single_protein_spec(
             .ok_or_else(|| format!("{flag}: expected KEY=VAL option, got '{tok}'"))?;
         let key = k.trim().to_ascii_lowercase();
         let val = v.trim();
+        if target == SpecTarget::Probe
+            && matches!(
+                key.as_str(),
+                "z" | "zoff"
+                    | "z_offset"
+                    | "dz"
+                    | "x"
+                    | "y"
+                    | "copies"
+                    | "n"
+                    | "clearance"
+                    | "margin"
+            )
+        {
+            return Err(format!(
+                "--probe: key '{key}' is not used by umbrella probes \
+                 (window z/x/y placement is automatic; valid keys: tilt, rot, charge, model, \
+                 scale, safe-dihedral, idr, idr-local, idr-nonlocal, charges, contact-scale, name)"
+            )
+            .into());
+        }
         match key.as_str() {
             "z" => {
                 if val.eq_ignore_ascii_case("center") || val.eq_ignore_ascii_case("mid") {
@@ -441,27 +477,41 @@ fn parse_single_protein_spec(
             }
             "name" => name_override = Some(val.to_string()),
             other => {
-                return Err(format!(
-                    "{flag}: unknown key '{other}' (use z, x, y, tilt, rot, copies, clearance, charge, model, scale, safe-dihedral, idr, idr-local, idr-nonlocal, charges, name)"
-                )
-                .into());
+                let valid = match target {
+                    SpecTarget::Embed => {
+                        "z, x, y, tilt, rot, copies, clearance, charge, model, scale, safe-dihedral, idr, idr-local, idr-nonlocal, charges, contact-scale, name"
+                    }
+                    SpecTarget::Probe => {
+                        "tilt, rot, charge, model, scale, safe-dihedral, idr, idr-local, idr-nonlocal, charges, contact-scale, name"
+                    }
+                };
+                return Err(format!("{flag}: unknown key '{other}' (use {valid})").into());
             }
         }
     }
 
-    let protein = if let Some(aa) = path_str
+    let explicit_aa = path_str
         .strip_prefix("aa:")
-        .or_else(|| path_str.strip_prefix("AA:"))
-    {
+        .or_else(|| path_str.strip_prefix("AA:"));
+    let bare_probe_aa = (target == SpecTarget::Probe
+        && explicit_aa.is_none()
+        && !looks_like_structure_path(path_str)
+        && isolf::protein::params::canonical_aa(path_str).is_some_and(|c| c != "UNK"))
+    .then_some(path_str);
+
+    let (protein, is_aa) = if let Some(aa) = explicit_aa.or(bare_probe_aa) {
         let mut p = Protein::single_bead(aa, single_charge)?;
         if let Some(n) = name_override {
             p.name = isolf::protein::sanitize_mol_name(&n);
         }
-        p
+        (p, true)
     } else {
-        Protein::from_file(Path::new(path_str), name_override.as_deref(), &options)?
+        (
+            Protein::from_file(Path::new(path_str), name_override.as_deref(), &options)?,
+            false,
+        )
     };
-    Ok(ProteinSpec { protein, placement })
+    Ok((ProteinSpec { protein, placement }, is_aa))
 }
 
 /// Walk non-empty comma-separated `KEY=VALUE` (or bare `VALUE`) tokens across
@@ -742,7 +792,19 @@ mod tests {
         assert_eq!(all.len(), 20);
 
         let custom = parse_umbrella_probes("aa:HIS,charge=1.0,name=HIP", None).unwrap();
+        assert_eq!(custom[0].kind, ProbeKind::AminoAcid);
         assert_eq!(custom[0].protein.name, "HIP");
         assert!((custom[0].protein.beads[0].charge - 1.0).abs() < 1e-12);
+
+        // Bare AA + KEY=VAL works without requiring the `aa:` prefix.
+        let bare_kv = parse_umbrella_probes("TRP,charge=0.0", None).unwrap();
+        assert_eq!(bare_kv[0].kind, ProbeKind::AminoAcid);
+        assert_eq!(bare_kv[0].protein.name, "TRP");
+        assert!((bare_kv[0].protein.beads[0].charge - 0.0).abs() < 1e-12);
+
+        // Placement-only keys are rejected instead of being silently ignored.
+        assert!(parse_umbrella_probes("TRP,z=1.5", None).is_err());
+        assert!(parse_umbrella_probes("peptide.pdb,copies=2", None).is_err());
+        assert!(parse_umbrella_probes("peptide.pdb,clearance=0.3", None).is_err());
     }
 }

@@ -104,7 +104,7 @@ atdyn npt.inp     # 2. equilibration  (nvt.inp for a vesicle, tubule, or protein
 atdyn pro.inp     # 3. production
 ```
 
-Run `isolf membrane --help`, `isolf vesicle --help`, `isolf tubule --help`, or `isolf protein --help` to see every option and its default.
+Run `isolf <command> --help` (for `membrane`, `vesicle`, `tubule`, `protein`, `umbrella`, or `params`) to see every option and its default.
 
 ## 🙏 Acknowledgements
 

@@ -80,41 +80,6 @@ pub fn build_tubule(
     .map(crate::embed::EmbeddedSystem::into_membrane)
 }
 
-/// Like [`build_tubule`], but also records every relaxation step (the per-shell
-/// cylindrical Lloyd rounds, then the de-clash) as a [`RelaxFrame`] projected
-/// onto the unrolled surface `[0, 2π·R_outer) × [0, length)` for `--gif`.
-///
-/// # Errors
-///
-/// The same as [`build_tubule`].
-#[allow(clippy::too_many_arguments)]
-pub fn build_tubule_recorded(
-    force_field: &ForceField,
-    name: &str,
-    outer: &Composition,
-    inner: &Composition,
-    radius: TubuleRadius,
-    length: f64,
-    options: &BuildOptions,
-    rng: &mut impl Rng,
-) -> Result<(Membrane, Vec<RelaxFrame>), BuildError> {
-    let mut frames = Vec::new();
-    let tubule = build_system(
-        force_field,
-        name,
-        outer,
-        inner,
-        radius,
-        length,
-        options,
-        &[],
-        rng,
-        Some(&mut frames),
-    )?
-    .into_membrane();
-    Ok((tubule, frames))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shell {
     Outer,

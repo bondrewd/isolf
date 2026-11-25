@@ -354,20 +354,7 @@ pub fn dynamics_with_restraint(
     restraint: Option<&ZRestraint<'_>>,
 ) -> Result<String, InpError> {
     validate_dynamics(params)?;
-    let Dynamics {
-        temperature,
-        num_steps,
-        time_step,
-        eneout_period,
-        crdout_period,
-        rstout_period,
-        stoptr_period,
-        nbupdate_period,
-        seed,
-        cg_ele_cutoff,
-    } = *params;
-    let ensemble = ensemble_block(ensemble, temperature);
-    let ele_cutoff_lines = format_ele_cutoff(cg_ele_cutoff);
+    let body = dynamics_body(ensemble, params);
     let mut s = format!(
         "\
 [INPUT]
@@ -380,30 +367,7 @@ rstfile               = ./{basename}.rst
 dcdfile               = ./{basename}.dcd
 pdbfile               = ./{basename}.pdb
 
-[ENERGY]
-forcefield            = RESIDCG
-electrostatic         = CUTOFF
-cg_sol_temperature    = {temperature}
-cg_sol_ionic_strength = 0.15
-{ele_cutoff_lines}
-[DYNAMICS]
-integrator            = VVER_CG
-timestep              = {time_step}
-nsteps                = {num_steps}
-eneout_period         = {eneout_period}
-crdout_period         = {crdout_period}
-rstout_period         = {rstout_period}
-stoptr_period         = {stoptr_period}
-nbupdate_period       = {nbupdate_period}
-iseed                 = {seed}
-
-[CONSTRAINTS]
-rigid_bond            = NO
-
-{ensemble}
-[BOUNDARY]
-type                  = PBC
-"
+{body}"
     );
     if let Some(r) = restraint {
         append_single_restraint(&mut s, r);
@@ -433,21 +397,8 @@ pub fn reus(
         reus_cfg.exchange_period,
         "exchange_period",
     )?;
-    let Dynamics {
-        temperature,
-        num_steps,
-        time_step,
-        eneout_period,
-        crdout_period,
-        rstout_period,
-        stoptr_period,
-        nbupdate_period,
-        seed,
-        cg_ele_cutoff,
-    } = *params;
     let nreplica = reus_cfg.references_angstrom.len();
-    let ensemble = ensemble_block(ensemble, temperature);
-    let ele_cutoff_lines = format_ele_cutoff(cg_ele_cutoff);
+    let body = dynamics_body(ensemble, params);
     let mut s = format!(
         "\
 [INPUT]
@@ -470,30 +421,7 @@ nreplica1             = {nreplica}
 cyclic_params1        = NO
 rest_function1        = 1
 
-[ENERGY]
-forcefield            = RESIDCG
-electrostatic         = CUTOFF
-cg_sol_temperature    = {temperature}
-cg_sol_ionic_strength = 0.15
-{ele_cutoff_lines}
-[DYNAMICS]
-integrator            = VVER_CG
-timestep              = {time_step}
-nsteps                = {num_steps}
-eneout_period         = {eneout_period}
-crdout_period         = {crdout_period}
-rstout_period         = {rstout_period}
-stoptr_period         = {stoptr_period}
-nbupdate_period       = {nbupdate_period}
-iseed                 = {seed}
-
-[CONSTRAINTS]
-rigid_bond            = NO
-
-{ensemble}
-[BOUNDARY]
-type                  = PBC
-
+{body}
 [SELECTION]
 group1                = {group1}
 group2                = {group2}
@@ -518,6 +446,52 @@ select_index1         = 1 2
         reus_cfg.references_angstrom,
     );
     Ok(s)
+}
+
+/// Shared `[ENERGY]`, `[DYNAMICS]`, `[CONSTRAINTS]`, `[ENSEMBLE]`, and
+/// `[BOUNDARY]` sections for standard dynamics and REUS control files.
+fn dynamics_body(ensemble: Ensemble, params: &Dynamics) -> String {
+    let Dynamics {
+        temperature,
+        num_steps,
+        time_step,
+        eneout_period,
+        crdout_period,
+        rstout_period,
+        stoptr_period,
+        nbupdate_period,
+        seed,
+        cg_ele_cutoff,
+    } = *params;
+    let ensemble = ensemble_block(ensemble, temperature);
+    let ele_cutoff_lines = format_ele_cutoff(cg_ele_cutoff);
+    format!(
+        "\
+[ENERGY]
+forcefield            = RESIDCG
+electrostatic         = CUTOFF
+cg_sol_temperature    = {temperature}
+cg_sol_ionic_strength = 0.15
+{ele_cutoff_lines}
+[DYNAMICS]
+integrator            = VVER_CG
+timestep              = {time_step}
+nsteps                = {num_steps}
+eneout_period         = {eneout_period}
+crdout_period         = {crdout_period}
+rstout_period         = {rstout_period}
+stoptr_period         = {stoptr_period}
+nbupdate_period       = {nbupdate_period}
+iseed                 = {seed}
+
+[CONSTRAINTS]
+rigid_bond            = NO
+
+{ensemble}
+[BOUNDARY]
+type                  = PBC
+"
+    )
 }
 
 /// Render a GENESIS `mbar_analysis` control file for 1D umbrella sampling

@@ -366,19 +366,6 @@ impl Protein {
         }
     }
 
-    /// Map local coordinates `(x, y, z)` into an orthonormal frame `(u, v, n)`
-    /// anchored at `origin`: `p' = origin + x·u + y·v + z·n`.
-    pub fn apply_frame(&mut self, origin: [f64; 3], u: [f64; 3], v: [f64; 3], n: [f64; 3]) {
-        for b in &mut self.beads {
-            let [x, y, z] = b.position;
-            b.position = [
-                origin[0] + x * u[0] + y * v[0] + z * n[0],
-                origin[1] + x * u[1] + y * v[1] + z * n[1],
-                origin[2] + x * u[2] + y * v[2] + z * n[2],
-            ];
-        }
-    }
-
     /// Cubic periodic box spanning the protein plus `padding` nm on each side.
     pub fn box_with_padding(&self, padding: f64) -> [f64; 3] {
         let (lo, hi) = self.bounding_box();

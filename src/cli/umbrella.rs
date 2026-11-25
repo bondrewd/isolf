@@ -91,7 +91,7 @@ fn validate_setup(
         }
     }
 
-    let base_params = match &args.params {
+    let base_params = match &args.lipid_protein {
         Some(path) => {
             let content = fs::read_to_string(path)
                 .map_err(|e| format!("--lipid-protein: failed to read {}: {e}", path.display()))?;
@@ -210,7 +210,7 @@ fn build_and_render_windows(
     force_field: &ForceField,
 ) -> (EmbeddedSystem, Vec<RenderedWindow>) {
     let probe_name = probe.protein.name.as_str();
-    let built: Vec<(EmbeddedSystem, RenderedWindow)> = z_windows
+    let built: Vec<(Option<EmbeddedSystem>, RenderedWindow)> = z_windows
         .par_iter()
         .enumerate()
         .map(|(idx, &z_nm)| {
@@ -226,16 +226,22 @@ fn build_and_render_windows(
                 gro,
                 pdb,
             };
-            (sys, rw)
+            ((idx == 0).then_some(sys), rw)
         })
         .collect();
 
-    let mut iter = built.into_iter();
-    let (first_sys, first_rw) = iter.next().expect("z_windows is validated to be non-empty");
+    let mut first_sys = None;
     let mut rendered = Vec::with_capacity(z_windows.len());
-    rendered.push(first_rw);
-    rendered.extend(iter.map(|(_, rw)| rw));
-    (first_sys, rendered)
+    for (sys_opt, rw) in built {
+        if sys_opt.is_some() {
+            first_sys = sys_opt;
+        }
+        rendered.push(rw);
+    }
+    (
+        first_sys.expect("z_windows is validated to be non-empty"),
+        rendered,
+    )
 }
 
 struct CampaignContext<'a> {

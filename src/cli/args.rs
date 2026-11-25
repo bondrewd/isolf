@@ -240,10 +240,8 @@ pub(crate) enum Command {
 #[derive(Subcommand, Debug)]
 pub(crate) enum UmbrellaCommand {
     /// Build umbrella-sampling windows (or REUS) + mbar.inp for amino acids or PDB/mmCIF proteins.
-    #[command(alias = "build")]
     Setup(Box<UmbrellaSetupArgs>),
     /// Extract RESTR_CVS001 from GENESIS atdyn logs (and demux REUS .rem files) into cv/{}.dat.
-    #[command(alias = "extract")]
     Cv(UmbrellaCvArgs),
 }
 
@@ -1012,13 +1010,8 @@ pub(crate) struct UmbrellaSetupArgs {
     pub(crate) charge: Option<f64>,
 
     /// Lipid–protein parameter file ([cg_ISOLF_parameters], optional [cg_WCA_parameters] / [cg_LJ_parameters]).
-    #[arg(
-        long = "lipid-protein",
-        alias = "params",
-        value_name = "FILE",
-        help_heading = "Probe & parameters"
-    )]
-    pub(crate) params: Option<PathBuf>,
+    #[arg(long, value_name = "FILE", help_heading = "Probe & parameters")]
+    pub(crate) lipid_protein: Option<PathBuf>,
 
     /// Override probe [ cg_ISOLF_parameters ] epsilon in kJ/mol [default: 1.5].
     #[arg(long, value_name = "KJ/MOL", help_heading = "Probe & parameters")]
@@ -1216,7 +1209,7 @@ pub(crate) struct ParamsArgs {
     pub(crate) probe: Option<String>,
 
     /// Input parameter table file ([cg_ISOLF_parameters], [cg_WCA_parameters], [cg_LJ_parameters]).
-    #[arg(long, alias = "lipid-protein", value_name = "FILE")]
+    #[arg(long, value_name = "FILE")]
     pub(crate) params: Option<PathBuf>,
 
     /// Override [ cg_ISOLF_parameters ] epsilon in kJ/mol.

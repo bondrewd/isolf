@@ -213,38 +213,6 @@ impl Membrane {
         .map(crate::embed::EmbeddedSystem::into_membrane)
     }
 
-    /// Like [`build`](Membrane::build), but also records every relaxation step (the
-    /// Lloyd rounds, then the de-clash) as a [`RelaxFrame`], for the `--gif`
-    /// animation.
-    ///
-    /// # Errors
-    ///
-    /// The same as [`build`](Membrane::build).
-    pub fn build_recorded(
-        force_field: &ForceField,
-        name: &str,
-        upper: &Composition,
-        lower: &Composition,
-        sizing: Sizing,
-        options: &BuildOptions,
-        rng: &mut impl Rng,
-    ) -> Result<(Self, Vec<RelaxFrame>), BuildError> {
-        let mut frames = Vec::new();
-        let membrane = build_system(
-            force_field,
-            name,
-            upper,
-            lower,
-            sizing,
-            options,
-            &[],
-            rng,
-            Some(&mut frames),
-        )?
-        .into_membrane();
-        Ok((membrane, frames))
-    }
-
     /// Total number of lipid molecules in the membrane.
     pub fn total_lipids(&self) -> usize {
         self.lipid_counts.iter().map(|(_, count)| count).sum()

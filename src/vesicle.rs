@@ -73,39 +73,6 @@ pub fn build_vesicle(
     .map(crate::embed::EmbeddedSystem::into_membrane)
 }
 
-/// Like [`build_vesicle`], but also records every relaxation step (the per-shell
-/// spherical Lloyd rounds, then the de-clash) as a [`RelaxFrame`], for the `--gif`
-/// animation. Each lipid is projected to 2D by a Lambert azimuthal equal-area map,
-/// so a uniform spread over the sphere stays uniform in the frame.
-///
-/// # Errors
-///
-/// The same as [`build_vesicle`].
-pub fn build_vesicle_recorded(
-    force_field: &ForceField,
-    name: &str,
-    outer: &Composition,
-    inner: &Composition,
-    radius: VesicleRadius,
-    options: &BuildOptions,
-    rng: &mut impl Rng,
-) -> Result<(Membrane, Vec<RelaxFrame>), BuildError> {
-    let mut frames = Vec::new();
-    let vesicle = build_system(
-        force_field,
-        name,
-        outer,
-        inner,
-        radius,
-        options,
-        &[],
-        rng,
-        Some(&mut frames),
-    )?
-    .into_membrane();
-    Ok((vesicle, frames))
-}
-
 /// Which shell a lipid belongs to: the outer one points outward (beads stack
 /// toward the centre), the inner one points inward.
 #[derive(Debug, Clone, Copy, PartialEq)]
