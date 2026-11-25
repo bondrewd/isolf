@@ -534,7 +534,7 @@ fn embeds_proteins_in_membrane_vesicle_and_tubule_via_cli() {
 }
 
 #[test]
-fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
+fn umbrella_setup_cv_params_peptide_and_membrane_lipid_protein() {
     let out = temp_out("umbrella_campaign");
 
     // 1. Build a reference bilayer to test --bilayer reuse.
@@ -562,11 +562,12 @@ fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
     );
     let ref_gro = ref_dir.join("membrane.gro");
 
-    // 2. Independent windows mode using --bilayer + --psf + --pdb.
+    // 2. Single-AA windows mode using --bilayer + --psf + --pdb + --vmd.
     let win_dir = out.join("win_trp");
     let win_run = isolf_bin()
         .args([
             "umbrella",
+            "setup",
             "--probe",
             "TRP",
             "--bilayer",
@@ -577,6 +578,7 @@ fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
             "0.5",
             "--psf",
             "--pdb",
+            "--vmd",
             "--seed",
             "9",
             "--no-color",
@@ -585,7 +587,7 @@ fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
         ])
         .arg(&win_dir)
         .output()
-        .expect("run isolf umbrella windows");
+        .expect("run isolf umbrella setup windows");
     assert!(
         win_run.status.success(),
         "stderr: {}",
@@ -598,20 +600,23 @@ fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
         "TRP.itp",
         "system.top",
         "system.psf",
+        "system.vmd",
         "mbar.inp",
         "manifest.json",
     ] {
         assert!(win_dir.join(file).exists(), "missing umbrella file {file}");
     }
     let min1 = fs::read_to_string(win_dir.join("win_1/min.inp")).unwrap();
-    assert!(min1.contains("group1                = rnam:TRP"));
+    assert!(min1.contains("group1                = ano:1"));
     assert!(min1.contains("group2                = rnam:POPC or rnam:POPS"));
     assert!(min1.contains("function1             = DISTMASS"));
     assert!(min1.contains("direction1            = Z2"));
     assert!(min1.contains("cg_cutoffdist_ele"));
     assert!(win_dir.join("win_4/system.pdb").exists());
 
-    // 3. Fast BO parameter update via --update-params.
+    // 3. Fast BO parameter update via top-level `isolf params` (auto-discovers TRP.itp,
+    //    even without manifest.json!).
+    fs::remove_file(win_dir.join("manifest.json")).unwrap();
     let param_file = out.join("trial.txt");
     fs::write(
         &param_file,
@@ -620,8 +625,7 @@ fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
     .unwrap();
     let upd = isolf_bin()
         .args([
-            "umbrella",
-            "--update-params",
+            "params",
             "--params",
             param_file.to_str().unwrap(),
             "--no-color",
@@ -630,7 +634,7 @@ fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
         ])
         .arg(&win_dir)
         .output()
-        .expect("run isolf umbrella --update-params");
+        .expect("run isolf params");
     assert!(
         upd.status.success(),
         "stderr: {}",
@@ -641,7 +645,7 @@ fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
     assert!(lp_itp.contains("   TRP   PHO    1.750    0.560    1.400"));
     assert!(!lp_itp.contains("   TRP   PHO    1.5"));
 
-    // 4. Mock GENESIS logs -> --extract-cv.
+    // 4. Mock GENESIS logs -> manifest-free `isolf umbrella cv`.
     for i in 1..=4 {
         let z0 = (i - 1) as f64 * 5.0;
         let log = format!(
@@ -656,7 +660,7 @@ fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
     let ext = isolf_bin()
         .args([
             "umbrella",
-            "--extract-cv",
+            "cv",
             "--discard",
             "150",
             "--no-color",
@@ -665,7 +669,7 @@ fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
         ])
         .arg(&win_dir)
         .output()
-        .expect("run isolf umbrella --extract-cv");
+        .expect("run isolf umbrella cv");
     assert!(
         ext.status.success(),
         "stderr: {}",
@@ -675,13 +679,17 @@ fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
     assert!(!cv4.contains("100 "));
     assert!(cv4.contains("200      14.900000"));
 
-    // 5. REUS mode + multi-probe (`--probe TRP,ARG`) + single-bead `-p aa:TRP`.
-    let reus_dir = out.join("reus_multi");
-    let reus_run = isolf_bin()
+    // 5. Multi-residue PDB peptide probe in REUS mode (constant lipid count, ano:1-20).
+    let pdb_path = out.join("helix.pdb");
+    write_sample_helix_pdb(&pdb_path);
+    let pep_dir = out.join("reus_helix");
+    let pep_spec = format!("{},tilt=90", pdb_path.display());
+    let pep_run = isolf_bin()
         .args([
             "umbrella",
+            "setup",
             "--probe",
-            "TRP,ARG",
+            &pep_spec,
             "-L",
             "POPC",
             "-n",
@@ -702,21 +710,62 @@ fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
             "--ascii",
             "-o",
         ])
-        .arg(&reus_dir)
+        .arg(&pep_dir)
         .output()
-        .expect("run isolf umbrella reus multi");
+        .expect("run isolf umbrella setup with PDB peptide");
     assert!(
-        reus_run.status.success(),
+        pep_run.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&reus_run.stderr)
+        String::from_utf8_lossy(&pep_run.stderr)
+    );
+    let eq_reus = fs::read_to_string(pep_dir.join("equil_reus.inp")).unwrap();
+    assert!(eq_reus.contains("group1                = ano:1-20"));
+    assert!(eq_reus.contains("group2                = rnam:POPC"));
+    let pep_lp = fs::read_to_string(pep_dir.join("lipid_protein.itp")).unwrap();
+    assert!(pep_lp.contains("   TRP "));
+    assert!(pep_lp.contains("   LEU "));
+    assert!(pep_lp.contains("   ARG "));
+    // Every window has identical atom count (20 protein + 64*6 lipids = 404).
+    for i in 1..=3 {
+        let gro = fs::read_to_string(pep_dir.join(format!("win_{i}.gro"))).unwrap();
+        let natoms: usize = gro.lines().nth(1).unwrap().trim().parse().unwrap();
+        assert_eq!(natoms, 20 + 64 * 6);
+    }
+
+    // 6. Multi-AA umbrella setup (`--probe TRP,ARG`) + `membrane -p ... --lipid-protein --ele-cutoff`.
+    let multi_dir = out.join("multi_aa");
+    let multi_run = isolf_bin()
+        .args([
+            "umbrella",
+            "setup",
+            "--probe",
+            "TRP,ARG",
+            "-L",
+            "POPC",
+            "-n",
+            "32",
+            "--z",
+            "0.0,1.0",
+            "--seed",
+            "4",
+            "--no-color",
+            "--ascii",
+            "-o",
+        ])
+        .arg(&multi_dir)
+        .output()
+        .expect("run multi-AA umbrella setup");
+    assert!(
+        multi_run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&multi_run.stderr)
     );
     for aa in ["TRP", "ARG"] {
-        assert!(reus_dir.join(aa).join("equil_reus.inp").exists());
-        assert!(reus_dir.join(aa).join("prod_reus.inp").exists());
-        assert!(reus_dir.join(aa).join("mbar.inp").exists());
+        assert!(multi_dir.join(aa).join("mbar.inp").exists());
     }
-    let aa_mem_dir = out.join("aa_mem");
-    let aa_mem = isolf_bin()
+
+    let mem_lp_dir = out.join("mem_lp");
+    let mem_lp = isolf_bin()
         .args([
             "membrane",
             "-L",
@@ -725,23 +774,31 @@ fn umbrella_windows_reus_bilayer_update_params_and_extract_cv() {
             "32",
             "-p",
             "aa:TRP,z=1.5",
-            "--top",
+            "--lipid-protein",
+            param_file.to_str().unwrap(),
+            "--inp",
+            "--ele-cutoff",
+            "24",
             "--seed",
             "3",
             "--no-color",
             "--ascii",
             "-o",
         ])
-        .arg(&aa_mem_dir)
+        .arg(&mem_lp_dir)
         .output()
-        .expect("run isolf membrane -p aa:TRP");
+        .expect("run isolf membrane -p with --lipid-protein and --ele-cutoff");
     assert!(
-        aa_mem.status.success(),
+        mem_lp.status.success(),
         "stderr: {}",
-        String::from_utf8_lossy(&aa_mem.stderr)
+        String::from_utf8_lossy(&mem_lp.stderr)
     );
-    assert!(aa_mem_dir.join("TRP.itp").exists());
-    assert!(aa_mem_dir.join("aicg2p.itp").exists());
+    assert!(mem_lp_dir.join("lipid_protein.itp").exists());
+    let mem_top = fs::read_to_string(mem_lp_dir.join("membrane.top")).unwrap();
+    assert!(mem_top.contains("#include \"./lipid_protein.itp\""));
+    let mem_min = fs::read_to_string(mem_lp_dir.join("min.inp")).unwrap();
+    assert!(mem_min.contains("cg_cutoffdist_ele     = 24.0"));
+    assert!(mem_min.contains("cg_pairlistdist_ele   = 29.0"));
 
     let _ = fs::remove_dir_all(&out);
 }

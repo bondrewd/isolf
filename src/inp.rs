@@ -45,6 +45,12 @@ pub fn ele_cutoff_for_box(box_nm: [f64; 3]) -> Option<(f64, f64)> {
     Some((cutoff, pairlist))
 }
 
+/// Pair an explicit user-supplied `cg_cutoffdist_ele` (Å) with its matching
+/// Verlet pairlist distance (`cutoff + 5.0 Å`).
+pub fn ele_cutoff_override(cutoff_angstrom: f64) -> (f64, f64) {
+    (cutoff_angstrom, cutoff_angstrom + DEFAULT_CG_ELE_SKIN_A)
+}
+
 /// Error from generating a control file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InpError {
@@ -123,7 +129,7 @@ pub struct Dynamics {
 /// `direction1 = Z2`: `U = k * (dz - z0)^2`, `dz = z1 - z2` in Å).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZRestraint<'a> {
-    /// GENESIS atom selection for group 1 (the probe, e.g. `"rnam:TRP"`).
+    /// GENESIS atom selection for group 1 (the probe, e.g. `"ano:1"` or `"ano:1-23"`).
     pub group1: &'a str,
     /// GENESIS atom selection for group 2 (the bilayer, e.g. `"rnam:POPC"`).
     pub group2: &'a str,

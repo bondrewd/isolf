@@ -249,6 +249,36 @@ impl Protein {
         [sum[0] * inv, sum[1] * inv, sum[2] * inv]
     }
 
+    /// Mass-weighted center of mass of all beads (nm).
+    pub fn center_of_mass(&self) -> [f64; 3] {
+        if self.beads.is_empty() {
+            return [0.0; 3];
+        }
+        let mut msum = 0.0;
+        let mut sum = [0.0; 3];
+        for b in &self.beads {
+            let m = if b.mass > 0.0 { b.mass } else { 1.0 };
+            msum += m;
+            sum[0] += m * b.position[0];
+            sum[1] += m * b.position[1];
+            sum[2] += m * b.position[2];
+        }
+        let inv = 1.0 / msum;
+        [sum[0] * inv, sum[1] * inv, sum[2] * inv]
+    }
+
+    /// Unique canonical 3-letter residue names present in this protein, in
+    /// order of first appearance.
+    pub fn unique_residues(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for b in &self.beads {
+            if !out.contains(&b.residue.as_str()) {
+                out.push(b.residue.as_str());
+            }
+        }
+        out
+    }
+
     /// Radius of gyration across all beads (nm).
     pub fn radius_of_gyration(&self) -> f64 {
         range_rg(&self.beads, 0..self.beads.len())

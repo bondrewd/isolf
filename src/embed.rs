@@ -251,6 +251,32 @@ impl EmbeddedSystem {
         self.translate(shift);
     }
 
+    /// Construct an [`EmbeddedSystem`] directly from a single probe protein and
+    /// bilayer with pre-assembled `particles` (probe beads first, followed by
+    /// all bilayer lipid beads). Used by umbrella sampling windows so `.gro`,
+    /// `.pdb`, `.psf`, `.top`, and VMD scripts share one code path.
+    pub fn from_probe_and_bilayer(
+        name: String,
+        probe: Protein,
+        bilayer: &Membrane,
+        particles: Vec<Particle>,
+    ) -> Self {
+        let lipid_particle_start = probe.beads.len();
+        let probe_name = probe.name.clone();
+        Self {
+            name,
+            protein_templates: vec![probe],
+            protein_counts: vec![(probe_name, 1)],
+            lipid_counts: bilayer.lipid_counts.clone(),
+            particles,
+            lipid_particle_start,
+            box_size: bilayer.box_size,
+            carved_lipids: 0,
+            pruned_lipids: 0,
+            warnings: Vec::new(),
+        }
+    }
+
     /// Render the combined system as a GROMACS `.gro` coordinate file.
     pub fn to_gro(&self) -> String {
         crate::gro::render(&self.particles, &self.name, self.box_size)
@@ -258,6 +284,12 @@ impl EmbeddedSystem {
 
     /// Render the combined system as a GENESIS `.top` topology file.
     pub fn to_top(&self) -> String {
+        self.to_top_with_lipid_protein(false)
+    }
+
+    /// Render the combined system as a GENESIS `.top` topology file, optionally
+    /// including `#include "./lipid_protein.itp"` after `isolf.itp`.
+    pub fn to_top_with_lipid_protein(&self, include_lipid_protein: bool) -> String {
         let mut s = String::new();
         if self.has_proteins() {
             let _ = writeln!(s, "; AICG2+ protein force field parameters");
@@ -265,6 +297,10 @@ impl EmbeddedSystem {
         }
         let _ = writeln!(s, "; Implicit Solvent Lipid Forcefield (iSoLF)");
         let _ = writeln!(s, "#include \"./isolf.itp\"");
+        if include_lipid_protein && self.has_proteins() {
+            let _ = writeln!(s, "; Lipid-protein interaction parameters");
+            let _ = writeln!(s, "#include \"./lipid_protein.itp\"");
+        }
         if self.has_proteins() {
             let _ = writeln!(s, "; Protein topologies");
             for tmpl in &self.protein_templates {

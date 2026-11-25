@@ -16,6 +16,12 @@
 //! the original TOML.
 
 mod isolf;
+pub mod lipid_protein;
+
+pub use lipid_protein::{
+    DEFAULT_PROBE_EPSILON, DEFAULT_PROBE_OMEGA, IsolfBeadParam, LipidProteinParams, LjPairParam,
+    ProbeParamOverrides, WcaPairParam,
+};
 
 /// Charges below this magnitude (in units of the elementary charge) are treated
 /// as neutral when classifying bead pairs into interaction tables.
